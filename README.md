@@ -14,6 +14,8 @@
   pip install .
   ```
 
+  install lm-eval
+  
   ```python
   git clone https://github.com/EleutherAI/lm-evaluation-harness.git
   cd lm-evaluation-harness
