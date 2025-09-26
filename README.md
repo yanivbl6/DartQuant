@@ -9,9 +9,9 @@
 - cd fast-hadamard-transform
 - pip install .
 
-- git clone https://github.com/Dao-AILab/fast-hadamard-transform.git
-- cd fast-hadamard-transform
-- pip install .
+- git clone https://github.com/EleutherAI/lm-evaluation-harness.git
+- cd lm-evaluation-harness
+- pip install -e .
 
 ## Guidelines
 
