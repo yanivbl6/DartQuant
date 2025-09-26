@@ -4,14 +4,21 @@
 - python 3.10, pytorch >= 2.0
 - install pytorch with cuda from https://pytorch.org/get-started/locally/, it is prerequisite for fast-hadamard-transform package.
 - pip install -r requirement.txt
-- cd third-part
-- git clone https://github.com/Dao-AILab/fast-hadamard-transform.git
-- cd fast-hadamard-transform
-- pip install .
+  
+  install fast-hadamard-transform
+  
+  ```python
+  cd third-part
+  git clone https://github.com/Dao-AILab/fast-hadamard-transform.git
+  cd fast-hadamard-transform
+  pip install .
+  ```
 
-- git clone https://github.com/EleutherAI/lm-evaluation-harness.git
-- cd lm-evaluation-harness
-- pip install -e .
+  ```python
+  git clone https://github.com/EleutherAI/lm-evaluation-harness.git
+  cd lm-evaluation-harness
+  pip install -e .
+  ```
 
 ## Guidelines
 
