@@ -101,8 +101,11 @@ class ActQuantizer(torch.nn.Module):
         self.register_buffer('scale', torch.zeros(1))
         self.register_buffer('zero', torch.zeros(1))
         self.bits = 16
+        self.static = False
 
     def free(self):
+        if self.static:
+            return  # keep pre-calibrated scales
         self.zero = None
         self.scale = None
 
@@ -112,7 +115,9 @@ class ActQuantizer(torch.nn.Module):
         if self.bits == 16:
             return x
 
-        self.find_params(x)  # 首次量化参数计算
+        if not self.static:
+            self.find_params(x)  # dynamic: recompute every forward
+        # else: use pre-loaded self.scale / self.zero
 
         if self.residual:
             if self.sym:
@@ -143,7 +148,8 @@ class ActQuantizer(torch.nn.Module):
                   groupsize=-1,
                   sym=False,
                   clip_ratio=1.0,
-                  residual=False):
+                  residual=False,
+                  static=False):
         _, self.maxq = get_minq_maxq(bits, sym)
         self.bits = bits
         self.groupsize = groupsize
@@ -151,6 +157,7 @@ class ActQuantizer(torch.nn.Module):
         self.clip_ratio = clip_ratio
         assert self.clip_ratio <= 1 and self.clip_ratio > 0, 'Clip ratio should be in (0, 1]'
         self.residual = residual
+        self.static = static
 
     def find_params_per_token_groupwise(self, x):
         init_shape = x.shape

@@ -54,6 +54,9 @@ def parser_gen():
                         help='Clip ratio for activation quantization. new_max = max * clip_ratio')
     parser.add_argument('--a_residual', action=argparse.BooleanOptionalAction, default=False,
                         help='Whether use residual quant for activation quantization (default: False)')
+    parser.add_argument('--act_scales_path', type=str, default=None,
+                        help='Path to pre-calibrated activation scales (.pt). '
+                             'When set, static quantization is used instead of dynamic.')
 
     # Weight Quantization Arguments
     parser.add_argument('--w_bits', type=int, default=16,

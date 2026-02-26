@@ -35,7 +35,8 @@ Options:
   -G GROUPSIZE     Group size for W, K, V              (default: 128)
   --sym            Use symmetric quantization for W/K/V (default: asymmetric)
   --overwrite      Ignore cached results, re-run all
-  -F FAST          Enable fast model 
+  --static-act     Use pre-calibrated static activation scales
+  -F FAST          Enable fast model
   -h               Show this help message
 
 Notes:
@@ -78,6 +79,7 @@ GROUPSIZE=128
 SYM=0
 OVERWRITE=0
 FAST=0
+STATIC_ACT=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -90,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         -G)       GROUPSIZE="$2"; shift 2 ;;
         --sym)    SYM=1;          shift   ;;
         --overwrite) OVERWRITE=1; shift   ;;
+        --static-act) STATIC_ACT=1; shift ;;
         -F|--fast) FAST=1;        shift   ;;
         -h|--help) usage ;;
         *)
@@ -199,6 +202,20 @@ if [ "$OVERWRITE" == "1" ]; then
     OVERWRITE_FLAG="--overwrite"
 fi
 
+# --- Static activation scales ---
+STATIC_ACT_FLAG=""
+if [ "$STATIC_ACT" == "1" ]; then
+    ACT_SCALES_DIR="../data/act_scales/${MODEL_NAME}"
+    ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${QUANT_TAG}.pt"
+    if [ ! -f "$ACT_SCALES_FILE" ]; then
+        echo "Static act scales not found at ${ACT_SCALES_FILE}"
+        echo "Run calibration first:"
+        echo "  cd calibrater && python calibrate_act_scales.py --model ${MODEL} --mode ${MODE} --save_path ${ACT_SCALES_FILE} ..."
+        exit 1
+    fi
+    STATIC_ACT_FLAG="--act_scales_path ${ACT_SCALES_FILE}"
+fi
+
 if [ "$FAST" == "1" ]; then
     tasks="piqa hellaswag arc_easy arc_challenge winogrande lambada_openai social_iqa openbookqa mmlu"
 else
@@ -223,6 +240,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python main_for_test.py \
     --v_groupsize ${GROUPSIZE} \
     ${K_ASYM_FLAG} \
     ${V_ASYM_FLAG} \
+    ${STATIC_ACT_FLAG} \
     --percdamp 0.1 \
     --no-w_ft \
     --ft_percdamp 0.0 \

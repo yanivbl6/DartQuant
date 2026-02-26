@@ -393,8 +393,12 @@ class QKRotationWrapper(torch.nn.Module):
         if self.k_quantizer.maxq.device != dev:
             _, maxq = quant_utils.get_minq_maxq(self.k_bits, self.k_sym)
             self.k_quantizer.maxq = maxq.to(dev)
-            self.k_quantizer.scale = torch.zeros(1, device=dev)
-            self.k_quantizer.zero = torch.zeros(1, device=dev)
+            if not self.k_quantizer.static:
+                self.k_quantizer.scale = torch.zeros(1, device=dev)
+                self.k_quantizer.zero = torch.zeros(1, device=dev)
+            else:
+                self.k_quantizer.scale = self.k_quantizer.scale.to(dev)
+                self.k_quantizer.zero = self.k_quantizer.zero.to(dev)
 
         if self.use_r3:
             q = hadamard_transform(q.float(), scale=1 / math.sqrt(q.shape[-1])).to(dtype)
@@ -402,12 +406,14 @@ class QKRotationWrapper(torch.nn.Module):
         (bsz, num_heads, seq_len, head_dim) = k.shape
 
         if self.k_groupsize == -1:  # token-wise quantization
-            token_wise_k = k.transpose(1, 2).reshape(-1, num_heads * head_dim)  # 源码：(-1, self.config.hidden_size)报错
-            self.k_quantizer.find_params(token_wise_k)
+            token_wise_k = k.transpose(1, 2).reshape(-1, num_heads * head_dim)
+            if not self.k_quantizer.static:
+                self.k_quantizer.find_params(token_wise_k)
             k = self.k_quantizer(token_wise_k).reshape((bsz, seq_len, num_heads, head_dim)).transpose(1, 2).to(q)
         else:  # head-wise quantization
-            per_head_k = k.reshape(-1, head_dim)  # 源码：per_head_k = k.view(-1, head_dim)报错
-            self.k_quantizer.find_params(per_head_k)
+            per_head_k = k.reshape(-1, head_dim)
+            if not self.k_quantizer.static:
+                self.k_quantizer.find_params(per_head_k)
             k = self.k_quantizer(per_head_k).reshape((bsz, num_heads, seq_len, head_dim)).to(q)
 
         self.k_quantizer.free()

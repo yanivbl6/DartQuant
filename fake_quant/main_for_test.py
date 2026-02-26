@@ -210,6 +210,41 @@ def main():
                     config=model.config,
                     **k_quant_config)
 
+    # Load pre-calibrated static activation scales
+    if args.act_scales_path:
+        logging.info("Loading static activation scales from: {}".format(args.act_scales_path))
+        act_scales = torch.load(args.act_scales_path, map_location='cpu', weights_only=True)
+
+        # Apply to ActQuantWrapper quantizers (input + output/v_proj)
+        qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        for name, qlayer in qlayers.items():
+            q_key = f'{name}.quantizer'
+            if q_key in act_scales and qlayer.quantizer.bits < 16:
+                qlayer.quantizer.scale = act_scales[q_key]['scale']
+                qlayer.quantizer.zero = act_scales[q_key]['zero']
+                qlayer.quantizer.static = True
+
+            oq_key = f'{name}.out_quantizer'
+            if oq_key in act_scales and qlayer.out_quantizer.bits < 16:
+                qlayer.out_quantizer.scale = act_scales[oq_key]['scale']
+                qlayer.out_quantizer.zero = act_scales[oq_key]['zero']
+                qlayer.out_quantizer.static = True
+
+        # Apply to QKRotationWrapper k_quantizers
+        layers = model_utils.get_layers(model)
+        for i, layer in enumerate(layers):
+            rope_fn = model_utils.get_rope_function_name(model)
+            wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
+            if hasattr(layer.self_attn, wrapper_attr):
+                wrapper = getattr(layer.self_attn, wrapper_attr)
+                kq_key = f'layer.{i}.k_quantizer'
+                if kq_key in act_scales and wrapper.k_quantizer.bits < 16:
+                    wrapper.k_quantizer.scale = act_scales[kq_key]['scale']
+                    wrapper.k_quantizer.zero = act_scales[kq_key]['zero']
+                    wrapper.k_quantizer.static = True
+
+        logging.info("Static activation scales applied to all quantizers.")
+
     if args.distribute:
         utils.distribute_model(model)
     else:
