@@ -309,7 +309,7 @@ def main():
 
         if tasks_to_run:
             logging.info(f"Running {len(tasks_to_run)} tasks (skipping {len(cached_results)} cached): {tasks_to_run}")
-            tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, token=args.hf_token)
+            tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, use_fast=False, token=args.hf_token)
             hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.lm_eval_batch_size)
 
             results = lm_eval.simple_evaluate(hflm, tasks=tasks_to_run,)['results']

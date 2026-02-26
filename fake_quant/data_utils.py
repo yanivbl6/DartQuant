@@ -6,9 +6,9 @@ import transformers
 def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
 
     if hf_token is None:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
     else:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model, token=hf_token)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False, token=hf_token)
 
     if eval_mode:
         testdata = datasets.load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
@@ -32,9 +32,9 @@ def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
 def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
 
     if hf_token is None:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
     else:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model, token=hf_token)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False, token=hf_token)
 
     if eval_mode:
         c4_cache = '/data/data/huggingface/datasets/allenai___c4/default-ad670c44f8f136e7/0.0.0/1588ec454efa1a09f29cd18ddd04fe05fc8653a2'
@@ -77,9 +77,9 @@ def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
 def get_ptb_new(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
 
     if hf_token is None:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
     else:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model, token=hf_token)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False, token=hf_token)
 
     if eval_mode:
         testdata = datasets.load_dataset('ptb_text_only', 'penn_treebank', split='test', trust_remote_code=True)

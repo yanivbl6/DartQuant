@@ -195,8 +195,6 @@ fi
 # --- Descriptive tag encoding the quantization config ---
 QUANT_TAG="w${W_BITS}a${A_BITS}k${KV_BITS}v${KV_BITS}_g${GROUPSIZE}_aAsym_${SYM_TAG}"
 
-# Result cache: /tmp/<mode>_<model>_<quant_tag>_results.pb  (JSON format)
-CACHE_PATH="/tmp/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG}_results.pb"
 OVERWRITE_FLAG=""
 if [ "$OVERWRITE" == "1" ]; then
     OVERWRITE_FLAG="--overwrite"
@@ -204,6 +202,7 @@ fi
 
 # --- Static activation scales ---
 STATIC_ACT_FLAG=""
+STATIC_TAG=""
 if [ "$STATIC_ACT" == "1" ]; then
     ACT_SCALES_DIR="../data/act_scales/${MODEL_NAME}"
     ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${QUANT_TAG}.pt"
@@ -214,6 +213,7 @@ if [ "$STATIC_ACT" == "1" ]; then
         exit 1
     fi
     STATIC_ACT_FLAG="--act_scales_path ${ACT_SCALES_FILE}"
+    STATIC_TAG="static_"
 fi
 
 if [ "$FAST" == "1" ]; then
@@ -226,7 +226,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python main_for_test.py \
     --model ${MODEL} \
     ${ROTATION_FLAGS} \
     --gptq_checkpoint_path /tmp/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG} \
-    --cache_path ${CACHE_PATH} \
+    --cache_path /tmp/${STATIC_TAG}${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG}_results.pb \
     ${OVERWRITE_FLAG} \
     --w_groupsize ${GROUPSIZE} \
     --w_clip \
@@ -244,7 +244,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python main_for_test.py \
     --percdamp 0.1 \
     --no-w_ft \
     --ft_percdamp 0.0 \
-    --save_name ${SAVE_PREFIX}_${QUANT_TAG} \
+    --save_name ${STATIC_TAG}${SAVE_PREFIX}_${QUANT_TAG} \
     --distribute \
     --ppl_eval \
     --ppl_eval_batch_size 1 \
