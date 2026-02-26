@@ -216,7 +216,7 @@ if [ "$STATIC_ACT" == "1" ]; then
     STATIC_TAG="static_"
 fi
 
-if [ "$FAST" == "1" ]; then
+if [ "$FAST" == "0" ]; then
     tasks="piqa hellaswag arc_easy arc_challenge winogrande lambada_openai social_iqa openbookqa mmlu"
 else
     tasks="hellaswag"
