@@ -25,13 +25,17 @@ MODE (required, first argument):
 
 Options:
   -g GPU_ID        GPU device ID                       (default: 0)
-  -m MODEL         Model path or HF model name         (default: meta-llama/Llama-2-7b-hf)
+  -m MODEL         Model path, HF name, or shorthand:   (default: 7b)
+                     1b  -> Llama-3.2-1B-Instruct
+                     3b  -> Llama-3.2-3B-Instruct
+                     7b  -> Llama-2-7b-hf
   -w W_BITS        Weight bit-width                    (default: 4)
   -a A_BITS        Activation bit-width                (default: 8)
   -k KV_BITS       KV-cache bit-width                  (default: 4)
   -G GROUPSIZE     Group size for W, K, V              (default: 128)
   --sym            Use symmetric quantization for W/K/V (default: asymmetric)
   --overwrite      Ignore cached results, re-run all
+  -F FAST          Enable fast model 
   -h               Show this help message
 
 Notes:
@@ -39,9 +43,9 @@ Notes:
   - Activations are always asymmetric (--sym only affects W, K, V).
 
 Examples:
-  $0 full -g 0 -m /path/to/model
-  $0 quarot -w 8 -a 8 -k 8
-  $0 dart -w 4 -a 8 -k 4 --sym
+  $0 full -m 1b
+  $0 quarot -m 3b -w 8 -a 8 -k 8
+  $0 dart -m 1b -w 4 -a 8 -k 4 --sym
   $0 baseline -w 4 -a 8 -k 4 -G 64
 EOF
     exit 0
@@ -66,13 +70,14 @@ esac
 
 # --- Defaults ---
 GPU_ID=0
-MODEL="/data/users/sashas/LLMC/Models/meta-llama/Llama-2-7b-hf/"
+MODEL="7b"
 W_BITS=4
 A_BITS=8
 KV_BITS=4
 GROUPSIZE=128
 SYM=0
 OVERWRITE=0
+FAST=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -85,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         -G)       GROUPSIZE="$2"; shift 2 ;;
         --sym)    SYM=1;          shift   ;;
         --overwrite) OVERWRITE=1; shift   ;;
+        -F|--fast) FAST=1;        shift   ;;
         -h|--help) usage ;;
         *)
             echo "Unknown option: $1"
@@ -93,6 +99,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# --- Resolve model shorthands ---
+MODEL_BASE="/data/users/sashas/LLMC/Models/meta-llama"
+case "$MODEL" in
+    1b) MODEL="${MODEL_BASE}/Llama-3.2-1B-Instruct" ;;
+    3b) MODEL="${MODEL_BASE}/Llama-3.2-3B-Instruct" ;;
+    7b) MODEL="${MODEL_BASE}/Llama-2-7b-hf" ;;
+esac
 
 # --- Full mode overrides ---
 if [ "$MODE" == "full" ]; then
@@ -114,7 +128,13 @@ else
     SYM_TAG="kAsym_vAsym"
 fi
 
-MODEL_NAME=${MODEL##*/}
+MODEL_NAME=$(basename "${MODEL%/}")
+
+# Cap K_GROUPSIZE at head_dim for models with small heads (1B: head_dim=64)
+case "$MODEL_NAME" in
+    *1B*) K_GROUPSIZE=64 ;;
+    *)    K_GROUPSIZE=$GROUPSIZE ;;
+esac
 
 # --- Build rotation flags based on mode ---
 if [ "$MODE" == "full" ] || [ "$MODE" == "baseline" ]; then
@@ -137,8 +157,25 @@ elif [ "$MODE" == "quarot" ]; then
     SAVE_PREFIX="quarot"
 
 elif [ "$MODE" == "dart" ]; then
-    R2_PATH="../data/trained_rotation/wikitext2_128samples/r2/sgd.0.001.0.9.10.64.2"
-    R1_PATH="../data/trained_rotation/wikitext2_128samples/r1/sgd.0.0015.0.9.10.64.0.1.1"
+    case "$MODEL_NAME" in
+        Llama-2-7b-hf)
+            R2_PATH="../data/trained_rotation/wikitext2_128samples/r2/sgd.0.001.0.9.10.64.2"
+            R1_PATH="../data/trained_rotation/wikitext2_128samples/r1/sgd.0.0015.0.9.10.64.0.1.1"
+            ;;
+        Llama-3.2-1B-Instruct)
+            R2_PATH="../data/trained_rotation/wikitext2_128samples/Llama-3.2-1B-Instruct/r2/sgd.0.001.0.9.10.64.2"
+            R1_PATH="../data/trained_rotation/wikitext2_128samples/Llama-3.2-1B-Instruct/r1/sgd.0.0015.0.9.10.64.0.1.1"
+            ;;
+        Llama-3.2-3B-Instruct)
+            R2_PATH="../data/trained_rotation/wikitext2_128samples/Llama-3.2-3B-Instruct/r2/sgd.0.001.0.9.10.64.2"
+            R1_PATH="../data/trained_rotation/wikitext2_128samples/Llama-3.2-3B-Instruct/r1/sgd.0.0015.0.9.10.64.0.1.1"
+            ;;
+        *)
+            echo "Error: dart mode requires trained R1/R2 matrices for ${MODEL_NAME}."
+            echo "Train them first: cd calibrater && ./calibrate_model.sh -m <MODEL>"
+            exit 1
+            ;;
+    esac
 
     ROTATION_FLAGS="\
     --fuse_norm \
@@ -155,17 +192,23 @@ fi
 # --- Descriptive tag encoding the quantization config ---
 QUANT_TAG="w${W_BITS}a${A_BITS}k${KV_BITS}v${KV_BITS}_g${GROUPSIZE}_aAsym_${SYM_TAG}"
 
-# Result cache: /tmp/<mode>_<quant_tag>_results.pb  (JSON format)
-CACHE_PATH="/tmp/${SAVE_PREFIX}_${QUANT_TAG}_results.pb"
+# Result cache: /tmp/<mode>_<model>_<quant_tag>_results.pb  (JSON format)
+CACHE_PATH="/tmp/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG}_results.pb"
 OVERWRITE_FLAG=""
 if [ "$OVERWRITE" == "1" ]; then
     OVERWRITE_FLAG="--overwrite"
 fi
 
+if [ "$FAST" == "1" ]; then
+    tasks="piqa hellaswag arc_easy arc_challenge winogrande lambada_openai social_iqa openbookqa mmlu"
+else
+    tasks="hellaswag"
+fi
+
 CUDA_VISIBLE_DEVICES=${GPU_ID} python main_for_test.py \
     --model ${MODEL} \
     ${ROTATION_FLAGS} \
-    --gptq_checkpoint_path /tmp/${SAVE_PREFIX}_${QUANT_TAG} \
+    --gptq_checkpoint_path /tmp/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG} \
     --cache_path ${CACHE_PATH} \
     ${OVERWRITE_FLAG} \
     --w_groupsize ${GROUPSIZE} \
@@ -176,7 +219,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python main_for_test.py \
     --a_bits ${A_BITS} \
     --k_bits ${KV_BITS} \
     --v_bits ${KV_BITS} \
-    --k_groupsize ${GROUPSIZE} \
+    --k_groupsize ${K_GROUPSIZE} \
     --v_groupsize ${GROUPSIZE} \
     ${K_ASYM_FLAG} \
     ${V_ASYM_FLAG} \
@@ -190,4 +233,4 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python main_for_test.py \
     --ppl_eval_dataset wikitext2 ptb c4 \
     --lm_eval \
     --lm_eval_batch_size 2 \
-    --tasks piqa hellaswag arc_easy arc_challenge winogrande lambada_openai social_iqa openbookqa mmlu
+    --tasks ${tasks}

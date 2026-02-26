@@ -172,6 +172,7 @@ def gptq_fwrd(model, dataloader, dev, args):
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
+            cache['position_embeddings'] = kwargs.get('position_embeddings', None)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -189,6 +190,7 @@ def gptq_fwrd(model, dataloader, dev, args):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache.get('position_embeddings', None)
 
     quantizers = {}
     sequential = [
@@ -229,7 +231,7 @@ def gptq_fwrd(model, dataloader, dev, args):
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
-                                position_ids=position_ids)[0]
+                                position_ids=position_ids, position_embeddings=position_embeddings)[0]
             for h in handles:
                 h.remove()
 
@@ -243,7 +245,7 @@ def gptq_fwrd(model, dataloader, dev, args):
                 gptq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
 
         layers[i] = layer.cpu()
         del layer

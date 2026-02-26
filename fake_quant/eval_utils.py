@@ -69,6 +69,7 @@ def evaluator(model, testenc, dev, args):
             cache['attention_mask'] = kwargs['attention_mask']
             if llama_type:
                 cache['position_ids'] = kwargs['position_ids']
+                cache['position_embeddings'] = kwargs.get('position_embeddings', None)
             raise ValueError
     layers[0] = Catcher(layers[0])
 
@@ -91,6 +92,7 @@ def evaluator(model, testenc, dev, args):
     elif llama_type:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         position_ids = cache['position_ids']
+        position_embeddings = cache.get('position_embeddings', None)
 
     torch.cuda.empty_cache()
     outs = [0] * nbatches
@@ -114,7 +116,8 @@ def evaluator(model, testenc, dev, args):
             elif llama_type:
                 outs[j] = layer(
                     inps[j], attention_mask=attention_mask[0].repeat(
-                        bsz, 1, 1, 1), position_ids=position_ids)[0]
+                        bsz, 1, 1, 1), position_ids=position_ids,
+                    position_embeddings=position_embeddings)[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()

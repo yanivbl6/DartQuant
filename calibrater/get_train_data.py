@@ -80,6 +80,7 @@ def get_Rs_training_data(model, dataloader, save_path, args):
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
             cache["position_ids"] = kwargs.get("position_ids", None)
+            cache["position_embeddings"] = kwargs.get("position_embeddings", None)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -107,6 +108,7 @@ def get_Rs_training_data(model, dataloader, save_path, args):
 
     attention_mask = cache["attention_mask"]
     position_ids = cache["position_ids"]
+    position_embeddings = cache.get("position_embeddings", None)
 
     if attention_mask is not None:
         attention_mask = attention_mask.repeat(1, 1, 1, 1).to(dtype)
@@ -164,7 +166,8 @@ def get_Rs_training_data(model, dataloader, save_path, args):
         with torch.no_grad():
             for j in range(args.nsamples):
                 fp_inps[j] = decoder_layer(fp_inps[j].unsqueeze(
-                    0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                    0), attention_mask=attention_mask, position_ids=position_ids,
+                    position_embeddings=position_embeddings)[0]
 
         assert q_proj_inp['idx'] == args.nsamples, '检查一下代码，获取的样本数目不对。'
         assert up_proj_inp['idx'] == args.nsamples, '检查一下代码，获取的样本数目不对。'
