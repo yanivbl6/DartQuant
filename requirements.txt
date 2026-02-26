@@ -14,3 +14,4 @@ wandb==0.25.0
 tqdm
 pyyaml
 protobuf
+pyzmq
