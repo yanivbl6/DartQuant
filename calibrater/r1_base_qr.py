@@ -88,9 +88,9 @@ def train_R1(dataset, args):
         dataloader = DataLoader(dataset,        # 创建数据加载器
                                 sampler=sampler,
                                 batch_size=args.bsz,
-                                num_workers=8,
-                                prefetch_factor=3,
-                                persistent_workers=True,
+                                num_workers=0,
+##                                prefetch_factor=3,
+##                               persistent_workers=True,
                                 pin_memory=True)
 
         for batch_idx, batch_samples in enumerate(dataloader):
@@ -139,7 +139,7 @@ def parser_gen():
     parser = argparse.ArgumentParser()
 
     # General Arguments
-    parser.add_argument('--model', type=str, choices=supported_models,
+    parser.add_argument('--model', type=str,
                         help='model name.')
     parser.add_argument('--calib_dataset', type=str, default='wikitext2',
                         choices=supported_datasets,

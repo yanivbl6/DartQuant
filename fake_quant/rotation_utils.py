@@ -365,7 +365,11 @@ class QKRotationWrapper(torch.nn.Module):
         head_dim = model_dim // num_heads
         assert is_pow2(head_dim), f'Only power of 2 head_dim is supported for K-cache Quantization!'
         self.func = func
-        self.k_quantizer = quant_utils.ActQuantizer()
+        # Store k_quantizer as a plain attribute (not a registered submodule)
+        # to prevent accelerate's dispatch_model from adding hooks to it.
+        # Its buffers (scale, zero) are dynamically reshaped each forward call,
+        # which conflicts with accelerate's shape-tracking hooks.
+        object.__setattr__(self, 'k_quantizer', quant_utils.ActQuantizer())
         self.k_bits = 16
         if kwargs is not None:
             assert kwargs['k_groupsize'] in [-1,
@@ -381,6 +385,17 @@ class QKRotationWrapper(torch.nn.Module):
     def forward(self, *args, **kwargs):
         q, k = self.func(*args, **kwargs)
         dtype = q.dtype
+
+        # Ensure quantizer buffers are on the correct device. accelerate's
+        # dispatch_model may place them on meta device (no data), so we
+        # recreate them from scratch rather than using .to().
+        dev = q.device
+        if self.k_quantizer.maxq.device != dev:
+            _, maxq = quant_utils.get_minq_maxq(self.k_bits, self.k_sym)
+            self.k_quantizer.maxq = maxq.to(dev)
+            self.k_quantizer.scale = torch.zeros(1, device=dev)
+            self.k_quantizer.zero = torch.zeros(1, device=dev)
+
         if self.use_r3:
             q = hadamard_transform(q.float(), scale=1 / math.sqrt(q.shape[-1])).to(dtype)
             k = hadamard_transform(k.float(), scale=1 / math.sqrt(k.shape[-1])).to(dtype)

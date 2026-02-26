@@ -11,6 +11,7 @@ import args_config_gen
 import hadamard_utils
 import logging
 import os
+from result_cache import ResultCache
 
 
 def main():
@@ -70,6 +71,15 @@ def main():
             args.w_rtn, args.w_bits, args.w_groupsize, not (args.w_asym), args.w_clip))
 
         save_dict = {}
+
+        # Resolve GPTQ checkpoint path
+        _gptq_ckpt = None
+        if args.gptq_checkpoint_path:
+            _gptq_ckpt = os.path.join(
+                args.gptq_checkpoint_path,
+                f'{model.model_name}_w{args.w_bits}'
+            )
+
         if args.load_qmodel_path:  # Load Quantized Rotated Model
             # assert args.fuse_norm, "Model should be fused to load a quantized model!"
             assert not args.save_qmodel_path, "Cannot save a quantized model if it is already loaded!"
@@ -77,6 +87,12 @@ def main():
             utils.load_model_in_parts(model, args.load_qmodel_path)
             # save_dict = torch.load(args.load_qmodel_path, map_location='cpu')
             # model.load_state_dict(save_dict["model"])
+
+        elif _gptq_ckpt and os.path.isdir(_gptq_ckpt) and any(
+                f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
+            logging.info("Loading GPTQ checkpoint from: {}".format(_gptq_ckpt))
+            utils.load_model_in_parts(model, _gptq_ckpt)
+            logging.info("GPTQ checkpoint loaded – skipping quantization.")
 
         elif not args.w_rtn:  # GPTQ Weight Quantization
             assert "llama" in args.model, "Only llama is supported for GPTQ!"
@@ -91,6 +107,14 @@ def main():
                 w_fine_tuning.w_ft(model, trainloader, utils.DEV, args)
             quantizers = gptq_utils.gptq_fwrd(model, trainloader, utils.DEV, args)
             save_dict["w_quantizers"] = quantizers
+
+            # Auto-save GPTQ checkpoint
+            if _gptq_ckpt:
+                os.makedirs(_gptq_ckpt, exist_ok=True)
+                logging.info("Saving GPTQ checkpoint to: {}".format(_gptq_ckpt))
+                utils.save_model_in_parts(model, _gptq_ckpt,
+                                          prefix=f'{model.model_name}_part')
+
         else:  # RTN Weight Quantization
 
             if args.w_ft:  # 精度补偿：
@@ -191,18 +215,31 @@ def main():
     else:
         model.to(utils.DEV)
 
+    # ---------- Result cache ----------
+    cache = None
+    if args.cache_path:
+        cache = ResultCache(args.cache_path, overwrite=args.overwrite)
+
     if args.ppl_eval:
         logging.info("Evaluating PPL on datasets: {}".format(args.ppl_eval_dataset))
         for dataset in args.ppl_eval_dataset:
-            testenc = data_utils.get_loaders(
-                dataset,
-                seed=args.seed,
-                model=args.model,
-                seqlen=model.seqlen,
-                hf_token=args.hf_token,
-                eval_mode=True)
-            dataset_ppl = eval_utils.ppl_evaluator(model, testenc, utils.DEV, args)
-            logging.info(f'{dataset.upper()} PPL: {dataset_ppl:.2f}')
+            cache_key = f'ppl/{dataset}'
+            if cache and cache.has(cache_key):
+                dataset_ppl = cache.get(cache_key)
+                logging.info(f'{dataset.upper()} PPL: {dataset_ppl:.2f} (cached)')
+            else:
+                testenc = data_utils.get_loaders(
+                    dataset,
+                    seed=args.seed,
+                    model=args.model,
+                    seqlen=model.seqlen,
+                    hf_token=args.hf_token,
+                    eval_mode=True)
+                dataset_ppl = eval_utils.ppl_evaluator(model, testenc, utils.DEV, args)
+                logging.info(f'{dataset.upper()} PPL: {dataset_ppl:.2f}')
+                if cache:
+                    cache.set(cache_key, dataset_ppl)
+                    cache.save()
 
             if not args.log_to_console:
                 print(f'{dataset.upper()} PPL: {dataset_ppl:.2f}')
@@ -216,17 +253,47 @@ def main():
         from lm_eval.models.huggingface import HFLM
         from lm_eval.tasks import TaskManager   # lm_eval==0.4.3
 
-        tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, use_fast=False, use_auth_token=args.hf_token)
-        hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.lm_eval_batch_size)
+        # Some datasets (e.g. social_i_qa) require trust_remote_code.
+        # The env var is read at datasets import time, so patch the config directly.
+        import datasets.config
+        datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True
 
         task_manager = TaskManager()
         task_names = task_manager.match_tasks(args.tasks)
 
-        results = lm_eval.simple_evaluate(hflm, tasks=task_names,)['results']
+        # Determine which tasks still need to be evaluated
+        tasks_to_run = []
+        cached_results = {}
+        for t in task_names:
+            cache_key = f'lm_eval/{t}/acc'
+            if cache and cache.has(cache_key):
+                cached_results[t] = cache.get(cache_key)
+                logging.info(f'lm_eval {t}: {cached_results[t]} (cached)')
+            else:
+                tasks_to_run.append(t)
 
-        metric_vals = {task: round(result.get(
-            'acc_norm,none', result['acc,none']) * 100, 2) for task, result in results.items()}
+        if tasks_to_run:
+            logging.info(f"Running {len(tasks_to_run)} tasks (skipping {len(cached_results)} cached): {tasks_to_run}")
+            tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, use_fast=False, use_auth_token=args.hf_token)
+            hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.lm_eval_batch_size)
+
+            results = lm_eval.simple_evaluate(hflm, tasks=tasks_to_run,)['results']
+
+            for task, result in results.items():
+                acc = round(result.get('acc_norm,none', result['acc,none']) * 100, 2)
+                cached_results[task] = acc
+                if cache:
+                    cache.set(f'lm_eval/{task}/acc', acc)
+            if cache:
+                cache.save()
+        else:
+            logging.info("All lm_eval tasks found in cache — skipping evaluation.")
+
+        metric_vals = {task: acc for task, acc in cached_results.items()}
         metric_vals['acc_avg'] = round(sum(metric_vals.values()) / len(metric_vals.values()), 2)
+        if cache:
+            cache.set('lm_eval/acc_avg', metric_vals['acc_avg'])
+            cache.save()
 
         logging.info(metric_vals)
 

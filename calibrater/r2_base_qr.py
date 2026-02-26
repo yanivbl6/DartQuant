@@ -158,7 +158,7 @@ def parser_gen():
     parser = argparse.ArgumentParser()
 
     # General Arguments
-    parser.add_argument('--model', type=str, choices=supported_models,
+    parser.add_argument('--model', type=str,
                         help='model name.')
     parser.add_argument('--calib_dataset', type=str, default='wikitext2',
                         choices=supported_datasets,
@@ -238,12 +238,12 @@ def mian():
         # 加载数据集
         data_dire = os.path.join(args.data_path,
                                  f'layer_{layer_id}_self_attn_o_proj.pt')
-        r2_dataset = R2Dataset(data_dire, args.nsamples, 'cuda')
+        r2_dataset = R2Dataset(data_dire, args.nsamples, 'cpu')
         # 创建数据加载器
         dataloader = DataLoader(r2_dataset,
                                 batch_size=args.bsz,
                                 shuffle=True,
-                                # pin_memory=True,
+                                pin_memory=True,
                                 # num_workers=4
                                 )
 
@@ -251,7 +251,7 @@ def mian():
                       layer_id=layer_id,
                       device=device,
                       args=args)
-        save_dict[f"model.layers.{layer_id}.self_attn.R2"] = r2.detach()  # .cpu()
+        save_dict[f"model.layers.{layer_id}.self_attn.R2"] = r2.detach().cpu()
         print(f"---> layer {layer_id} 's r2 has been trained.")
         print(f"Allocated memory: {torch.cuda.memory_allocated() / 1024 ** 2:.2f} MB")
 

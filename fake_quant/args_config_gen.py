@@ -12,7 +12,7 @@ def parser_gen():
 
     # General Arguments
     parser.add_argument('--model', type=str, default='meta-llama/Llama-2-7b-hf',
-                        help='Model to load;', choices=supported_models)
+                        help='Model to load;')
     parser.add_argument('--seed', type=int, default=0, help='Random Seed for HuggingFace and PyTorch')
     parser.add_argument('--hf_token', type=str, default=None)
 
@@ -117,6 +117,8 @@ def parser_gen():
                         help='Load the quantized model from the specified path!')
     parser.add_argument('--save_qmodel_path', type=str, default=None,
                         help='Save the quantized model to the specified path!')
+    parser.add_argument('--gptq_checkpoint_path', type=str, default=None,
+                        help='Auto-checkpoint after GPTQ: if path exists, load; otherwise run GPTQ and save.')
 
     # WandB Arguments
     parser.add_argument('--wandb', action=argparse.BooleanOptionalAction, default=False)
@@ -135,6 +137,13 @@ def parser_gen():
     parser.add_argument('--capture_layer_io', action=argparse.BooleanOptionalAction, default=False,
                         help='Capture the input and output of the specified decoder layer and dump into a file')
     parser.add_argument('--layer_idx', type=int, default=10, help='Which decoder layer to capture')
+
+    # Result Caching Arguments
+    parser.add_argument('--cache_path', type=str, default=None,
+                        help='Path to the JSON result cache file (e.g. /tmp/quarot_results.pb). '
+                             'When set, completed eval results are saved and reused across runs.')
+    parser.add_argument('--overwrite', action='store_true', default=False,
+                        help='Ignore existing cached results and re-run all evaluations.')
 
     # PPL Eval Arguments
     parser.add_argument("--ppl_eval", action="store_true", help="Evaluate the model PPL")

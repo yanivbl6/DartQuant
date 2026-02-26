@@ -37,10 +37,11 @@ def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
         tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False, use_auth_token=hf_token)
 
     if eval_mode:
-        # ~/.cache/huggingface/datasets/allenai___c4/default-c7bc8b0aefc5e48f
-        # , data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}
-        valdata = datasets.load_dataset(
-            'allenai/c4', 'default-c7bc8b0aefc5e48f', split='validation')
+        c4_cache = '/data/data/huggingface/datasets/allenai___c4/default-ad670c44f8f136e7/0.0.0/1588ec454efa1a09f29cd18ddd04fe05fc8653a2'
+        valdata = datasets.concatenate_datasets([
+            datasets.Dataset.from_file(f'{c4_cache}/c4-validation-00000-of-00002.arrow'),
+            datasets.Dataset.from_file(f'{c4_cache}/c4-validation-00001-of-00002.arrow'),
+        ])
         valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
         valenc = valenc.input_ids[:, :(256 * seqlen)]
 
@@ -50,10 +51,11 @@ def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
         valenc = TokenizerWrapper(valenc)
         return valenc
     else:
-        # ~/.cache/huggingface/datasets/allenai___c4/default-b04fc8a0b8562884
-        # data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}
-        traindata = datasets.load_dataset(
-            'allenai/c4', 'default-b04fc8a0b8562884', split='train')
+        c4_cache = '/data/data/huggingface/datasets/allenai___c4/default-b04fc8a0b8562884/0.0.0/1588ec454efa1a09f29cd18ddd04fe05fc8653a2'
+        traindata = datasets.concatenate_datasets([
+            datasets.Dataset.from_file(f'{c4_cache}/c4-train-00000-of-00002.arrow'),
+            datasets.Dataset.from_file(f'{c4_cache}/c4-train-00001-of-00002.arrow'),
+        ])
 
         random.seed(seed)
         trainloader = []
@@ -80,11 +82,11 @@ def get_ptb_new(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
         tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False, use_auth_token=hf_token)
 
     if eval_mode:
-        testdata = datasets.load_dataset('ptb_text_only', 'penn_treebank', split='test')
+        testdata = datasets.load_dataset('ptb_text_only', 'penn_treebank', split='test', trust_remote_code=True)
         testenc = tokenizer(" ".join(testdata['sentence']), return_tensors='pt')
         return testenc
     else:
-        traindata = datasets.load_dataset('ptb_text_only', 'penn_treebank', split='train')
+        traindata = datasets.load_dataset('ptb_text_only', 'penn_treebank', split='train', trust_remote_code=True)
         trainenc = tokenizer(" ".join(traindata['sentence']), return_tensors='pt')
         random.seed(seed)
         trainloader = []

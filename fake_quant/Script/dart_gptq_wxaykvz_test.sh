@@ -1,6 +1,43 @@
 #!/bin/bash
 
-# 检查是否提供了8个参数：GPU编号
+# =============================================================================
+# DartQuant GPTQ Evaluation Script
+# =============================================================================
+#
+# Runs DartQuant rotation-based quantization (GPTQ for weights, fake-quant for
+# activations and KV-cache) using learned R1/R2 rotation matrices, then
+# evaluates perplexity and downstream accuracy.
+#
+# Quantization formats:
+#   Weights (W)     : W_BITS-bit integer, group=128, symmetric, GPTQ + MSE clip
+#   Activations (A) : A_BITS-bit integer, per-token, asymmetric, clip_ratio=0.9
+#   K-cache         : KV_BITS-bit integer, group=128, asymmetric (post-RoPE)
+#   V-cache         : KV_BITS-bit integer, group=128, asymmetric
+#
+# Excluded / special layers:
+#   lm_head   : excluded from quantization (kept at 16-bit for weights & activations)
+#   o_proj    : activation groupsize = head_dim (per-head, aligned with R2 rotation)
+#   down_proj : activation groupsize auto-computed to match intermediate size
+#
+# Four rotations applied:
+#   R1 : learned full rotation on residual stream (offline, from calibration)
+#   R2 : learned per-head rotation on attention output (offline, baked into weights)
+#   R3 : online Hadamard on K-cache (inside K quantization wrapper)
+#   R4 : online Hadamard on down_proj input (before activation quantization)
+#
+# Fallback behavior when R1/R2 paths are omitted:
+#   If --r1_path is not provided, R1 falls back to a standard Hadamard matrix.
+#   If --r2_path is not provided, R2 falls back to a per-head Hadamard matrix.
+#   This effectively yields a QuaRot-style (all-Hadamard) baseline, not "no rotation."
+#   To disable rotations entirely (plain GPTQ), use:
+#     --no-use_r1 --use_r2 none --no-use_r3 --no-use_r4 --no-fuse_norm
+#
+# Usage:
+#   bash dart_gptq_wxaykvz_test.sh <GPU_ID> <MODEL> <W_BITS> <A_BITS> \
+#                                   <KV_BITS> <R2_PATH> <R1_PATH>
+# =============================================================================
+
+# 检查是否提供了7个参数
 if [ "$#" -ne 7 ]; then
     echo "Usage: $0 <GPU_ID> <MODEL> <W_BITS> <A_BITS> <KV_BITS> <R2_PATH> <R1_PATH>"
     exit 1

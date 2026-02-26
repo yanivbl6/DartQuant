@@ -197,7 +197,7 @@ def ppl_evaluator(model, testenc, dev, args):
         hidden_states = outputs[0]
         logits = model.lm_head(hidden_states)
         shift_logits = logits[:, :-1, :]
-        shift_labels = input_ids[i][:, 1:].to(model.lm_head.weight.device)
+        shift_labels = input_ids[i][:, 1:].to(shift_logits.device)
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)),

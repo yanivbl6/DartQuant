@@ -215,7 +215,6 @@ def get_Rs_training_data(model, dataloader, save_path, args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='meta-llama/Llama-2-7b-hf',
-                        choices=utils.supported_models,
                         help='model name')
     parser.add_argument('--hf_token', type=str, default=None)
     parser.add_argument('--r_path', type=str, default='',
