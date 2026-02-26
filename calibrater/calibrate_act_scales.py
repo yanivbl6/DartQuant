@@ -287,11 +287,11 @@ def parse_args():
     parser.add_argument('--a_clip_ratio', type=float, default=0.9)
     parser.add_argument('--a_residual', action='store_true', default=False)
     parser.add_argument('--k_bits', type=int, default=4)
-    parser.add_argument('--k_groupsize', type=int, default=-1)
+    parser.add_argument('--k_groupsize', type=int, default=128)
     parser.add_argument('--k_asym', action='store_true', default=False)
     parser.add_argument('--k_clip_ratio', type=float, default=1.0)
     parser.add_argument('--v_bits', type=int, default=4)
-    parser.add_argument('--v_groupsize', type=int, default=-1)
+    parser.add_argument('--v_groupsize', type=int, default=128)
     parser.add_argument('--v_asym', action='store_true', default=False)
     parser.add_argument('--v_clip_ratio', type=float, default=1.0)
     parser.add_argument('--o_per_head', action='store_true', default=False)
@@ -451,8 +451,13 @@ def main():
     if args.k_bits < 16:
         rope_function_name = model_utils.get_rope_function_name(model)
         layers = model_utils.get_layers(model)
+        # Cap k_groupsize at head_dim (mirrors shell script logic for small-head models)
+        head_dim = model.config.hidden_size // model.config.num_attention_heads
+        k_groupsize = args.k_groupsize
+        if k_groupsize > 0 and k_groupsize > head_dim:
+            k_groupsize = head_dim
         k_quant_config = {
-            'k_bits': args.k_bits, 'k_groupsize': args.k_groupsize,
+            'k_bits': args.k_bits, 'k_groupsize': k_groupsize,
             'k_sym': not args.k_asym, 'k_clip_ratio': args.k_clip_ratio,
             'use_r3': (args.mode in ('quarot', 'dart')),
         }
