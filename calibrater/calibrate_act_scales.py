@@ -5,16 +5,16 @@ layer-by-layer activation statistics collection.
 
 The GPTQ checkpoint is saved so the experiment script can load it directly.
 
-Usage:
-    python calibrate_act_scales.py \
-        --model /path/to/model \
-        --mode dart \
-        --r1_path ../data/trained_rotation/.../r1/... \
-        --r2_path ../data/trained_rotation/.../r2/... \
-        --a_bits 8 --k_bits 4 --v_bits 4 --a_asym --o_per_head \
-        --w_bits 4 --w_groupsize 128 --w_clip --percdamp 0.1 \
-        --gptq_checkpoint_path /tmp/dart_Llama-3.2-1B-Instruct_w4a8k4v4_g128_aAsym_kAsym_vAsym \
-        --save_path ../data/act_scales/model_name/scales.pt
+Simplified usage (mirrors experiment script conventions):
+    python calibrate_act_scales.py --mode dart -m 1b --sym --r1 --r2
+    python calibrate_act_scales.py --mode quarot -m 1b --sym
+    python calibrate_act_scales.py --mode baseline -m 3b
+
+Explicit paths (override auto-deduction):
+    python calibrate_act_scales.py --mode dart -m 1b --sym \
+        --r1_path /path/to/r1 --r2_path /path/to/r2 \
+        --save_path /path/to/scales.pt \
+        --gptq_checkpoint_path /tmp/my_ckpt
 """
 
 import torch
@@ -261,54 +261,91 @@ def _find_quantizer(layer, cname, layer_idx, model, rope_fn):
     return None
 
 
+MODEL_BASE = "/data/users/sashas/LLMC/Models/meta-llama"
+MODEL_MAP = {
+    '1b': f'{MODEL_BASE}/Llama-3.2-1B-Instruct',
+    '3b': f'{MODEL_BASE}/Llama-3.2-3B-Instruct',
+    '7b': f'{MODEL_BASE}/Llama-2-7b-hf',
+}
+
+# Default R1/R2 paths per model (same as experiment script dart mode)
+R1_PATHS = {
+    'Llama-2-7b-hf':          '../data/trained_rotation/wikitext2_128samples/r1/sgd.0.0015.0.9.10.64.0.1.1',
+    'Llama-3.2-1B-Instruct':  '../data/trained_rotation/wikitext2_128samples/Llama-3.2-1B-Instruct/r1/sgd.0.0015.0.9.10.64.0.1.1',
+    'Llama-3.2-3B-Instruct':  '../data/trained_rotation/wikitext2_128samples/Llama-3.2-3B-Instruct/r1/sgd.0.0015.0.9.10.64.0.1.1',
+}
+R2_PATHS = {
+    'Llama-2-7b-hf':          '../data/trained_rotation/wikitext2_128samples/r2/sgd.0.001.0.9.10.64.2',
+    'Llama-3.2-1B-Instruct':  '../data/trained_rotation/wikitext2_128samples/Llama-3.2-1B-Instruct/r2/sgd.0.001.0.9.10.64.2',
+    'Llama-3.2-3B-Instruct':  '../data/trained_rotation/wikitext2_128samples/Llama-3.2-3B-Instruct/r2/sgd.0.001.0.9.10.64.2',
+}
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description='Calibrate static activation scales')
-    parser.add_argument('--model', type=str, required=True, help='Model path or HF name')
+    parser = argparse.ArgumentParser(
+        description='Calibrate static activation scales',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python calibrate_act_scales.py --mode dart -m 1b --sym --r1 --r2
+  python calibrate_act_scales.py --mode quarot -m 3b --sym
+  python calibrate_act_scales.py --mode baseline -m 7b
+  python calibrate_act_scales.py --mode dart -m 1b --r1_path /my/r1 --r2_path /my/r2
+""")
+
+    # Model
+    parser.add_argument('-m', '--model', type=str, required=True,
+                        help='Model path, HF name, or shorthand: 1b, 3b, 7b')
     parser.add_argument('--hf_token', type=str, default=None)
+
+    # Mode
+    parser.add_argument('--mode', type=str, default='dart',
+                        choices=['baseline', 'quarot', 'dart'])
+
+    # R1/R2 rotation paths
+    parser.add_argument('--r1', action='store_true',
+                        help='Auto-lookup R1 path for this model (dart mode)')
+    parser.add_argument('--r2', action='store_true',
+                        help='Auto-lookup R2 path for this model (dart mode)')
+    parser.add_argument('--r1_path', type=str, default=None,
+                        help='Explicit R1 path (overrides --r1)')
+    parser.add_argument('--r2_path', type=str, default=None,
+                        help='Explicit R2 path (overrides --r2)')
+
+    # Quantization (matching experiment script defaults)
+    parser.add_argument('-w', '--w_bits', type=int, default=4)
+    parser.add_argument('-a', '--a_bits', type=int, default=8)
+    parser.add_argument('-k', '--k_bits', type=int, default=4)
+    parser.add_argument('--v_bits', type=int, default=4)
+    parser.add_argument('-G', '--groupsize', type=int, default=128,
+                        help='Group size for W, K, V (default: 128)')
+    parser.add_argument('--sym', action='store_true',
+                        help='Symmetric K/V quantization (default: asymmetric)')
+
+    # Rarely changed tuning knobs
+    parser.add_argument('--a_clip_ratio', type=float, default=0.9)
+    parser.add_argument('--k_clip_ratio', type=float, default=1.0)
+    parser.add_argument('--v_clip_ratio', type=float, default=1.0)
+    parser.add_argument('--percdamp', type=float, default=0.1)
+    parser.add_argument('--a_groupsize', type=int, default=-1)
+    parser.add_argument('--a_residual', action='store_true')
+    parser.add_argument('--fp32_had', action='store_true')
+    parser.add_argument('--rotate_mode', type=str, default='hadamard',
+                        choices=['hadamard', 'random'])
+
+    # Calibration
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--nsamples', type=int, default=128)
     parser.add_argument('--seqlen', type=int, default=2048)
     parser.add_argument('--calib_dataset', type=str, default='wikitext2',
                         choices=['wikitext2', 'ptb', 'c4'])
 
-    # Mode: determines rotation config
-    parser.add_argument('--mode', type=str, default='dart',
-                        choices=['baseline', 'quarot', 'dart'],
-                        help='Which rotation mode to use (determines R1-R4 config)')
-    parser.add_argument('--r1_path', type=str, default=None)
-    parser.add_argument('--r2_path', type=str, default=None)
-    parser.add_argument('--rotate_mode', type=str, default='hadamard',
-                        choices=['hadamard', 'random'])
-
-    # Activation quantization config
-    parser.add_argument('--a_bits', type=int, default=8)
-    parser.add_argument('--a_groupsize', type=int, default=-1)
-    parser.add_argument('--a_asym', action='store_true', default=False)
-    parser.add_argument('--a_clip_ratio', type=float, default=0.9)
-    parser.add_argument('--a_residual', action='store_true', default=False)
-    parser.add_argument('--k_bits', type=int, default=4)
-    parser.add_argument('--k_groupsize', type=int, default=128)
-    parser.add_argument('--k_asym', action='store_true', default=False)
-    parser.add_argument('--k_clip_ratio', type=float, default=1.0)
-    parser.add_argument('--v_bits', type=int, default=4)
-    parser.add_argument('--v_groupsize', type=int, default=128)
-    parser.add_argument('--v_asym', action='store_true', default=False)
-    parser.add_argument('--v_clip_ratio', type=float, default=1.0)
-    parser.add_argument('--o_per_head', action='store_true', default=False)
-    parser.add_argument('--fp32_had', action='store_true', default=False)
-
-    # Weight quantization / GPTQ config
-    parser.add_argument('--w_bits', type=int, default=4)
-    parser.add_argument('--w_groupsize', type=int, default=128)
-    parser.add_argument('--w_asym', action='store_true', default=False)
-    parser.add_argument('--w_clip', action='store_true', default=False)
-    parser.add_argument('--percdamp', type=float, default=0.1)
+    # Output paths (auto-deduced if not specified)
+    parser.add_argument('--save_path', type=str, default=None,
+                        help='Where to save scales .pt (auto-deduced if omitted)')
     parser.add_argument('--gptq_checkpoint_path', type=str, default=None,
-                        help='Directory to save/load GPTQ checkpoint. '
-                             'If checkpoint exists, loads it; otherwise runs GPTQ and saves.')
+                        help='GPTQ checkpoint dir (auto-deduced if omitted)')
 
-    parser.add_argument('--save_path', type=str, required=True,
-                        help='Where to save the calibrated scales .pt file')
     return parser.parse_args()
 
 
@@ -317,9 +354,64 @@ def main():
     import transformers
     transformers.set_seed(args.seed)
 
+    # --- Resolve model shorthand ---
+    if args.model in MODEL_MAP:
+        args.model = MODEL_MAP[args.model]
+    model_name = os.path.basename(args.model.rstrip('/'))
+
+    # --- Resolve --r1/--r2 auto-lookup ---
+    if args.r1 and args.r1_path is None:
+        if model_name not in R1_PATHS:
+            print(f"Error: no default R1 path for {model_name}. Use --r1_path explicitly.")
+            sys.exit(1)
+        args.r1_path = R1_PATHS[model_name]
+    if args.r2 and args.r2_path is None:
+        if model_name not in R2_PATHS:
+            print(f"Error: no default R2 path for {model_name}. Use --r2_path explicitly.")
+            sys.exit(1)
+        args.r2_path = R2_PATHS[model_name]
+
+    # --- Derive symmetry flags (matching experiment script) ---
+    # Activations are always asymmetric; --sym controls K/V/W
+    args.a_asym = True
+    args.k_asym = not args.sym
+    args.v_asym = not args.sym
+    args.w_asym = False  # W is always symmetric
+
+    sym_tag = "wSym_kSym_vSym" if args.sym else "kAsym_vAsym"
+
+    # --- Derive groupsizes from --groupsize ---
+    args.w_groupsize = args.groupsize
+    args.k_groupsize = args.groupsize
+    args.v_groupsize = args.groupsize
+
+    # --- Always-on flags for quarot/dart ---
+    args.o_per_head = (args.mode in ('quarot', 'dart'))
+    args.w_clip = True
+
+    # --- Build quant tag (matching experiment script convention) ---
+    quant_tag = f"w{args.w_bits}a{args.a_bits}k{args.k_bits}v{args.v_bits}_g{args.groupsize}_aAsym_{sym_tag}"
+    save_prefix = args.mode
+
+    # --- Auto-deduce output paths ---
+    if args.save_path is None:
+        args.save_path = f"../data/act_scales/{model_name}/{save_prefix}_{quant_tag}.pt"
+    if args.gptq_checkpoint_path is None:
+        args.gptq_checkpoint_path = f"/tmp/{save_prefix}_{model_name}_{quant_tag}"
+
+    # --- Print resolved config ---
+    print(f"Mode:       {args.mode}")
+    print(f"Model:      {args.model}")
+    print(f"Quant tag:  {quant_tag}")
+    print(f"R1 path:    {args.r1_path}")
+    print(f"R2 path:    {args.r2_path}")
+    print(f"GPTQ ckpt:  {args.gptq_checkpoint_path}")
+    print(f"Save path:  {args.save_path}")
+    print()
+
     model = model_utils.get_model(args.model, args.hf_token)
     model.eval()
-    model.model_name = args.model.split('/')[-1]
+    model.model_name = model_name
 
     # --- Set up rotations to match experiment pipeline ---
     if args.mode in ('quarot', 'dart'):
@@ -373,12 +465,9 @@ def main():
     # Must happen before activation calibration so we measure activations
     # flowing through quantized weights (matching actual inference).
     if args.w_bits < 16:
-        model_name = model.model_name
-        _gptq_ckpt = None
-        if args.gptq_checkpoint_path:
-            _gptq_ckpt = os.path.join(args.gptq_checkpoint_path, f'{model_name}_w{args.w_bits}')
+        _gptq_ckpt = os.path.join(args.gptq_checkpoint_path, f'{model_name}_w{args.w_bits}')
 
-        if _gptq_ckpt and os.path.isdir(_gptq_ckpt) and any(
+        if os.path.isdir(_gptq_ckpt) and any(
                 f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
             print(f"Loading existing GPTQ checkpoint from: {_gptq_ckpt}")
             utils.load_model_in_parts(model, _gptq_ckpt)
@@ -389,7 +478,6 @@ def main():
                 seed=args.seed, model=args.model,
                 seqlen=model.seqlen, eval_mode=False)
 
-            # Build args namespace that gptq_fwrd expects
             class GptqArgs:
                 pass
             gptq_args = GptqArgs()
@@ -405,12 +493,10 @@ def main():
 
             gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
 
-            # Save checkpoint for the experiment to reuse
-            if _gptq_ckpt:
-                os.makedirs(_gptq_ckpt, exist_ok=True)
-                print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
-                utils.save_model_in_parts(model, _gptq_ckpt,
-                                          prefix=f'{model_name}_part')
+            os.makedirs(_gptq_ckpt, exist_ok=True)
+            print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
+            utils.save_model_in_parts(model, _gptq_ckpt,
+                                      prefix=f'{model_name}_part')
 
         utils.cleanup_memory(verbos=True)
 
