@@ -1,6 +1,7 @@
 data/train_data/wikitext2_128samples/r1_train/sample_0_layer_0_mlp_up_proj.pt
-*.txt
 *.pt
 *.pyc
 *.dat
 *.json
+calibrater/logs/time_log.txt
+calibrater/logs/r2_time_log.txt

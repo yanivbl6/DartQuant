@@ -1,0 +1,16 @@
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
+transformers==5.2.0
+tokenizers==0.22.2
+accelerate==0.31.0
+safetensors==0.7.0
+datasets==2.20.0
+sentencepiece==0.2.1
+huggingface_hub==1.4.1
+numpy==2.1.1
+scipy==1.17.1
+wandb==0.25.0
+tqdm
+pyyaml
+protobuf
