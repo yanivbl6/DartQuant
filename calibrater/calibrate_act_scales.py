@@ -1,7 +1,9 @@
 """
 Calibrate static activation scales for all ActQuantWrapper and QKRotationWrapper
-quantizers. Runs the model layer-by-layer on calibration data, collecting per-channel
-min/max statistics, then saves {name: {scale, zero}} to a .pt file.
+quantizers. Runs the full pipeline: rotations -> GPTQ weight quantization ->
+layer-by-layer activation statistics collection.
+
+The GPTQ checkpoint is saved so the experiment script can load it directly.
 
 Usage:
     python calibrate_act_scales.py \
@@ -9,9 +11,9 @@ Usage:
         --mode dart \
         --r1_path ../data/trained_rotation/.../r1/... \
         --r2_path ../data/trained_rotation/.../r2/... \
-        --a_bits 8 --k_bits 4 --v_bits 4 \
-        --a_groupsize -1 --k_groupsize 128 --v_groupsize 128 \
-        --a_clip_ratio 0.9 --a_asym \
+        --a_bits 8 --k_bits 4 --v_bits 4 --a_asym --o_per_head \
+        --w_bits 4 --w_groupsize 128 --w_clip --percdamp 0.1 \
+        --gptq_checkpoint_path /tmp/dart_Llama-3.2-1B-Instruct_w4a8k4v4_g128_aAsym_kAsym_vAsym \
         --save_path ../data/act_scales/model_name/scales.pt
 """
 
@@ -23,6 +25,7 @@ import sys
 import gc
 import functools
 import math
+import logging
 from tqdm import tqdm
 
 sys.path.append('../fake_quant')
@@ -31,6 +34,7 @@ import model_utils
 import data_utils
 import rotation_utils
 import quant_utils
+import gptq_utils
 import hadamard_utils
 import utils
 
@@ -91,7 +95,6 @@ def calibrate_act_scales(model, dataloader, args):
     position_embeddings = cache.get('position_embeddings', None)
 
     # --- Collect per-channel min/max for each quantizer ---
-    # We accumulate running min/max across all samples.
     act_scales = {}
 
     for i in tqdm(range(len(layers)), desc="Calibrating layers"):
@@ -103,7 +106,6 @@ def calibrate_act_scales(model, dataloader, args):
         def collect_hook(module, inp, out, name):
             """Forward hook to collect min/max of the input tensor."""
             x = inp[0] if isinstance(inp, tuple) else inp
-            # Reduce over all dims except the last (channel dim) -> per-channel stats
             flat = x.reshape(-1, x.shape[-1]).float()
             cmin = flat.min(dim=0)[0]
             cmax = flat.max(dim=0)[0]
@@ -145,9 +147,6 @@ def calibrate_act_scales(model, dataloader, args):
         if hasattr(layer.self_attn, wrapper_attr):
             wrapper = getattr(layer.self_attn, wrapper_attr)
             if wrapper.k_quantizer.bits < 16:
-                # For K-cache, we need to collect after RoPE + R3 Hadamard.
-                # The wrapper itself applies find_params dynamically; instead
-                # we hook the wrapper's forward to capture the k tensor.
                 original_forward = wrapper.forward
 
                 def make_k_hook(layer_idx, orig_fwd, wrap):
@@ -171,7 +170,7 @@ def calibrate_act_scales(model, dataloader, args):
                         else:
                             collectors[cname]['min'] = torch.minimum(collectors[cname]['min'], cmin)
                             collectors[cname]['max'] = torch.maximum(collectors[cname]['max'], cmax)
-                        # Still need to quantize K for correct layer output
+                        # Still quantize K for correct layer output propagation
                         wrap.k_quantizer.find_params(flat_k)
                         if wrap.k_groupsize == -1:
                             k = wrap.k_quantizer(flat_k).reshape((bsz, seq_len, num_heads, head_dim)).transpose(1, 2).to(q)
@@ -190,21 +189,15 @@ def calibrate_act_scales(model, dataloader, args):
                             position_ids=position_ids,
                             position_embeddings=position_embeddings)[0]
 
-        # Remove hooks, restore original forward
+        # Remove hooks
         for h in hooks:
             h.remove()
-        if hasattr(layer.self_attn, wrapper_attr):
-            wrapper = getattr(layer.self_attn, wrapper_attr)
-            if hasattr(wrapper, '_orig_forward'):
-                wrapper.forward = wrapper._orig_forward
 
         # Compute scale/zero from collected min/max
         for cname, stats in collectors.items():
             cmin = stats['min']
             cmax = stats['max']
 
-            # Determine quantizer config to compute scales correctly
-            # Find the matching quantizer to get bits/sym/clip_ratio
             qtz = _find_quantizer(layer, cname, i, model, rope_fn)
             if qtz is None:
                 continue
@@ -249,7 +242,6 @@ def _find_quantizer(layer, cname, layer_idx, model, rope_fn):
     """Look up the ActQuantizer object matching a collector name."""
     qlayers = quant_utils.find_qlayers(layer, layers=[quant_utils.ActQuantWrapper])
 
-    # ActQuantWrapper quantizers: "model.layers.{i}.{subname}.quantizer"
     prefix = f'model.layers.{layer_idx}.'
     if cname.startswith(prefix) and cname.endswith('.quantizer'):
         subname = cname[len(prefix):-len('.quantizer')]
@@ -261,7 +253,6 @@ def _find_quantizer(layer, cname, layer_idx, model, rope_fn):
         if subname in qlayers:
             return qlayers[subname].out_quantizer
 
-    # K-cache quantizer: "layer.{i}.k_quantizer"
     if cname == f'layer.{layer_idx}.k_quantizer':
         wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
         if hasattr(layer.self_attn, wrapper_attr):
@@ -289,7 +280,7 @@ def parse_args():
     parser.add_argument('--rotate_mode', type=str, default='hadamard',
                         choices=['hadamard', 'random'])
 
-    # Quantization config (must match experiment config)
+    # Activation quantization config
     parser.add_argument('--a_bits', type=int, default=8)
     parser.add_argument('--a_groupsize', type=int, default=-1)
     parser.add_argument('--a_asym', action='store_true', default=False)
@@ -306,6 +297,16 @@ def parse_args():
     parser.add_argument('--o_per_head', action='store_true', default=False)
     parser.add_argument('--fp32_had', action='store_true', default=False)
 
+    # Weight quantization / GPTQ config
+    parser.add_argument('--w_bits', type=int, default=4)
+    parser.add_argument('--w_groupsize', type=int, default=128)
+    parser.add_argument('--w_asym', action='store_true', default=False)
+    parser.add_argument('--w_clip', action='store_true', default=False)
+    parser.add_argument('--percdamp', type=float, default=0.1)
+    parser.add_argument('--gptq_checkpoint_path', type=str, default=None,
+                        help='Directory to save/load GPTQ checkpoint. '
+                             'If checkpoint exists, loads it; otherwise runs GPTQ and saves.')
+
     parser.add_argument('--save_path', type=str, required=True,
                         help='Where to save the calibrated scales .pt file')
     return parser.parse_args()
@@ -318,12 +319,12 @@ def main():
 
     model = model_utils.get_model(args.model, args.hf_token)
     model.eval()
+    model.model_name = args.model.split('/')[-1]
 
     # --- Set up rotations to match experiment pipeline ---
     if args.mode in ('quarot', 'dart'):
         rotation_utils.fuse_layer_norms(model)
 
-        # Build a namespace that rotation_utils.rotate_model expects
         class RotArgs:
             pass
         rot_args = RotArgs()
@@ -339,10 +340,10 @@ def main():
         rot_args.use_r4 = True
         rot_args.use_r3 = True
         rot_args.o_per_head = args.o_per_head
+        rot_args.smooth = None
 
         rotation_utils.rotate_model(model, rot_args)
     elif args.mode == 'baseline':
-        # No rotations, no norm fusion
         pass
 
     utils.cleanup_memory(verbos=True)
@@ -368,7 +369,52 @@ def main():
                 qlayers[name].had_dim = model.config.hidden_size // model.config.num_attention_heads
                 qlayers[name].fp32_had = args.fp32_had
 
-    # Configure quantizer bit-widths
+    # --- GPTQ weight quantization ---
+    # Must happen before activation calibration so we measure activations
+    # flowing through quantized weights (matching actual inference).
+    if args.w_bits < 16:
+        model_name = model.model_name
+        _gptq_ckpt = None
+        if args.gptq_checkpoint_path:
+            _gptq_ckpt = os.path.join(args.gptq_checkpoint_path, f'{model_name}_w{args.w_bits}')
+
+        if _gptq_ckpt and os.path.isdir(_gptq_ckpt) and any(
+                f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
+            print(f"Loading existing GPTQ checkpoint from: {_gptq_ckpt}")
+            utils.load_model_in_parts(model, _gptq_ckpt)
+        else:
+            print(f"Running GPTQ (w{args.w_bits}, groupsize={args.w_groupsize}) ...")
+            trainloader = data_utils.get_loaders(
+                args.calib_dataset, nsamples=args.nsamples,
+                seed=args.seed, model=args.model,
+                seqlen=model.seqlen, eval_mode=False)
+
+            # Build args namespace that gptq_fwrd expects
+            class GptqArgs:
+                pass
+            gptq_args = GptqArgs()
+            gptq_args.nsamples = args.nsamples
+            gptq_args.w_bits = args.w_bits
+            gptq_args.w_asym = args.w_asym
+            gptq_args.w_groupsize = args.w_groupsize
+            gptq_args.w_clip = args.w_clip
+            gptq_args.w_bits_down_proj = None
+            gptq_args.percdamp = args.percdamp
+            gptq_args.act_order = False
+            gptq_args.w_static_groups = False
+
+            gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
+
+            # Save checkpoint for the experiment to reuse
+            if _gptq_ckpt:
+                os.makedirs(_gptq_ckpt, exist_ok=True)
+                print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
+                utils.save_model_in_parts(model, _gptq_ckpt,
+                                          prefix=f'{model_name}_part')
+
+        utils.cleanup_memory(verbos=True)
+
+    # --- Configure activation quantizer bit-widths ---
     down_proj_groupsize = -1
     if args.a_groupsize > 0:
         down_proj_groupsize = utils.llama_down_proj_groupsize(model, args.a_groupsize)
@@ -421,7 +467,7 @@ def main():
         seed=args.seed, model=args.model,
         seqlen=model.seqlen, eval_mode=False)
 
-    # --- Run calibration ---
+    # --- Run activation scale calibration ---
     act_scales = calibrate_act_scales(model, dataloader, args)
 
     # --- Save ---
@@ -429,7 +475,7 @@ def main():
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
     torch.save(act_scales, args.save_path)
-    print(f"Saved {len(act_scales)} activation scale entries to {args.save_path}")
+    print(f"\nSaved {len(act_scales)} activation scale entries to {args.save_path}")
     for k in sorted(act_scales.keys()):
         s = act_scales[k]['scale']
         print(f"  {k}: scale shape={list(s.shape)}, range=[{s.min():.6f}, {s.max():.6f}]")
