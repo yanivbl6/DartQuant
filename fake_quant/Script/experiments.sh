@@ -6,7 +6,8 @@ export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
 
 
 
-
+rm /tmp/*_results.out
+rm /tmp/*_results.err
 
 ./Script/dart_gptq_wxaykvz.sh full -g 1 "$@" > /tmp/full_results.out 2> /tmp/full_results.err &
 ./Script/dart_gptq_wxaykvz.sh baseline -g 2 -w 4 -a 8 -k 4 -G 128 --sym "$@" > /tmp/baseline_results.out 2> /tmp/baseline_results.err &
