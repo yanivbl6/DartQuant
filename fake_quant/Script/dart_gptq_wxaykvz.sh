@@ -36,6 +36,8 @@ Options:
   --sym            Use symmetric quantization for W/K/V (default: asymmetric)
   --overwrite      Ignore cached results, re-run all
   --gptq           Delete cached GPTQ checkpoint and re-quantize
+  --kv_ex N        K-cache quant without R3 rotation            (default: 0=off)
+  --proj_ex N      Down-proj input quant without R4 rotation   (default: 0=off)
   --static-act     Use pre-calibrated static activation scales
   -F FAST          Enable fast model
   -h               Show this help message
@@ -82,6 +84,8 @@ OVERWRITE=0
 FAST=0
 STATIC_ACT=0
 REDO_GPTQ=0
+KV_EX=0
+PROJ_EX=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -96,6 +100,8 @@ while [[ $# -gt 0 ]]; do
         --overwrite) OVERWRITE=1; shift   ;;
         --static-act) STATIC_ACT=1; shift ;;
         --gptq)   REDO_GPTQ=1;   shift   ;;
+        --kv_ex)  KV_EX="$2";   shift 2 ;;
+        --proj_ex) PROJ_EX="$2"; shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
         -h|--help) usage ;;
         *)
@@ -197,6 +203,12 @@ fi
 
 # --- Descriptive tag encoding the quantization config ---
 QUANT_TAG="w${W_BITS}a${A_BITS}k${KV_BITS}v${KV_BITS}_g${GROUPSIZE}_aAsym_${SYM_TAG}"
+if [ "$KV_EX" != "0" ]; then
+    QUANT_TAG="${QUANT_TAG}_kvex${KV_EX}"
+fi
+if [ "$PROJ_EX" != "0" ]; then
+    QUANT_TAG="${QUANT_TAG}_projex${PROJ_EX}"
+fi
 
 OVERWRITE_FLAG=""
 if [ "$OVERWRITE" == "1" ]; then
@@ -262,6 +274,8 @@ python main_for_test.py \
     ${K_ASYM_FLAG} \
     ${V_ASYM_FLAG} \
     ${STATIC_ACT_FLAG} \
+    --kv_ex ${KV_EX} \
+    --proj_ex ${PROJ_EX} \
     --percdamp 0.1 \
     --no-w_ft \
     --ft_percdamp 0.0 \

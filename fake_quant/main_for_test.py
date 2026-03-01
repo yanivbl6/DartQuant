@@ -33,6 +33,16 @@ def main():
     model.eval()
     model.model_name = args.model.split('/')[-1]
 
+    # --- kv_ex / proj_ex overrides (must be before rotate_model) ---
+    if args.kv_ex != 0:
+        logging.info("kv_ex=%d: disabling R3, setting k_bits=%d", args.kv_ex, args.kv_ex)
+        args.use_r3 = False
+        args.k_bits = args.kv_ex
+
+    if args.proj_ex != 0:
+        logging.info("proj_ex=%d: disabling R4, setting down_proj input bits=%d", args.proj_ex, args.proj_ex)
+        args.use_r4 = False
+
     # Rotate the weights
     if args.fuse_norm:
         logging.info("Fuse LayerNorms")
@@ -181,7 +191,9 @@ def main():
                 layer_groupsize = model_dim // num_heads
 
             if 'down_proj' in name:  # Set the down_proj precision
-                if args.a_bits_down_proj is not None:
+                if args.proj_ex != 0:
+                    layer_input_bits = args.proj_ex
+                elif args.a_bits_down_proj is not None:
                     layer_input_bits = args.a_bits_down_proj
                 layer_groupsize = down_proj_groupsize
 

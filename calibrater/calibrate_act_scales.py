@@ -329,6 +329,10 @@ Examples:
     parser.add_argument('--percdamp', type=float, default=0.1)
     parser.add_argument('--a_groupsize', type=int, default=-1)
     parser.add_argument('--a_residual', action='store_true')
+    parser.add_argument('--kv_ex', type=int, default=0,
+                        help='When non-zero, disable R3 and quantize K-cache to N bits')
+    parser.add_argument('--proj_ex', type=int, default=0,
+                        help='When non-zero, disable R4 and quantize down_proj input to N bits')
     parser.add_argument('--fp32_had', action='store_true')
     parser.add_argument('--rotate_mode', type=str, default='hadamard',
                         choices=['hadamard', 'random'])
@@ -391,6 +395,10 @@ def main():
 
     # --- Build quant tag (matching experiment script convention) ---
     quant_tag = f"w{args.w_bits}a{args.a_bits}k{args.k_bits}v{args.v_bits}_g{args.groupsize}_aAsym_{sym_tag}"
+    if args.kv_ex != 0:
+        quant_tag += f"_kvex{args.kv_ex}"
+    if args.proj_ex != 0:
+        quant_tag += f"_projex{args.proj_ex}"
     save_prefix = args.mode
 
     # --- Auto-deduce output paths ---
@@ -429,13 +437,17 @@ def main():
         rot_args.r2_path = args.r2_path
         if args.r2_path and '.pt' not in args.r2_path and '.bin' not in args.r2_path:
             rot_args.r2_path += '/' + args.r2_path.split('/')[-1] + '.pt'
-        rot_args.use_r4 = True
-        rot_args.use_r3 = True
+        rot_args.use_r4 = (args.proj_ex == 0)
+        rot_args.use_r3 = (args.kv_ex == 0)
         rot_args.o_per_head = args.o_per_head
         rot_args.smooth = None
 
         rotation_utils.rotate_model(model, rot_args)
-    elif args.mode == 'baseline':
+
+    if args.kv_ex != 0:
+        args.k_bits = args.kv_ex
+
+    if args.mode == 'baseline':
         pass
 
     utils.cleanup_memory(verbos=True)
@@ -447,13 +459,13 @@ def main():
     # Configure online Hadamard for R4 (down_proj) and online R2 (o_proj)
     if args.mode in ('quarot', 'dart'):
         for name in qlayers:
-            if 'down_proj' in name:
+            if 'down_proj' in name and args.proj_ex == 0:
                 had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
                 qlayers[name].online_full_had = True
                 qlayers[name].had_K = had_K
                 qlayers[name].K = K
                 qlayers[name].fp32_had = args.fp32_had
-            if 'o_proj' in name and args.o_per_head:
+            if 'o_proj' in name and rot_args.use_r2 == 'online':
                 had_K, K = hadamard_utils.get_hadK(model.config.num_attention_heads)
                 qlayers[name].online_partial_had = True
                 qlayers[name].had_K = had_K
@@ -527,6 +539,8 @@ def main():
             layer_groupsize = model_dim // num_heads
 
         if 'down_proj' in name:
+            if args.proj_ex != 0:
+                layer_input_bits = args.proj_ex
             layer_groupsize = down_proj_groupsize
 
         qlayers[name].quantizer.configure(
@@ -545,7 +559,7 @@ def main():
         k_quant_config = {
             'k_bits': args.k_bits, 'k_groupsize': k_groupsize,
             'k_sym': not args.k_asym, 'k_clip_ratio': args.k_clip_ratio,
-            'use_r3': (args.mode in ('quarot', 'dart')),
+            'use_r3': (args.mode in ('quarot', 'dart')) and (args.kv_ex == 0),
         }
         for layer in layers:
             rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(

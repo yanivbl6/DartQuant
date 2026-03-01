@@ -36,6 +36,10 @@ def parser_gen():
                         help='''Use R3 for rotate Q/K Online.''')
     parser.add_argument('--use_r4', action=argparse.BooleanOptionalAction, default=True,
                         help='''Use R4 for rotate down-projection inputs Online.''')
+    parser.add_argument('--kv_ex', type=int, default=0,
+                        help='When non-zero, disable R3 and quantize K-cache to N bits (no rotation).')
+    parser.add_argument('--proj_ex', type=int, default=0,
+                        help='When non-zero, disable R4 and quantize down_proj input to N bits (no rotation).')
     parser.add_argument('--rotate_mode', type=str, default='hadamard', choices=['hadamard', 'random'])
     # parser.add_argument('--rotation_seed', type=int, default=-1,
     #                     help='Random Seed for generating random matrix!!')

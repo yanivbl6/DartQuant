@@ -54,11 +54,22 @@ def color_val(val, best, worst, fmt=".2f", is_ppl=False):
 def parse_filename(path):
     """Extract mode and quant config from filename."""
     base = os.path.basename(path).replace("_results.pb", "")
+
+    is_static = "static" in base
+    base = base.replace("static_", "") if is_static else base
+
     # e.g. "quarot_w4a8k4v4_g128_aAsym_wSym_kSym_vSym"
     # or legacy "baseline_results.pb" -> "baseline"
     parts = base.split("_", 1)
+
+        
+
     mode = parts[0]
     tag = parts[1] if len(parts) > 1 else ""
+
+    if is_static:
+        tag += ", static"
+
     return mode, tag
 
 
@@ -96,6 +107,7 @@ def load_results(paths):
             continue
         mode, tag = parse_filename(p)
         label = short_label(mode, tag)
+
         runs.append((label, data, mode))
     # Sort: full first, then alphabetically by label
     runs.sort(key=lambda r: (0 if r[2] == "full" else 1, r[0]))
@@ -201,6 +213,7 @@ def print_summary(runs):
     for r in range(n_runs):
         label = labels[r]
         mode = runs[r][2]
+ 
 
         # Color the label by mode
         mode_colors = {"full": CYAN, "baseline": YELLOW, "quarot": MAGENTA, "dart": GREEN}
