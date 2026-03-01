@@ -46,6 +46,11 @@ def get_llama(model_name, hf_token):
     model = transformers.LlamaForCausalLM.from_pretrained(model_name, torch_dtype='auto',
                                                           token=hf_token,
                                                           low_cpu_mem_usage=True)
+    # Untie lm_head and embed_tokens so that norm fusion and rotation
+    # can modify them independently (e.g. Llama-3.2-1B has tied embeddings).
+    if model.config.tie_word_embeddings:
+        model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.clone())
+        model.config.tie_word_embeddings = False
     model.seqlen = 2048
     logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))
     return model

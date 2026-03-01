@@ -35,6 +35,7 @@ Options:
   -G GROUPSIZE     Group size for W, K, V              (default: 128)
   --sym            Use symmetric quantization for W/K/V (default: asymmetric)
   --overwrite      Ignore cached results, re-run all
+  --gptq           Delete cached GPTQ checkpoint and re-quantize
   --static-act     Use pre-calibrated static activation scales
   -F FAST          Enable fast model
   -h               Show this help message
@@ -80,6 +81,7 @@ SYM=0
 OVERWRITE=0
 FAST=0
 STATIC_ACT=0
+REDO_GPTQ=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -93,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --sym)    SYM=1;          shift   ;;
         --overwrite) OVERWRITE=1; shift   ;;
         --static-act) STATIC_ACT=1; shift ;;
+        --gptq)   REDO_GPTQ=1;   shift   ;;
         -F|--fast) FAST=1;        shift   ;;
         -h|--help) usage ;;
         *)
@@ -217,12 +220,30 @@ if [ "$STATIC_ACT" == "1" ]; then
 fi
 
 if [ "$FAST" == "0" ]; then
-    tasks="piqa hellaswag arc_easy arc_challenge winogrande lambada_openai social_iqa openbookqa mmlu"
+    tasks="--tasks piqa hellaswag arc_easy arc_challenge winogrande lambada_openai social_iqa openbookqa mmlu"
+
+    ppl_t="wikitext2 ptb c4"
 else
-    tasks="hellaswag"
+    tasks=""
+    ppl_t="wikitext2"
 fi
 
-CUDA_VISIBLE_DEVICES=${GPU_ID} python main_for_test.py \
+if [ "$REDO_GPTQ" == "1" ]; then
+    GPTQ_DIR="/tmp/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG}"
+    if [ -z "$SAVE_PREFIX" ] || [ -z "$MODEL_NAME" ] || [ -z "$QUANT_TAG" ]; then
+        echo "Error: refusing to rm -rf with empty path components"
+        exit 1
+    fi
+    if [ -d "$GPTQ_DIR" ]; then
+        echo "Removing cached GPTQ checkpoint: $GPTQ_DIR"
+        rm -rf "$GPTQ_DIR"
+    fi
+fi
+
+CUDA_VISIBLE_DEVICES=${GPU_ID} \
+HF_DATASETS_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+python main_for_test.py \
     --model ${MODEL} \
     ${ROTATION_FLAGS} \
     --gptq_checkpoint_path /tmp/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG} \
@@ -248,7 +269,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python main_for_test.py \
     --distribute \
     --ppl_eval \
     --ppl_eval_batch_size 1 \
-    --ppl_eval_dataset wikitext2 ptb c4 \
+    --ppl_eval_dataset ${ppl_t} \
     --lm_eval \
     --lm_eval_batch_size 2 \
-    --tasks ${tasks}
+    ${tasks}

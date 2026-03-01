@@ -4,8 +4,6 @@
 
 export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
 
-
-
 rm /tmp/*_results.out
 rm /tmp/*_results.err
 
