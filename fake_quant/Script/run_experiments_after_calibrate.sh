@@ -2,10 +2,9 @@
 
 ## Wrapper to run the 7 experiments. Optionally runs calibration first.
 ## Usage:
-##   ./Script/run_experiments_after_calibrate.sh [--calibrate] [args...]
-## If --calibrate is provided, this will call ../calibrater/calibrate_model.sh with the same args.
-
-set -e
+##   ./Script/run_experiments_after_calibrate.sh [--calibrate] [extra args...]
+## If --calibrate is provided, this will call ../calibrater/calibrate_model.sh first.
+## Extra args (e.g. -m 1b) are forwarded to all experiment runs.
 
 CALIBRATE=0
 if [ "$1" = "--calibrate" ]; then
@@ -13,30 +12,22 @@ if [ "$1" = "--calibrate" ]; then
   shift
 fi
 
+# Save remaining args before calibration parsing can consume them
+EXTRA_ARGS=("$@")
+
 if [ $CALIBRATE -eq 1 ]; then
-  # Extract only -m MODEL and optional -g GPU_ID from the passed args
+  # Extract -m MODEL and optional -g GPU_ID for calibration
   MODEL=""
   GPU_ID=""
-  i=1
-  # iterate over args
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -m)
-        MODEL="$2"
-        shift 2
-        ;;
-      -g)
-        GPU_ID="$2"
-        shift 2
-        ;;
-      *)
-        shift
-        ;;
+  for ((i=0; i<${#EXTRA_ARGS[@]}; i++)); do
+    case "${EXTRA_ARGS[$i]}" in
+      -m) MODEL="${EXTRA_ARGS[$((i+1))]}" ;;
+      -g) GPU_ID="${EXTRA_ARGS[$((i+1))]}" ;;
     esac
   done
 
   if [ -z "${MODEL}" ]; then
-    echo "Error: -m MODEL is required for calibration. Provide it when invoking this script."
+    echo "Error: -m MODEL is required for calibration."
     exit 1
   fi
 
@@ -45,25 +36,65 @@ if [ $CALIBRATE -eq 1 ]; then
     CAL_CMD+=( -g "${GPU_ID}" )
   fi
 
-  echo "Running calibrate: ${CAL_CMD[*]}"
+  echo "=== Running calibration: ${CAL_CMD[*]} ==="
   "${CAL_CMD[@]}"
+  echo ""
 fi
 
-export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+# --- Shared quantization args ---
+QUANT_ARGS=(-w 4 -a 8 -k 8 -G 128 --sym --kv_ex 8 --proj_ex 15)
 
-rm /tmp/*_results.out || true
-rm /tmp/*_results.err || true
+# --- Define experiments: (name, mode, gpu, extra_flags...) ---
+EXPERIMENTS=(
+  "full|full|1|"
+  "baseline|baseline|2|"
+  "quarot|quarot|3|"
+  "dart|dart|4|"
+  "baseline_static|baseline|5|--static-act"
+  "quarot_static|quarot|6|--static-act"
+  "dart_static|dart|7|--static-act"
+)
 
-./Script/dart_gptq_wxaykvz.sh full -g 1 "$@" > /tmp/full_results.out 2> /tmp/full_results.err &
-./Script/dart_gptq_wxaykvz.sh baseline -g 2 -w 4 -a 8 -k 8 -G 128 --sym --kv_ex 8 --proj_ex 15 "$@" > /tmp/baseline_results.out 2> /tmp/baseline_results.err &
-./Script/dart_gptq_wxaykvz.sh quarot -g 3 -w 4 -a 8 -k 8 -G 128 --sym --kv_ex 8 --proj_ex 15 "$@" > /tmp/quarot_results.out 2> /tmp/quarot_results.err &
-./Script/dart_gptq_wxaykvz.sh dart -g 4 -w 4 -a 8 -k 8 -G 128 --sym --kv_ex 8 --proj_ex 15 "$@" > /tmp/dart_results.out 2> /tmp/dart_results.err &
+rm -f /tmp/*_results.out /tmp/*_results.err 2>/dev/null
 
-# --- Static activation quantization runs (reuse GPTQ checkpoints from above) ---
-./Script/dart_gptq_wxaykvz.sh baseline -g 5 -w 4 -a 8 -k 8 -G 128 --sym --static-act --kv_ex 8 --proj_ex 15 "$@" > /tmp/baseline_static_results.out 2> /tmp/baseline_static_results.err &
-./Script/dart_gptq_wxaykvz.sh quarot -g 6 -w 4 -a 8 -k 8 -G 128 --sym --static-act --kv_ex 8 --proj_ex 15 "$@" > /tmp/quarot_static_results.out 2> /tmp/quarot_static_results.err &
-./Script/dart_gptq_wxaykvz.sh dart -g 7 -w 4 -a 8 -k 8 -G 128 --sym --static-act --kv_ex 8 --proj_ex 15 "$@" > /tmp/dart_static_results.out 2> /tmp/dart_static_results.err &
+echo "=== Launching 7 experiments ==="
+echo ""
 
-wait
+PIDS=()
+for exp in "${EXPERIMENTS[@]}"; do
+  IFS='|' read -r name mode gpu extra <<< "$exp"
 
-echo "All experiments completed"
+  if [ "$mode" = "full" ]; then
+    CMD=(./Script/dart_gptq_wxaykvz.sh "$mode" -g "$gpu" "${EXTRA_ARGS[@]}")
+  else
+    CMD=(./Script/dart_gptq_wxaykvz.sh "$mode" -g "$gpu" "${QUANT_ARGS[@]}")
+    [ -n "$extra" ] && CMD+=($extra)
+    CMD+=("${EXTRA_ARGS[@]}")
+  fi
+
+  echo "  [GPU $gpu] $name: ${CMD[*]}"
+  "${CMD[@]}" > "/tmp/${name}_results.out" 2> "/tmp/${name}_results.err" &
+  PIDS+=("$!:$name")
+done
+
+echo ""
+echo "=== Waiting for all experiments ==="
+
+FAILED=0
+for entry in "${PIDS[@]}"; do
+  IFS=':' read -r pid name <<< "$entry"
+  if wait "$pid"; then
+    echo "  [done] $name"
+  else
+    echo "  [FAIL] $name (see /tmp/${name}_results.err)"
+    FAILED=$((FAILED + 1))
+  fi
+done
+
+echo ""
+if [ $FAILED -eq 0 ]; then
+  echo "=== All 7 experiments completed successfully ==="
+else
+  echo "=== $FAILED experiment(s) failed ==="
+  exit 1
+fi

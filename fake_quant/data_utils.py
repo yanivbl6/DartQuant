@@ -10,12 +10,14 @@ def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
     else:
         tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False, token=hf_token)
 
+    wikitext_cache = '/data/data/huggingface/datasets/wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3'
+
     if eval_mode:
-        testdata = datasets.load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+        testdata = datasets.Dataset.from_file(f'{wikitext_cache}/wikitext-test.arrow')
         testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
         return testenc
     else:
-        traindata = datasets.load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        traindata = datasets.Dataset.from_file(f'{wikitext_cache}/wikitext-train.arrow')
         trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
         random.seed(seed)
         trainloader = []
