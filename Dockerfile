@@ -4,6 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
     git \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
@@ -33,5 +34,7 @@ WORKDIR /workspace/DartQuant
 
 # HF cache on persistent mount (datasets pre-populated via scripts/download_lm_eval_datasets.py)
 ENV HF_HOME=/data/data/huggingface
+RUN git config --global user.email "yanivblm6@gmail.com"
+RUN git config --global user.name "Yaniv Blumenfeld"
 
 CMD ["/bin/bash", "--login"]

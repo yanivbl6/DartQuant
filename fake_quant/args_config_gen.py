@@ -193,8 +193,9 @@ def parser_gen():
 
     if args.save_name is None:
         args.save_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_tag = os.path.basename(args.model.rstrip('/')) if os.path.isabs(args.model) else args.model
     setattr(args, 'save_path',
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'experiments', args.model, args.save_name))
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'experiments', model_tag, args.save_name))
 
     os.makedirs(args.save_path, exist_ok=True)
 
