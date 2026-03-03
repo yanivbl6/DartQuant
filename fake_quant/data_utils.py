@@ -1,6 +1,21 @@
 import datasets
+import glob
 import random
 import transformers
+
+
+HF_DATASETS_ROOT = '/data/data/huggingface/datasets'
+
+
+def _find_arrow(pattern):
+    """Find a cached .arrow file by glob pattern under the HF datasets cache."""
+    matches = glob.glob(f'{HF_DATASETS_ROOT}/{pattern}', recursive=True)
+    if not matches:
+        raise FileNotFoundError(
+            f"No cached arrow file matching {pattern} under {HF_DATASETS_ROOT}. "
+            f"Run: HF_DATASETS_OFFLINE=0 python scripts/download_lm_eval_datasets.py"
+        )
+    return sorted(matches)[0]
 
 
 def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
@@ -84,11 +99,13 @@ def get_ptb_new(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
         tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False, token=hf_token)
 
     if eval_mode:
-        testdata = datasets.load_dataset('ptb_text_only', 'penn_treebank', split='test', trust_remote_code=True)
+        arrow = _find_arrow('ptb_text_only/penn_treebank/**/ptb_text_only-test.arrow')
+        testdata = datasets.Dataset.from_file(arrow)
         testenc = tokenizer(" ".join(testdata['sentence']), return_tensors='pt')
         return testenc
     else:
-        traindata = datasets.load_dataset('ptb_text_only', 'penn_treebank', split='train', trust_remote_code=True)
+        arrow = _find_arrow('ptb_text_only/penn_treebank/**/ptb_text_only-train.arrow')
+        traindata = datasets.Dataset.from_file(arrow)
         trainenc = tokenizer(" ".join(traindata['sentence']), return_tensors='pt')
         random.seed(seed)
         trainloader = []

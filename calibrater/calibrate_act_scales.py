@@ -141,6 +141,23 @@ def calibrate_act_scales(model, dataloader, args):
                     qlayer.module.register_forward_hook(
                         functools.partial(collect_output_hook, name=f'{full_name}.out_quantizer')))
 
+        # Register hooks on PWLActivation quantizers (if present)
+        for name, module in layer.named_modules():
+            try:
+                import pwl_utils
+                if isinstance(module, pwl_utils.PWLActivation):
+                    full_name = f'model.layers.{i}.{name}'
+                    if module.input_quantizer.bits < 16:
+                        hooks.append(
+                            module.register_forward_hook(
+                                functools.partial(collect_hook, name=f'{full_name}.input_quantizer')))
+                    if module.output_quantizer.bits < 16:
+                         hooks.append(
+                            module.register_forward_hook(
+                                functools.partial(collect_output_hook, name=f'{full_name}.output_quantizer')))
+            except ImportError:
+                break  # pwl_utils not available, skip
+
         # Register hook on QKRotationWrapper for K-cache
         rope_fn = model_utils.get_rope_function_name(model)
         wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
@@ -258,6 +275,22 @@ def _find_quantizer(layer, cname, layer_idx, model, rope_fn):
         if hasattr(layer.self_attn, wrapper_attr):
             return getattr(layer.self_attn, wrapper_attr).k_quantizer
 
+    # PWLActivation quantizers
+    try:
+        import pwl_utils
+        if cname.startswith(prefix) and cname.endswith('.input_quantizer'):
+            subname = cname[len(prefix):-len('.input_quantizer')]
+            for name, module in layer.named_modules():
+                if name == subname and isinstance(module, pwl_utils.PWLActivation):
+                    return module.input_quantizer
+        if cname.startswith(prefix) and cname.endswith('.output_quantizer'):
+            subname = cname[len(prefix):-len('.output_quantizer')]
+            for name, module in layer.named_modules():
+                if name == subname and isinstance(module, pwl_utils.PWLActivation):
+                    return module.output_quantizer
+    except ImportError:
+        pass
+
     return None
 
 
@@ -344,6 +377,17 @@ Examples:
     parser.add_argument('--calib_dataset', type=str, default='wikitext2',
                         choices=['wikitext2', 'ptb', 'c4'])
 
+    # PWL Activation Approximation
+    parser.add_argument('--pwl_act', action='store_true',
+                        help='Use PWL activation approximation during calibration')
+    parser.add_argument('--pwl_n_segments', type=int, default=9)
+    parser.add_argument('--pwl_input_bits', type=int, default=16)
+    parser.add_argument('--pwl_output_bits', type=int, default=16)
+    parser.add_argument('--pwl_mantissa_bits', type=int, default=10)
+    parser.add_argument('--pwl_exp_bits', type=int, default=4)
+    parser.add_argument('--pwl_offset_bits', type=int, default=13)
+    parser.add_argument('--pwl_no_hw_sim', action='store_true')
+
     # Output paths (auto-deduced if not specified)
     parser.add_argument('--save_path', type=str, default=None,
                         help='Where to save scales .pt (auto-deduced if omitted)')
@@ -399,6 +443,14 @@ def main():
         quant_tag += f"_kvex{args.kv_ex}"
     if args.proj_ex != 0:
         quant_tag += f"_projex{args.proj_ex}"
+    if args.pwl_act:
+        import pwl_utils
+        quant_tag += pwl_utils.pwl_tag(
+            n_segments=args.pwl_n_segments,
+            input_bits=args.pwl_input_bits,
+            output_bits=args.pwl_output_bits,
+            no_hw_sim=args.pwl_no_hw_sim,
+        )
     save_prefix = args.mode
 
     # --- Auto-deduce output paths ---
@@ -565,6 +617,22 @@ def main():
             rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
                 layer.self_attn, rope_function_name,
                 config=model.config, **k_quant_config)
+
+    # --- Replace activations with PWL (before calibration so scales reflect PWL) ---
+    if args.pwl_act:
+        import pwl_utils
+        act_name = getattr(model.config, 'hidden_act', 'silu')
+        hw_config = None if args.pwl_no_hw_sim else pwl_utils.HWConfig(
+            mantissa_bits=args.pwl_mantissa_bits,
+            exp_bits=args.pwl_exp_bits,
+            offset_bits=args.pwl_offset_bits)
+        replaced = pwl_utils.replace_activation_with_pwl(
+            model, act_name=act_name,
+            n_segments=args.pwl_n_segments,
+            hw_config=hw_config,
+            input_bits=args.pwl_input_bits,
+            output_bits=args.pwl_output_bits)
+        print(f"Replaced {len(replaced)} activations with PWL ({act_name}, {args.pwl_n_segments} segments)")
 
     # --- Get calibration data ---
     dataloader = data_utils.get_loaders(

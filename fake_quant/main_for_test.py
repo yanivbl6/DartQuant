@@ -76,6 +76,23 @@ def main():
         # Add Activation Wrapper to the model as the rest of the code assumes it is present
         quant_utils.add_actquant(model)
 
+    # Replace activations with PWL approximation (before GPTQ so Hessians see PWL)
+    if args.pwl_act:
+        import pwl_utils
+        act_name = getattr(model.config, 'hidden_act', 'silu')
+        hw_config = None if args.pwl_no_hw_sim else pwl_utils.HWConfig(
+            mantissa_bits=args.pwl_mantissa_bits,
+            exp_bits=args.pwl_exp_bits,
+            offset_bits=args.pwl_offset_bits)
+        replaced = pwl_utils.replace_activation_with_pwl(
+            model, act_name=act_name,
+            n_segments=args.pwl_n_segments,
+            hw_config=hw_config,
+            input_bits=args.pwl_input_bits,
+            output_bits=args.pwl_output_bits)
+        logging.info("Replaced %d activations with PWL (%s, %d segments, hw_sim=%s)",
+                     len(replaced), act_name, args.pwl_n_segments, hw_config is not None)
+
     if args.w_bits < 16:
         logging.info("Add weight quantization: w_rtn = {}, w_bits = {}, w_groupsize = {}, w_sym = {}, w_clip = {}".format(
             args.w_rtn, args.w_bits, args.w_groupsize, not (args.w_asym), args.w_clip))
@@ -254,6 +271,22 @@ def main():
                     wrapper.k_quantizer.scale = act_scales[kq_key]['scale']
                     wrapper.k_quantizer.zero = act_scales[kq_key]['zero']
                     wrapper.k_quantizer.static = True
+
+        # Apply to PWLActivation quantizers (if PWL is enabled)
+        if args.pwl_act:
+            import pwl_utils
+            pwl_modules = pwl_utils.find_pwl_activations(model)
+            for name, pwl_mod in pwl_modules.items():
+                iq_key = f'{name}.input_quantizer'
+                if iq_key in act_scales and pwl_mod.input_quantizer.bits < 16:
+                    pwl_mod.input_quantizer.scale = act_scales[iq_key]['scale']
+                    pwl_mod.input_quantizer.zero = act_scales[iq_key]['zero']
+                    pwl_mod.input_quantizer.static = True
+                oq_key = f'{name}.output_quantizer'
+                if oq_key in act_scales and pwl_mod.output_quantizer.bits < 16:
+                    pwl_mod.output_quantizer.scale = act_scales[oq_key]['scale']
+                    pwl_mod.output_quantizer.zero = act_scales[oq_key]['zero']
+                    pwl_mod.output_quantizer.static = True
 
         logging.info("Static activation scales applied to all quantizers.")
 

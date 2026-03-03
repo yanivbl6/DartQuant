@@ -62,6 +62,25 @@ def parser_gen():
                         help='Path to pre-calibrated activation scales (.pt). '
                              'When set, static quantization is used instead of dynamic.')
 
+    # PWL Activation Approximation Arguments
+    parser.add_argument('--pwl_act', action=argparse.BooleanOptionalAction, default=False,
+                        help='Replace non-linear activations (SiLU/GELU) with piecewise-linear '
+                             'approximations matching Hailo hardware behavior.')
+    parser.add_argument('--pwl_n_segments', type=int, default=9,
+                        help='Number of PWL segments (default: 9, matching Hailo SiLU/GELU)')
+    parser.add_argument('--pwl_input_bits', type=int, default=16,
+                        help='Bit-width for PWL input quantization (default: 16 = no quant)')
+    parser.add_argument('--pwl_output_bits', type=int, default=16,
+                        help='Bit-width for PWL output quantization (default: 16 = no quant)')
+    parser.add_argument('--pwl_mantissa_bits', type=int, default=10,
+                        help='Slope mantissa precision bits (default: 10, Hailo HW)')
+    parser.add_argument('--pwl_exp_bits', type=int, default=4,
+                        help='Slope exponent bits (default: 4, Hailo HW)')
+    parser.add_argument('--pwl_offset_bits', type=int, default=13,
+                        help='Offset precision bits (default: 13, Hailo HW)')
+    parser.add_argument('--pwl_no_hw_sim', action=argparse.BooleanOptionalAction, default=False,
+                        help='Disable HW precision simulation for PWL (pure float PWL)')
+
     # Weight Quantization Arguments
     parser.add_argument('--w_bits', type=int, default=16,
                         help='Number of bits for weights of the Linear layers')

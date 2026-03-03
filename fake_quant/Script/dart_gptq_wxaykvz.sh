@@ -39,6 +39,11 @@ Options:
   --kv_ex N        K-cache quant without R3 rotation            (default: 0=off)
   --proj_ex N      Down-proj input quant without R4 rotation   (default: 0=off)
   --static-act     Use pre-calibrated static activation scales
+  --pwl_act            Replace activations with PWL approximation
+  --pwl_n_segments N   Number of PWL segments                     (default: 9)
+  --pwl_input_bits N   PWL input quantizer bit-width              (default: 16)
+  --pwl_output_bits N  PWL output quantizer bit-width             (default: 16)
+  --pwl_no_hw_sim      Disable HW precision simulation (pure float PWL)
   -F FAST          Enable fast model
   -h               Show this help message
 
@@ -86,6 +91,11 @@ STATIC_ACT=0
 REDO_GPTQ=0
 KV_EX=0
 PROJ_EX=0
+PWL_ACT=0
+PWL_N_SEGMENTS=9
+PWL_INPUT_BITS=16
+PWL_OUTPUT_BITS=16
+PWL_NO_HW_SIM=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -102,6 +112,11 @@ while [[ $# -gt 0 ]]; do
         --gptq)   REDO_GPTQ=1;   shift   ;;
         --kv_ex)  KV_EX="$2";   shift 2 ;;
         --proj_ex) PROJ_EX="$2"; shift 2 ;;
+        --pwl_act) PWL_ACT=1;    shift   ;;
+        --pwl_n_segments) PWL_N_SEGMENTS="$2"; shift 2 ;;
+        --pwl_input_bits) PWL_INPUT_BITS="$2"; shift 2 ;;
+        --pwl_output_bits) PWL_OUTPUT_BITS="$2"; shift 2 ;;
+        --pwl_no_hw_sim) PWL_NO_HW_SIM=1; shift ;;
         -F|--fast) FAST=1;        shift   ;;
         -h|--help) usage ;;
         *)
@@ -231,6 +246,27 @@ if [ "$STATIC_ACT" == "1" ]; then
     STATIC_TAG="static_"
 fi
 
+# --- PWL activation flags & tag (mirrors pwl_utils.pwl_tag()) ---
+PWL_ACT_FLAG=""
+if [ "$PWL_ACT" == "1" ]; then
+    PWL_ACT_FLAG="--pwl_act --pwl_n_segments ${PWL_N_SEGMENTS} --pwl_input_bits ${PWL_INPUT_BITS} --pwl_output_bits ${PWL_OUTPUT_BITS}"
+    PWL_TAG="_pwl"
+    if [ "$PWL_N_SEGMENTS" != "9" ]; then
+        PWL_TAG="${PWL_TAG}_${PWL_N_SEGMENTS}p"
+    fi
+    if [ "$PWL_INPUT_BITS" != "16" ]; then
+        PWL_TAG="${PWL_TAG}_in${PWL_INPUT_BITS}"
+    fi
+    if [ "$PWL_OUTPUT_BITS" != "16" ]; then
+        PWL_TAG="${PWL_TAG}_out${PWL_OUTPUT_BITS}"
+    fi
+    if [ "$PWL_NO_HW_SIM" == "1" ]; then
+        PWL_ACT_FLAG="${PWL_ACT_FLAG} --pwl_no_hw_sim"
+        PWL_TAG="${PWL_TAG}_nohw"
+    fi
+    QUANT_TAG="${QUANT_TAG}${PWL_TAG}"
+fi
+
 if [ "$FAST" == "0" ]; then
     tasks="--tasks piqa hellaswag arc_easy arc_challenge winogrande lambada_openai social_iqa openbookqa mmlu"
 
@@ -274,6 +310,7 @@ python main_for_test.py \
     ${K_ASYM_FLAG} \
     ${V_ASYM_FLAG} \
     ${STATIC_ACT_FLAG} \
+    ${PWL_ACT_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     --percdamp 0.1 \
