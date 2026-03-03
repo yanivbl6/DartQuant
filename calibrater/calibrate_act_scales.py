@@ -388,6 +388,16 @@ Examples:
     parser.add_argument('--pwl_offset_bits', type=int, default=13)
     parser.add_argument('--pwl_no_hw_sim', action='store_true')
 
+    # Integer GEMM / Capped Accumulator
+    parser.add_argument('--int_gemm', action='store_true',
+                        help='Run calibration with integer GEMM active')
+    parser.add_argument('--acc_bits', type=int, default=32,
+                        help='Accumulator bit-width (default: 32 = no capping)')
+    parser.add_argument('--acc_block_k', type=int, default=32,
+                        help='K-block size for accumulator capping (default: 32)')
+    parser.add_argument('--acc_wrap', action='store_true',
+                        help='Use wrap-around instead of saturation on accumulator overflow')
+
     # Output paths (auto-deduced if not specified)
     parser.add_argument('--save_path', type=str, default=None,
                         help='Where to save scales .pt (auto-deduced if omitted)')
@@ -450,6 +460,13 @@ def main():
             input_bits=args.pwl_input_bits,
             output_bits=args.pwl_output_bits,
             no_hw_sim=args.pwl_no_hw_sim,
+        )
+    if args.int_gemm:
+        from int_acc_gemm import int_gemm_tag
+        quant_tag += int_gemm_tag(
+            acc_bits=args.acc_bits,
+            acc_block_k=args.acc_block_k,
+            acc_wrap=args.acc_wrap,
         )
     save_prefix = args.mode
 
@@ -633,6 +650,24 @@ def main():
             input_bits=args.pwl_input_bits,
             output_bits=args.pwl_output_bits)
         print(f"Replaced {len(replaced)} activations with PWL ({act_name}, {args.pwl_n_segments} segments)")
+
+    # --- Enable integer GEMM on ActQuantWrappers ---
+    if args.int_gemm:
+        print(f"Enabling integer GEMM for calibration: acc_bits={args.acc_bits}, acc_block_k={args.acc_block_k}")
+        # Force symmetric activations for int GEMM
+        args.a_asym = False
+        ig_qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        n_ig = 0
+        for name, qlayer in ig_qlayers.items():
+            if 'lm_head' in name or qlayer.quantizer.bits >= 16:
+                continue
+            qlayer.prepare_int_gemm(
+                w_bits=args.w_bits, w_sym=True,
+                w_group_size=args.w_groupsize,
+                acc_bits=args.acc_bits, acc_block_k=args.acc_block_k,
+                acc_wrap=args.acc_wrap)
+            n_ig += 1
+        print(f"Integer GEMM prepared for {n_ig} layers")
 
     # --- Get calibration data ---
     dataloader = data_utils.get_loaders(

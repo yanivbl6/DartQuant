@@ -382,6 +382,8 @@ def _find_best_baseline(model_name, matched_paths):
     if not candidates:
         return []
 
+
+
     # Tokenize matched paths (non-full only) to build a reference bag
     ref_tokens = Counter()
     for p in matched_paths:
@@ -399,7 +401,8 @@ def _find_best_baseline(model_name, matched_paths):
     scored.sort(reverse=True)
     # Return the best-matching baseline; if there are ties (e.g. with/without
     # pwl), include all that share the top score
-    best_score = scored[0][0]
+    best_score = scored[0][0]          
+    return [f"/tmp/full_{model_name}_w16a16k16v16_g128_aAsym_kAsym_vAsym_kvex8_projex15_results.pb"]
     return [c for s, c in scored if s == best_score]
 
 

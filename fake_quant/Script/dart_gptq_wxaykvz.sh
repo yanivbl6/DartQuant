@@ -44,6 +44,10 @@ Options:
   --pwl_input_bits N   PWL input quantizer bit-width              (default: 16)
   --pwl_output_bits N  PWL output quantizer bit-width             (default: 16)
   --pwl_no_hw_sim      Disable HW precision simulation (pure float PWL)
+  --int_gemm           Use integer GEMM with capped accumulator
+  --acc_bits N         Accumulator bit-width                         (default: 32)
+  --acc_block_k N      K-block size for accumulator capping          (default: 32)
+  --acc_wrap           Use wrap-around instead of saturation on overflow
   -F FAST          Enable fast model
   -h               Show this help message
 
@@ -96,6 +100,10 @@ PWL_N_SEGMENTS=9
 PWL_INPUT_BITS=16
 PWL_OUTPUT_BITS=16
 PWL_NO_HW_SIM=0
+INT_GEMM=0
+ACC_BITS=32
+ACC_BLOCK_K=32
+ACC_WRAP=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -117,6 +125,10 @@ while [[ $# -gt 0 ]]; do
         --pwl_input_bits) PWL_INPUT_BITS="$2"; shift 2 ;;
         --pwl_output_bits) PWL_OUTPUT_BITS="$2"; shift 2 ;;
         --pwl_no_hw_sim) PWL_NO_HW_SIM=1; shift ;;
+        --int_gemm)    INT_GEMM=1;      shift   ;;
+        --acc_bits)    ACC_BITS="$2";    shift 2 ;;
+        --acc_block_k) ACC_BLOCK_K="$2"; shift 2 ;;
+        --acc_wrap)    ACC_WRAP=1;        shift   ;;
         -F|--fast) FAST=1;        shift   ;;
         -h|--help) usage ;;
         *)
@@ -230,22 +242,6 @@ if [ "$OVERWRITE" == "1" ]; then
     OVERWRITE_FLAG="--overwrite"
 fi
 
-# --- Static activation scales ---
-STATIC_ACT_FLAG=""
-STATIC_TAG=""
-if [ "$STATIC_ACT" == "1" ]; then
-    ACT_SCALES_DIR="../data/act_scales/${MODEL_NAME}"
-    ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${QUANT_TAG}.pt"
-    if [ ! -f "$ACT_SCALES_FILE" ]; then
-        echo "Static act scales not found at ${ACT_SCALES_FILE}"
-        echo "Run calibration first:"
-        echo "  cd calibrater && python calibrate_act_scales.py --model ${MODEL} --mode ${MODE} --save_path ${ACT_SCALES_FILE} ..."
-        exit 1
-    fi
-    STATIC_ACT_FLAG="--act_scales_path ${ACT_SCALES_FILE}"
-    STATIC_TAG="static_"
-fi
-
 # --- PWL activation flags & tag (mirrors pwl_utils.pwl_tag()) ---
 PWL_ACT_FLAG=""
 if [ "$PWL_ACT" == "1" ]; then
@@ -265,6 +261,40 @@ if [ "$PWL_ACT" == "1" ]; then
         PWL_TAG="${PWL_TAG}_nohw"
     fi
     QUANT_TAG="${QUANT_TAG}${PWL_TAG}"
+fi
+
+# --- Integer GEMM flags & tag (mirrors int_acc_gemm.int_gemm_tag()) ---
+INT_GEMM_FLAG=""
+if [ "$INT_GEMM" == "1" ]; then
+    INT_GEMM_FLAG="--int_gemm --acc_bits ${ACC_BITS} --acc_block_k ${ACC_BLOCK_K}"
+    INTGEMM_TAG="_intgemm"
+    if [ "$ACC_BITS" != "32" ]; then
+        INTGEMM_TAG="${INTGEMM_TAG}_acc${ACC_BITS}"
+    fi
+    if [ "$ACC_BLOCK_K" != "32" ]; then
+        INTGEMM_TAG="${INTGEMM_TAG}_bk${ACC_BLOCK_K}"
+    fi
+    if [ "$ACC_WRAP" == "1" ]; then
+        INT_GEMM_FLAG="${INT_GEMM_FLAG} --acc_wrap"
+        INTGEMM_TAG="${INTGEMM_TAG}_wrap"
+    fi
+    QUANT_TAG="${QUANT_TAG}${INTGEMM_TAG}"
+fi
+
+# --- Static activation scales (after all tag components are finalized) ---
+STATIC_ACT_FLAG=""
+STATIC_TAG=""
+if [ "$STATIC_ACT" == "1" ]; then
+    ACT_SCALES_DIR="../data/act_scales/${MODEL_NAME}"
+    ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${QUANT_TAG}.pt"
+    if [ ! -f "$ACT_SCALES_FILE" ]; then
+        echo "Static act scales not found at ${ACT_SCALES_FILE}"
+        echo "Run calibration first:"
+        echo "  cd calibrater && python calibrate_act_scales.py --model ${MODEL} --mode ${MODE} --save_path ${ACT_SCALES_FILE} ..."
+        exit 1
+    fi
+    STATIC_ACT_FLAG="--act_scales_path ${ACT_SCALES_FILE}"
+    STATIC_TAG="static_"
 fi
 
 if [ "$FAST" == "0" ]; then
@@ -311,6 +341,7 @@ python main_for_test.py \
     ${V_ASYM_FLAG} \
     ${STATIC_ACT_FLAG} \
     ${PWL_ACT_FLAG} \
+    ${INT_GEMM_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     --percdamp 0.1 \

@@ -144,6 +144,42 @@ class ActQuantizer(torch.nn.Module):
         else:
             return asym_quant(x, self.scale, self.zero, self.maxq)
 
+    def quantize_to_int(self, x):
+        """Quantize activations to int8 and return (q_int8, per_token_scale).
+
+        Unlike ``forward`` (fake-quant) or ``quantize`` (returns float integers),
+        this method returns *actual* int8 values and a 1-D per-token scale vector,
+        suitable for feeding into the integer GEMM kernel.
+
+        Requires symmetric, per-token (groupsize <= 0) quantization.
+        """
+        assert self.sym, "quantize_to_int requires symmetric quantization"
+        assert self.bits <= 8, \
+            f"quantize_to_int requires bits <= 8 (got {self.bits}); values would overflow int8"
+        assert self.groupsize <= 0 or not hasattr(self, 'groupsize'), \
+            "quantize_to_int requires per-token quantization (groupsize <= 0)"
+
+        if not self.static:
+            self.find_params(x)
+
+        # sym_quant returns (q, scale) where q is float with integer values
+        q, scale = sym_quant(x, self.scale, self.maxq)
+
+        # Extract per-token scalar scale from the broadcasted scale tensor.
+        # self.scale has shape [..., K] with repeated values along K.
+        # IMPORTANT: flat_scale[:, 0] has stride K (non-contiguous).  The
+        # Triton kernel indexes A_scale_ptr with stride 1, so we MUST return
+        # a contiguous 1-D tensor — otherwise the kernel reads garbage.
+        flat_scale = scale.reshape(-1, scale.shape[-1])
+        per_token_scale = flat_scale[:, 0].contiguous()  # [M], stride-1
+
+        q_int8 = q.reshape(-1, q.shape[-1]).to(torch.int8)
+
+        if not self.static:
+            self.free()
+
+        return q_int8, per_token_scale
+
     def configure(self, bits,
                   groupsize=-1,
                   sym=False,
@@ -243,6 +279,33 @@ class ActQuantWrapper(torch.nn.Module):
         self.online_partial_had = False
         self.had_dim = 0
         self.fp32_had = False
+        # Integer GEMM with capped accumulator
+        self.use_int_gemm = False
+        self.acc_bits = 32
+        self.acc_block_k = 32
+        self.acc_wrap = False
+        self.int_gemm_use_triton = True
+        self.register_buffer('w_int', None)
+        self._buffers['w_int'] = None
+        self.register_buffer('w_scale', None)
+        self._buffers['w_scale'] = None
+        self.w_group_size = -1
+
+    def prepare_int_gemm(self, w_bits, w_sym=True, w_group_size=-1,
+                         acc_bits=32, acc_block_k=32, use_triton=True,
+                         acc_wrap=False):
+        """Pre-compute integer weight representation for capped-accumulator GEMM."""
+        from int_acc_gemm import prepare_int_weights
+        self.use_int_gemm = True
+        self.acc_bits = acc_bits
+        self.acc_block_k = acc_block_k
+        self.acc_wrap = acc_wrap
+        self.int_gemm_use_triton = use_triton
+        self.w_group_size = w_group_size
+
+        w_int, w_scale = prepare_int_weights(self.module, w_bits, w_sym, w_group_size)
+        self.w_int = w_int.to(self.module.weight.device)
+        self.w_scale = w_scale.to(self.module.weight.device)
 
     def extra_repr(self) -> str:
         str_ = f'Input Quantizer Bits: {self.quantizer.bits}'
@@ -252,6 +315,10 @@ class ActQuantWrapper(torch.nn.Module):
         str_ += f'\nOutput Quantizer Bits: {self.out_quantizer.bits}'
         if self.out_quantizer.bits < 16:
             str_ += f' (Asymmetric Per-Token)' if not self.out_quantizer.sym else f' (Symmetric Per-Token)'
+
+        if self.use_int_gemm:
+            overflow = 'wrap' if self.acc_wrap else 'saturate'
+            str_ += f'\nInt GEMM: acc_bits={self.acc_bits}, block_k={self.acc_block_k}, overflow={overflow}'
 
         return str_
 
@@ -284,12 +351,29 @@ class ActQuantWrapper(torch.nn.Module):
                 x = x.to(x_dtype)
             x = x.reshape(init_shape)
 
-        if self.quantizer.bits < 16:  # Quantize, if needed
-            # self.quantizer.find_params(x)  # QuaRot 源码，现修改在 quantizer.forward 函数中
-            x = self.quantizer(x).to(x_dtype)
-            self.quantizer.free()
+        if self.use_int_gemm and self.quantizer.bits <= 8:
+            # Integer GEMM path: quantize activations to int inside the kernel
+            from int_acc_gemm import int_gemm_capped
+            x = int_gemm_capped(
+                x_float=x,
+                w_int=self.w_int,
+                w_scale=self.w_scale,
+                act_quantizer=self.quantizer,
+                acc_bits=self.acc_bits,
+                block_k=self.acc_block_k,
+                w_group_size=self.w_group_size,
+                bias=self.bias,
+                use_triton=self.int_gemm_use_triton,
+                acc_wrap=self.acc_wrap,
+            ).to(x_dtype)
+        else:
+            # Original fake-quant path
+            if self.quantizer.bits < 16:  # Quantize, if needed
+                # self.quantizer.find_params(x)  # QuaRot 源码，现修改在 quantizer.forward 函数中
+                x = self.quantizer(x).to(x_dtype)
+                self.quantizer.free()
 
-        x = self.module(x).to(x_dtype)
+            x = self.module(x).to(x_dtype)
 
         if self.out_quantizer.bits < 16:  # Quantize the output, if needed
             # self.out_quantizer.find_params(x) # QuaRot 源码，现修改在 quantizer.forward 函数中

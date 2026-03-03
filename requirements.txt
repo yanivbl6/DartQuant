@@ -16,3 +16,4 @@ pyyaml
 protobuf
 pyzmq
 pwlf
+triton>=2.2.0

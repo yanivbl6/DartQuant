@@ -244,6 +244,27 @@ def gptq_fwrd(model, dataloader, dev, args):
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
 
+        # Enable capped int GEMM on this layer before propagation so the
+        # Hessian for subsequent layers reflects accumulator effects.
+        if getattr(args, 'int_gemm', False):
+            _a_bits = getattr(args, 'a_bits', 16)
+            qlayers_ig = quant_utils.find_qlayers(layer, layers=[quant_utils.ActQuantWrapper])
+            for qname, ql in qlayers_ig.items():
+                # Configure activation quantizer if not yet done (bits defaults to 16)
+                if ql.quantizer.bits >= 16 and _a_bits < 16:
+                    ql.quantizer.configure(bits=_a_bits, groupsize=-1,
+                                           sym=True, clip_ratio=1.0)
+                if ql.quantizer.bits < 16:
+                    ql.prepare_int_gemm(
+                        w_bits=args.w_bits,
+                        w_sym=not args.w_asym,
+                        w_group_size=args.w_groupsize,
+                        acc_bits=args.acc_bits,
+                        acc_block_k=args.acc_block_k,
+                        use_triton=getattr(args, 'int_gemm_use_triton', True),
+                        acc_wrap=getattr(args, 'acc_wrap', False),
+                    )
+
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
 

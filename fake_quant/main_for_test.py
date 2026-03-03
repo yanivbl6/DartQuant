@@ -220,6 +220,35 @@ def main():
                                               clip_ratio=layer_a_clip,
                                               residual=residual)
 
+    # --- Prepare integer GEMM with capped accumulator ---
+    if args.int_gemm:
+        logging.info("Preparing integer GEMM: acc_bits=%d, acc_block_k=%d, use_triton=%s, acc_wrap=%s",
+                     args.acc_bits, args.acc_block_k, args.int_gemm_use_triton, args.acc_wrap)
+        qlayers_ig = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        n_int_gemm = 0
+        for name, qlayer in qlayers_ig.items():
+            if 'lm_head' in name:
+                continue
+            if qlayer.quantizer.bits > 8:
+                # Undo use_int_gemm that GPTQ propagation may have set
+                # before the quantizer was reconfigured to >8 bits.
+                qlayer.use_int_gemm = False
+                if qlayer.quantizer.bits < 16:
+                    logging.info("  skipping int_gemm for %s (act_bits=%d > 8, falling back to fake-quant)",
+                                 name, qlayer.quantizer.bits)
+                continue
+            qlayer.prepare_int_gemm(
+                w_bits=args.w_bits,
+                w_sym=not args.w_asym,
+                w_group_size=args.w_groupsize,
+                acc_bits=args.acc_bits,
+                acc_block_k=args.acc_block_k,
+                use_triton=args.int_gemm_use_triton,
+                acc_wrap=args.acc_wrap,
+            )
+            n_int_gemm += 1
+        logging.info("Integer GEMM prepared for %d layers", n_int_gemm)
+
     if args.k_bits < 16:
         logging.info("Add k quantization: k_bits={}, k_groupsize={}, k_sym={}, k_clip_ratio={}".format(
             args.k_bits, args.k_groupsize, not (args.k_asym), args.k_clip_ratio))

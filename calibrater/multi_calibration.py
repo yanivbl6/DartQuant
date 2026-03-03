@@ -116,7 +116,28 @@ def build_calibrate_cmd(mode, model_short, extra_args):
     return cmd
 
 
+def get_calibrate_help():
+    """Get the help text from calibrate_act_scales.py."""
+    result = subprocess.run(
+        [sys.executable, 'calibrate_act_scales.py', '-h'],
+        capture_output=True, text=True, cwd=os.path.dirname(os.path.abspath(__file__))
+    )
+    return result.stdout
+
+
 def parse_args():
+    # If -h/--help is in args, show both our help and calibrate's help
+    if '-h' in sys.argv[1:] or '--help' in sys.argv[1:]:
+        calibrate_help = get_calibrate_help()
+        extra_help = (
+            "\n\nAll other arguments are forwarded to calibrate_act_scales.py.\n"
+            "Below is its help output:\n"
+            + "=" * 60 + "\n"
+            + calibrate_help
+        )
+    else:
+        extra_help = ""
+
     parser = argparse.ArgumentParser(
         description='Run baseline/quarot/dart calibrations in parallel',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -124,7 +145,7 @@ def parse_args():
 Examples:
   python multi_calibration.py -m 1b --sym --kv_ex 8 --proj_ex 15 -k 8 --v_bits 8 -g 2 3 4
   python multi_calibration.py -m 3b --sym -g 0 1 2
-""")
+""" + extra_help)
     parser.add_argument('-m', '--model', required=True,
                         help='Model shorthand (1b, 3b, 7b) or full path')
     parser.add_argument('-g', '--gpus', type=int, nargs='+', required=True,

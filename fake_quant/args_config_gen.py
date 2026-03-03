@@ -81,6 +81,23 @@ def parser_gen():
     parser.add_argument('--pwl_no_hw_sim', action=argparse.BooleanOptionalAction, default=False,
                         help='Disable HW precision simulation for PWL (pure float PWL)')
 
+    # Integer GEMM / Capped Accumulator Arguments
+    parser.add_argument('--int_gemm', action=argparse.BooleanOptionalAction, default=False,
+                        help='Use integer GEMM with capped accumulator instead of float matmul. '
+                             'Requires symmetric activation quantization and a_bits/w_bits <= 8.')
+    parser.add_argument('--acc_bits', type=int, default=32,
+                        help='Accumulator bit-width for integer GEMM (e.g. 16, 20, 32). '
+                             '32 means no capping. (default: 32)')
+    parser.add_argument('--acc_block_k', type=int, default=32,
+                        help='K-dimension block size for accumulator capping granularity. '
+                             'Smaller = more frequent capping = more realistic HW simulation. (default: 32)')
+    parser.add_argument('--acc_wrap', action=argparse.BooleanOptionalAction, default=False,
+                        help='Use two\'s-complement wrap-around on accumulator overflow instead of '
+                             'saturation (clamp). Default: False (saturation).')
+    parser.add_argument('--int_gemm_use_triton', action=argparse.BooleanOptionalAction, default=True,
+                        help='Use Triton kernel for integer GEMM (default: True). '
+                             'Set --no-int_gemm_use_triton for pure-PyTorch reference.')
+
     # Weight Quantization Arguments
     parser.add_argument('--w_bits', type=int, default=16,
                         help='Number of bits for weights of the Linear layers')
@@ -223,6 +240,17 @@ def parser_gen():
 
     # assert args.a_groupsize == args.w_groupsize, 'a_groupsize should be the same as w_groupsize!'
     assert args.k_pre_rope == False, 'Pre-RoPE quantization is not supported yet!'
+
+    if args.int_gemm:
+        assert args.a_bits <= 8, 'Integer GEMM requires activation bits <= 8'
+        assert args.w_bits <= 8, 'Integer GEMM requires weight bits <= 8'
+        if args.a_asym:
+            logging.warning('Integer GEMM requires symmetric activations. Forcing --no-a_asym.')
+            args.a_asym = False
+        if args.w_groupsize > 0:
+            assert args.acc_block_k <= args.w_groupsize, (
+                f'acc_block_k ({args.acc_block_k}) must be <= w_groupsize ({args.w_groupsize}) '
+                'to avoid straddling weight group boundaries in the kernel')
 
     if args.model == 'facebook/opt-125m' or args.model == 'facebook/opt-1.3b':
         logging.warning('Warning: OPT-125M/1.3B is only for debugging purposes!!')

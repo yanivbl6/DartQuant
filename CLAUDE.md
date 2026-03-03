@@ -23,6 +23,8 @@ The quantization of the hailo-sdk repository is in
 `/home/yanivbl/phase2-sdk/model_optimization/model_optimization_production/hailo_model_optimization/flows/optimization_flow.py`
 
 
+6. Integer GEMM with capped accumulator (`fake_quant/int_acc_gemm.py`): Triton kernel + PyTorch reference that simulates hardware integer GEMM with limited-width accumulator. Enabled via `--int_gemm --acc_bits N --acc_block_k N`. Integrated into inference, GPTQ propagation, and calibration.
+
 for static configuration, we use `calibrater/calibrate_model.sh` before the run. it accepts r1/r2 and also runs gptq, which we cache.
 `multi_calibration.py` runs `calibrater/calibrate_model.sh` for 3 different experiments.
 
