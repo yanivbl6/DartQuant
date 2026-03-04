@@ -28,6 +28,9 @@ import math
 import logging
 from tqdm import tqdm
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+import experiment_config as cfg
+
 sys.path.append('../fake_quant')
 
 import model_utils
@@ -104,8 +107,8 @@ def calibrate_act_scales(model, dataloader, args):
         collectors = {}
 
         def collect_hook(module, inp, out, name):
-            """Forward hook to collect min/max of the input tensor."""
-            x = inp[0] if isinstance(inp, tuple) else inp
+            """Forward hook to collect min/max of pre-quantization input."""
+            x = module._cal_input if hasattr(module, '_cal_input') and module._cal_input is not None else (inp[0] if isinstance(inp, tuple) else inp)
             flat = x.reshape(-1, x.shape[-1]).float()
             cmin = flat.min(dim=0)[0]
             cmax = flat.max(dim=0)[0]
@@ -116,8 +119,8 @@ def calibrate_act_scales(model, dataloader, args):
                 collectors[name]['max'] = torch.maximum(collectors[name]['max'], cmax)
 
         def collect_output_hook(module, inp, out, name):
-            """Forward hook to collect min/max of the output tensor (for v_proj out_quantizer)."""
-            x = out if not isinstance(out, tuple) else out[0]
+            """Forward hook to collect min/max of post-matmul output (for out_quantizer)."""
+            x = module._cal_output if hasattr(module, '_cal_output') and module._cal_output is not None else (out if not isinstance(out, tuple) else out[0])
             flat = x.reshape(-1, x.shape[-1]).float()
             cmin = flat.min(dim=0)[0]
             cmax = flat.max(dim=0)[0]
@@ -130,15 +133,19 @@ def calibrate_act_scales(model, dataloader, args):
         # Register hooks on ActQuantWrapper modules
         hooks = []
         qlayers = quant_utils.find_qlayers(layer, layers=[quant_utils.ActQuantWrapper])
+        # Enable calibration mode so forward() stores intermediates
+        # (works with both int_gemm and fake-quant paths)
+        for name, qlayer in qlayers.items():
+            qlayer._calibrating = True
         for name, qlayer in qlayers.items():
             full_name = f'model.layers.{i}.{name}'
             if qlayer.quantizer.bits < 16:
                 hooks.append(
-                    qlayer.module.register_forward_hook(
+                    qlayer.register_forward_hook(
                         functools.partial(collect_hook, name=f'{full_name}.quantizer')))
             if qlayer.out_quantizer.bits < 16:
                 hooks.append(
-                    qlayer.module.register_forward_hook(
+                    qlayer.register_forward_hook(
                         functools.partial(collect_output_hook, name=f'{full_name}.out_quantizer')))
 
         # Register hooks on PWLActivation quantizers (if present)
@@ -206,9 +213,13 @@ def calibrate_act_scales(model, dataloader, args):
                             position_ids=position_ids,
                             position_embeddings=position_embeddings)[0]
 
-        # Remove hooks
+        # Remove hooks and clean up calibration state
         for h in hooks:
             h.remove()
+        for name, qlayer in qlayers.items():
+            qlayer._calibrating = False
+            qlayer._cal_input = None
+            qlayer._cal_output = None
 
         # Compute scale/zero from collected min/max
         for cname, stats in collectors.items():
@@ -294,24 +305,9 @@ def _find_quantizer(layer, cname, layer_idx, model, rope_fn):
     return None
 
 
-MODEL_BASE = "/data/users/sashas/LLMC/Models/meta-llama"
-MODEL_MAP = {
-    '1b': f'{MODEL_BASE}/Llama-3.2-1B-Instruct',
-    '3b': f'{MODEL_BASE}/Llama-3.2-3B-Instruct',
-    '7b': f'{MODEL_BASE}/Llama-2-7b-hf',
-}
-
-# Default R1/R2 paths per model (same as experiment script dart mode)
-R1_PATHS = {
-    'Llama-2-7b-hf':          '../data/trained_rotation/wikitext2_128samples/r1/sgd.0.0015.0.9.10.64.0.1.1',
-    'Llama-3.2-1B-Instruct':  '../data/trained_rotation/wikitext2_128samples/Llama-3.2-1B-Instruct/r1/sgd.0.0015.0.9.10.64.0.1.1',
-    'Llama-3.2-3B-Instruct':  '../data/trained_rotation/wikitext2_128samples/Llama-3.2-3B-Instruct/r1/sgd.0.0015.0.9.10.64.0.1.1',
-}
-R2_PATHS = {
-    'Llama-2-7b-hf':          '../data/trained_rotation/wikitext2_128samples/r2/sgd.0.001.0.9.10.64.2',
-    'Llama-3.2-1B-Instruct':  '../data/trained_rotation/wikitext2_128samples/Llama-3.2-1B-Instruct/r2/sgd.0.001.0.9.10.64.2',
-    'Llama-3.2-3B-Instruct':  '../data/trained_rotation/wikitext2_128samples/Llama-3.2-3B-Instruct/r2/sgd.0.001.0.9.10.64.2',
-}
+MODEL_MAP = cfg.MODEL_MAP
+R1_PATHS = cfg.R1_PATHS
+R2_PATHS = cfg.R2_PATHS
 
 
 def parse_args():
@@ -349,7 +345,8 @@ Examples:
     parser.add_argument('-w', '--w_bits', type=int, default=4)
     parser.add_argument('-a', '--a_bits', type=int, default=8)
     parser.add_argument('-k', '--k_bits', type=int, default=4)
-    parser.add_argument('--v_bits', type=int, default=4)
+    parser.add_argument('-v', '--v_bits', type=int, default=None,
+                        help='V-cache bit-width (default: same as -k)')
     parser.add_argument('-G', '--groupsize', type=int, default=128,
                         help='Group size for W, K, V (default: 128)')
     parser.add_argument('--sym', action='store_true',
@@ -403,12 +400,15 @@ Examples:
                         help='Where to save scales .pt (auto-deduced if omitted)')
     parser.add_argument('--gptq_checkpoint_path', type=str, default=None,
                         help='GPTQ checkpoint dir (auto-deduced if omitted)')
+    parser.add_argument('--gptq', action='store_true',
+                        help='Delete cached GPTQ checkpoint and re-quantize')
 
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    cfg.resolve_v_bits(args)
     import transformers
     transformers.set_seed(args.seed)
 
@@ -542,46 +542,9 @@ def main():
                 qlayers[name].had_dim = model.config.hidden_size // model.config.num_attention_heads
                 qlayers[name].fp32_had = args.fp32_had
 
-    # --- GPTQ weight quantization ---
-    # Must happen before activation calibration so we measure activations
-    # flowing through quantized weights (matching actual inference).
-    if args.w_bits < 16:
-        _gptq_ckpt = os.path.join(args.gptq_checkpoint_path, f'{model_name}_w{args.w_bits}')
-
-        if os.path.isdir(_gptq_ckpt) and any(
-                f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
-            print(f"Loading existing GPTQ checkpoint from: {_gptq_ckpt}")
-            utils.load_model_in_parts(model, _gptq_ckpt)
-        else:
-            print(f"Running GPTQ (w{args.w_bits}, groupsize={args.w_groupsize}) ...")
-            trainloader = data_utils.get_loaders(
-                args.calib_dataset, nsamples=args.nsamples,
-                seed=args.seed, model=args.model,
-                seqlen=model.seqlen, eval_mode=False)
-
-            class GptqArgs:
-                pass
-            gptq_args = GptqArgs()
-            gptq_args.nsamples = args.nsamples
-            gptq_args.w_bits = args.w_bits
-            gptq_args.w_asym = args.w_asym
-            gptq_args.w_groupsize = args.w_groupsize
-            gptq_args.w_clip = args.w_clip
-            gptq_args.w_bits_down_proj = None
-            gptq_args.percdamp = args.percdamp
-            gptq_args.act_order = False
-            gptq_args.w_static_groups = False
-
-            gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
-
-            os.makedirs(_gptq_ckpt, exist_ok=True)
-            print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
-            utils.save_model_in_parts(model, _gptq_ckpt,
-                                      prefix=f'{model_name}_part')
-
-        utils.cleanup_memory(verbos=True)
-
     # --- Configure activation quantizer bit-widths ---
+    # Must happen before GPTQ so int_gemm per-group setup sees correct groupsize
+    # (e.g., o_per_head sets groupsize > 0 on o_proj, which must be respected).
     down_proj_groupsize = -1
     if args.a_groupsize > 0:
         down_proj_groupsize = utils.llama_down_proj_groupsize(model, args.a_groupsize)
@@ -615,6 +578,57 @@ def main():
         qlayers[name].quantizer.configure(
             bits=layer_input_bits, groupsize=layer_groupsize,
             sym=layer_a_sym, clip_ratio=layer_a_clip, residual=residual)
+
+    # --- GPTQ weight quantization ---
+    # Must happen before activation calibration so we measure activations
+    # flowing through quantized weights (matching actual inference).
+    if args.w_bits < 16:
+        _gptq_ckpt = os.path.join(args.gptq_checkpoint_path, f'{model_name}_w{args.w_bits}')
+
+        if args.gptq and os.path.isdir(_gptq_ckpt):
+            import shutil
+            print(f"--gptq: removing cached GPTQ checkpoint: {_gptq_ckpt}")
+            shutil.rmtree(_gptq_ckpt)
+
+        if os.path.isdir(_gptq_ckpt) and any(
+                f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
+            print(f"Loading existing GPTQ checkpoint from: {_gptq_ckpt}")
+            utils.load_model_in_parts(model, _gptq_ckpt)
+        else:
+            print(f"Running GPTQ (w{args.w_bits}, groupsize={args.w_groupsize}) ...")
+            trainloader = data_utils.get_loaders(
+                args.calib_dataset, nsamples=args.nsamples,
+                seed=args.seed, model=args.model,
+                seqlen=model.seqlen, eval_mode=False)
+
+            class GptqArgs:
+                pass
+            gptq_args = GptqArgs()
+            gptq_args.nsamples = args.nsamples
+            gptq_args.w_bits = args.w_bits
+            gptq_args.w_asym = args.w_asym
+            gptq_args.w_groupsize = args.w_groupsize
+            gptq_args.w_clip = args.w_clip
+            gptq_args.w_bits_down_proj = None
+            gptq_args.percdamp = args.percdamp
+            gptq_args.act_order = False
+            gptq_args.w_static_groups = False
+            # Forward int_gemm args so GPTQ enables capped accumulator between groups
+            gptq_args.int_gemm = getattr(args, 'int_gemm', False)
+            gptq_args.a_bits = getattr(args, 'a_bits', 16)
+            gptq_args.acc_bits = getattr(args, 'acc_bits', 32)
+            gptq_args.acc_block_k = getattr(args, 'acc_block_k', 32)
+            gptq_args.acc_wrap = getattr(args, 'acc_wrap', False)
+            gptq_args.int_gemm_use_triton = True
+
+            gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
+
+            os.makedirs(_gptq_ckpt, exist_ok=True)
+            print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
+            utils.save_model_in_parts(model, _gptq_ckpt,
+                                      prefix=f'{model_name}_part')
+
+        utils.cleanup_memory(verbos=True)
 
     # Add K-cache quantization wrappers
     if args.k_bits < 16:
@@ -653,21 +667,29 @@ def main():
 
     # --- Enable integer GEMM on ActQuantWrappers ---
     if args.int_gemm:
-        print(f"Enabling integer GEMM for calibration: acc_bits={args.acc_bits}, acc_block_k={args.acc_block_k}")
-        # Force symmetric activations for int GEMM
-        args.a_asym = False
+        print(f"Enabling integer GEMM for calibration: acc_bits={args.acc_bits}, acc_block_k={args.acc_block_k}", flush=True)
         ig_qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        print(f"  Found {len(ig_qlayers)} ActQuantWrapper layers", flush=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            print(f"  CUDA synced, proceeding with prepare_int_gemm...", flush=True)
         n_ig = 0
         for name, qlayer in ig_qlayers.items():
             if 'lm_head' in name or qlayer.quantizer.bits >= 16:
                 continue
+            if getattr(qlayer.quantizer, 'groupsize', -1) > 0:
+                logging.info(f"  skipping int_gemm for {name} (act groupsize={qlayer.quantizer.groupsize})")
+                continue
+            dev = qlayer.module.weight.device
+            print(f"  [{n_ig}] {name}: weight on {dev}, shape={list(qlayer.module.weight.shape)}, bits={qlayer.quantizer.bits}", flush=True)
             qlayer.prepare_int_gemm(
                 w_bits=args.w_bits, w_sym=True,
                 w_group_size=args.w_groupsize,
                 acc_bits=args.acc_bits, acc_block_k=args.acc_block_k,
                 acc_wrap=args.acc_wrap)
             n_ig += 1
-        print(f"Integer GEMM prepared for {n_ig} layers")
+            print(f"    done.", flush=True)
+        print(f"Integer GEMM prepared for {n_ig} layers", flush=True)
 
     # --- Get calibration data ---
     dataloader = data_utils.get_loaders(

@@ -402,7 +402,7 @@ def test_quantize_to_int_contiguous_scale():
     quantizer = ActQuantizer()
     quantizer.configure(bits=8, groupsize=-1, sym=True, clip_ratio=0.9)
 
-    q_int8, per_token_scale = quantizer.quantize_to_int(x)
+    q_int8, per_token_scale, _zp = quantizer.quantize_to_int(x)
 
     assert per_token_scale.is_contiguous(), \
         f"FAIL: per_token_scale stride={per_token_scale.stride()}, expected contiguous (stride 1)"

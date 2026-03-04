@@ -237,6 +237,13 @@ def main():
                     logging.info("  skipping int_gemm for %s (act_bits=%d > 8, falling back to fake-quant)",
                                  name, qlayer.quantizer.bits)
                 continue
+            if getattr(qlayer.quantizer, 'groupsize', -1) > 0:
+                # Grouped activation quantization (e.g. o_per_head) is
+                # incompatible with int GEMM which needs per-token scales.
+                qlayer.use_int_gemm = False
+                logging.info("  skipping int_gemm for %s (act groupsize=%d, need per-token)",
+                             name, qlayer.quantizer.groupsize)
+                continue
             qlayer.prepare_int_gemm(
                 w_bits=args.w_bits,
                 w_sym=not args.w_asym,

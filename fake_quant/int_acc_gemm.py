@@ -200,6 +200,7 @@ def int_gemm_capped(
     bias: Optional[torch.Tensor] = None,
     use_triton: bool = True,
     acc_wrap: bool = False,
+    w_zp_correction: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Quantize activations → run integer GEMM with capped accumulator → float output.
@@ -216,6 +217,8 @@ def int_gemm_capped(
     bias    : optional [N] float bias
     use_triton : use Triton kernel if available
     acc_wrap : use two's-complement wrap-around instead of saturation
+    w_zp_correction : optional [N] float — precomputed Σ_k s_w(j,k)·q_w(j,k),
+        used with asymmetric activations to correct for the zero-point shift.
 
     Returns
     -------
@@ -228,7 +231,7 @@ def int_gemm_capped(
     N = w_int.shape[0]
 
     # Quantize activations to int8
-    a_int, a_scale = act_quantizer.quantize_to_int(x_2d)
+    a_int, a_scale, a_zp_correction = act_quantizer.quantize_to_int(x_2d)
 
     # Dispatch
     if use_triton and _HAS_TRITON and x_float.is_cuda:
@@ -239,6 +242,11 @@ def int_gemm_capped(
         output = int_gemm_capped_reference(a_int, a_scale, w_int, w_scale,
                                            acc_bits, block_k, w_group_size,
                                            bias, acc_wrap)
+
+    # Zero-point correction for asymmetric activations (applied in float,
+    # outside the capped accumulator).
+    if a_zp_correction is not None and w_zp_correction is not None:
+        output += a_zp_correction.unsqueeze(1) * w_zp_correction.unsqueeze(0)
 
     return output.reshape(*orig_shape[:-1], N)
 
@@ -374,17 +382,18 @@ def prepare_int_weights(
 
     if w_group_size > 0:
         n_groups = math.ceil(K / w_group_size)
-        w_int = torch.zeros_like(W, dtype=torch.int8)
-        w_scale = torch.zeros(N, n_groups, dtype=torch.float32, device=W.device)
-
-        for g in range(n_groups):
-            k_start = g * w_group_size
-            k_end = min(k_start + w_group_size, K)
-            group = W[:, k_start:k_end]
-
-            q, scale = _recover_int_and_scale(group, maxq)
-            w_int[:, k_start:k_end] = q
-            w_scale[:, g] = scale.squeeze(1)
+        # Pad K so it's divisible by group_size, then batch all groups at once
+        padded_K = n_groups * w_group_size
+        if padded_K > K:
+            W_padded = F.pad(W, (0, padded_K - K))
+        else:
+            W_padded = W
+        # Reshape [N, K] -> [N * n_groups, group_size] so each row is one group
+        W_grouped = W_padded.reshape(N * n_groups, w_group_size)
+        q_flat, scale_flat = _recover_int_and_scale(W_grouped, maxq)
+        # Reshape back and trim padding
+        w_int = q_flat.reshape(N, padded_K)[:, :K].contiguous()
+        w_scale = scale_flat.squeeze(1).reshape(N, n_groups)
     else:
         q, scale = _recover_int_and_scale(W, maxq)
         w_int = q

@@ -31,7 +31,8 @@ Options:
                      7b  -> Llama-2-7b-hf
   -w W_BITS        Weight bit-width                    (default: 4)
   -a A_BITS        Activation bit-width                (default: 8)
-  -k KV_BITS       KV-cache bit-width                  (default: 4)
+  -k KV_BITS       K-cache bit-width                    (default: 4)
+  -v V_BITS        V-cache bit-width                    (default: same as -k)
   -G GROUPSIZE     Group size for W, K, V              (default: 128)
   --sym            Use symmetric quantization for W/K/V (default: asymmetric)
   --overwrite      Ignore cached results, re-run all
@@ -87,6 +88,7 @@ MODEL="7b"
 W_BITS=4
 A_BITS=8
 KV_BITS=4
+V_BITS=""
 GROUPSIZE=128
 SYM=0
 OVERWRITE=0
@@ -113,6 +115,7 @@ while [[ $# -gt 0 ]]; do
         -w)       W_BITS="$2";    shift 2 ;;
         -a)       A_BITS="$2";    shift 2 ;;
         -k)       KV_BITS="$2";   shift 2 ;;
+        -v)       V_BITS="$2";    shift 2 ;;
         -G)       GROUPSIZE="$2"; shift 2 ;;
         --sym)    SYM=1;          shift   ;;
         --overwrite) OVERWRITE=1; shift   ;;
@@ -147,11 +150,15 @@ case "$MODEL" in
     7b) MODEL="${MODEL_BASE}/Llama-2-7b-hf" ;;
 esac
 
+# --- Default V_BITS to KV_BITS if not explicitly set ---
+V_BITS=${V_BITS:-$KV_BITS}
+
 # --- Full mode overrides ---
 if [ "$MODE" == "full" ]; then
     W_BITS=16
     A_BITS=16
     KV_BITS=16
+    V_BITS=16
 fi
 
 # --- Symmetry flags ---
@@ -229,7 +236,7 @@ elif [ "$MODE" == "dart" ]; then
 fi
 
 # --- Descriptive tag encoding the quantization config ---
-QUANT_TAG="w${W_BITS}a${A_BITS}k${KV_BITS}v${KV_BITS}_g${GROUPSIZE}_aAsym_${SYM_TAG}"
+QUANT_TAG="w${W_BITS}a${A_BITS}k${KV_BITS}v${V_BITS}_g${GROUPSIZE}_aAsym_${SYM_TAG}"
 if [ "$KV_EX" != "0" ]; then
     QUANT_TAG="${QUANT_TAG}_kvex${KV_EX}"
 fi
@@ -299,11 +306,12 @@ fi
 
 if [ "$FAST" == "0" ]; then
     tasks="--tasks piqa hellaswag arc_easy arc_challenge winogrande lambada_openai social_iqa openbookqa mmlu"
-
+    LM_EVAL_FLAG="--lm_eval"
     ppl_t="wikitext2 ptb c4"
 else
     tasks=""
-    ppl_t="wikitext2"
+    LM_EVAL_FLAG=""
+    ppl_t="wikitext2 ptb c4"
 fi
 
 if [ "$REDO_GPTQ" == "1" ]; then
@@ -334,7 +342,7 @@ python main_for_test.py \
     --w_bits ${W_BITS} \
     --a_bits ${A_BITS} \
     --k_bits ${KV_BITS} \
-    --v_bits ${KV_BITS} \
+    --v_bits ${V_BITS} \
     --k_groupsize ${K_GROUPSIZE} \
     --v_groupsize ${GROUPSIZE} \
     ${K_ASYM_FLAG} \
@@ -352,6 +360,6 @@ python main_for_test.py \
     --ppl_eval \
     --ppl_eval_batch_size 1 \
     --ppl_eval_dataset ${ppl_t} \
-    --lm_eval \
+    ${LM_EVAL_FLAG} \
     --lm_eval_batch_size 2 \
     ${tasks}

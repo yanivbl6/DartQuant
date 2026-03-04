@@ -8,7 +8,7 @@ trains them first (on the first available GPU) before launching the three
 calibrations in parallel.
 
 Usage:
-    python multi_calibration.py -m 1b --sym --kv_ex 8 --proj_ex 15 -k 8 --v_bits 8 -g 2 3 4
+    python multi_calibration.py -m 1b --sym --kv_ex 8 --proj_ex 15 -k 8 -v 8 -g 2 3 4
     python multi_calibration.py -m 3b --sym -g 0 1 2
 
 The first GPU is used for dart (and for R1/R2 training if needed), the second
@@ -22,40 +22,8 @@ import os
 import threading
 import time
 
-
-MODEL_BASE = "/data/users/sashas/LLMC/Models/meta-llama"
-MODEL_MAP = {
-    '1b': f'{MODEL_BASE}/Llama-3.2-1B-Instruct',
-    '3b': f'{MODEL_BASE}/Llama-3.2-3B-Instruct',
-    '7b': f'{MODEL_BASE}/Llama-2-7b-hf',
-}
-
-R1_PATHS = {
-    'Llama-2-7b-hf':         '../data/trained_rotation/wikitext2_128samples/r1/sgd.0.0015.0.9.10.64.0.1.1',
-    'Llama-3.2-1B-Instruct': '../data/trained_rotation/wikitext2_128samples/Llama-3.2-1B-Instruct/r1/sgd.0.0015.0.9.10.64.0.1.1',
-    'Llama-3.2-3B-Instruct': '../data/trained_rotation/wikitext2_128samples/Llama-3.2-3B-Instruct/r1/sgd.0.0015.0.9.10.64.0.1.1',
-}
-R2_PATHS = {
-    'Llama-2-7b-hf':         '../data/trained_rotation/wikitext2_128samples/r2/sgd.0.001.0.9.10.64.2',
-    'Llama-3.2-1B-Instruct': '../data/trained_rotation/wikitext2_128samples/Llama-3.2-1B-Instruct/r2/sgd.0.001.0.9.10.64.2',
-    'Llama-3.2-3B-Instruct': '../data/trained_rotation/wikitext2_128samples/Llama-3.2-3B-Instruct/r2/sgd.0.001.0.9.10.64.2',
-}
-
-
-def resolve_r_path(base_path):
-    """Append the .pt file inside the directory, matching calibrate_act_scales.py logic."""
-    if base_path and '.pt' not in base_path and '.bin' not in base_path:
-        return base_path + '/' + base_path.split('/')[-1] + '.pt'
-    return base_path
-
-
-def r1r2_exist(model_name):
-    """Check whether pre-trained R1 and R2 .pt files exist for the model."""
-    r1_base = R1_PATHS.get(model_name)
-    r2_base = R2_PATHS.get(model_name)
-    if not r1_base or not r2_base:
-        return False
-    return os.path.isfile(resolve_r_path(r1_base)) and os.path.isfile(resolve_r_path(r2_base))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+import experiment_config as cfg
 
 
 def stream_output(proc, prefix):
@@ -103,7 +71,7 @@ def make_env(gpu_id):
     return env
 
 
-def build_calibrate_cmd(mode, model_short, extra_args):
+def build_calibrate_cmd(mode, model_short, quant_args, extra_args):
     """Build the calibrate_act_scales.py command for the given mode."""
     cmd = [
         sys.executable, 'calibrate_act_scales.py',
@@ -112,7 +80,7 @@ def build_calibrate_cmd(mode, model_short, extra_args):
     ]
     if mode == 'dart':
         cmd += ['--r1', '--r2']
-    cmd += extra_args
+    cmd += quant_args + extra_args
     return cmd
 
 
@@ -130,7 +98,8 @@ def parse_args():
     if '-h' in sys.argv[1:] or '--help' in sys.argv[1:]:
         calibrate_help = get_calibrate_help()
         extra_help = (
-            "\n\nAll other arguments are forwarded to calibrate_act_scales.py.\n"
+            "\n\nExtra arguments (e.g. --nsamples, --seqlen) are forwarded "
+            "to calibrate_act_scales.py.\n"
             "Below is its help output:\n"
             + "=" * 60 + "\n"
             + calibrate_help
@@ -143,49 +112,65 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python multi_calibration.py -m 1b --sym --kv_ex 8 --proj_ex 15 -k 8 --v_bits 8 -g 2 3 4
+  python multi_calibration.py -m 1b --sym --kv_ex 8 --proj_ex 15 -k 8 -v 8 -g 2 3 4
   python multi_calibration.py -m 3b --sym -g 0 1 2
 """ + extra_help)
-    parser.add_argument('-m', '--model', required=True,
-                        help='Model shorthand (1b, 3b, 7b) or full path')
+
+    cfg.add_model_arg(parser)
     parser.add_argument('-g', '--gpus', type=int, nargs='+', required=True,
                         help='GPU IDs to use (at least 1; up to 3 for full parallelism)')
-    # All remaining args are forwarded to calibrate_act_scales.py
+    cfg.add_quant_args(parser)
+    parser.add_argument('--dry', action='store_true',
+                        help='Print commands without running them')
+
+    # Calibration-specific extras (--nsamples, --seqlen, etc.) remain in extra_args
     return parser.parse_known_args()
 
 
 def main():
     args, extra_args = parse_args()
+    cfg.resolve_v_bits(args)
+    quant_args = cfg.build_quant_args(args)
+
     gpus = args.gpus
     model_short = args.model
 
     # Resolve model name for R1/R2 existence check
-    model_full = MODEL_MAP.get(model_short, model_short)
-    model_name = os.path.basename(model_full.rstrip('/'))
+    model_full = cfg.resolve_model(model_short)
+    model_name = cfg.model_name_from_path(model_full)
 
     modes = ['dart', 'quarot', 'baseline']
 
     # --- Phase 1: Train R1/R2 if needed (blocks dart GPU) ---
-    if not r1r2_exist(model_name):
+    r1r2_cmd = ['bash', 'calibrate_model.sh', '-m', model_full, '-g', str(gpus[0])]
+    if not cfg.r1r2_exist(model_name):
         print(f"R1/R2 not found for {model_name}. Training on GPU {gpus[0]} first...")
-        ret = run_job(
-            ['bash', 'calibrate_model.sh', '-m', model_full, '-g', str(gpus[0])],
-            make_env(gpus[0]),
-            'R1/R2 train',
-        )
-        if ret != 0:
-            print("R1/R2 training failed. Aborting.")
-            sys.exit(1)
+        if args.dry:
+            print(f"  CUDA_VISIBLE_DEVICES={gpus[0]} {' '.join(r1r2_cmd)}")
+        else:
+            ret = run_job(r1r2_cmd, make_env(gpus[0]), 'R1/R2 train')
+            if ret != 0:
+                print("R1/R2 training failed. Aborting.")
+                sys.exit(1)
     else:
         print(f"R1/R2 already exist for {model_name}. Skipping training.")
 
     # --- Phase 2: Run all three calibrations in parallel ---
     # Assign GPUs round-robin: mode[i] -> gpus[i % len(gpus)]
+    print()
+    for i, mode in enumerate(modes):
+        gpu = gpus[i % len(gpus)]
+        cmd = build_calibrate_cmd(mode, model_short, quant_args, extra_args)
+        print(f"  [GPU {gpu}] {mode}: CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}")
+
+    if args.dry:
+        return
+
     threads = []
     results = {}
 
     def worker(mode, gpu_id):
-        cmd = build_calibrate_cmd(mode, model_short, extra_args)
+        cmd = build_calibrate_cmd(mode, model_short, quant_args, extra_args)
         results[mode] = run_job(cmd, make_env(gpu_id), mode)
 
     for i, mode in enumerate(modes):

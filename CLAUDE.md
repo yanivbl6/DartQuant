@@ -33,5 +33,5 @@ when changing enviroment variables/ update the dockerfile to match.
 
 example run:
 `sh Script/experiments.sh -m 1b` 
-but it's very slow an uses shared GPU, so don't run it yourself
+but it's very slow and uses shared GPU, so don't run it yourself
 

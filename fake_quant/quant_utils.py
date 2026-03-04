@@ -145,40 +145,58 @@ class ActQuantizer(torch.nn.Module):
             return asym_quant(x, self.scale, self.zero, self.maxq)
 
     def quantize_to_int(self, x):
-        """Quantize activations to int8 and return (q_int8, per_token_scale).
+        """Quantize activations to int8 and return (q_int8, per_token_scale, zp_correction).
 
         Unlike ``forward`` (fake-quant) or ``quantize`` (returns float integers),
         this method returns *actual* int8 values and a 1-D per-token scale vector,
         suitable for feeding into the integer GEMM kernel.
 
-        Requires symmetric, per-token (groupsize <= 0) quantization.
+        For asymmetric quantization, q is shifted into signed int8 range and a
+        per-token zero-point correction factor is returned.  The caller must
+        combine it with the precomputed ``w_zp_correction`` vector:
+
+            output += zp_correction[:, None] * w_zp_correction[None, :]
+
+        Requires per-token (groupsize <= 0) quantization, bits <= 8.
         """
-        assert self.sym, "quantize_to_int requires symmetric quantization"
         assert self.bits <= 8, \
             f"quantize_to_int requires bits <= 8 (got {self.bits}); values would overflow int8"
         assert self.groupsize <= 0 or not hasattr(self, 'groupsize'), \
             "quantize_to_int requires per-token quantization (groupsize <= 0)"
 
-        if not self.static:
-            self.find_params(x)
+        # Always compute per-token scales from x, even in static mode.
+        # Static calibration produces per-column scales [K], but int_gemm needs
+        # per-token scales [M] — per-column scales can't be factored out of a
+        # dot product.  The fake-quant path (self.quantizer(x)) still uses the
+        # static per-column scales correctly via element-wise dequantization.
+        self.find_params(x)
 
-        # sym_quant returns (q, scale) where q is float with integer values
-        q, scale = sym_quant(x, self.scale, self.maxq)
-
-        # Extract per-token scalar scale from the broadcasted scale tensor.
+        # Extract per-token scalar scale (works for both sym and asym).
         # self.scale has shape [..., K] with repeated values along K.
         # IMPORTANT: flat_scale[:, 0] has stride K (non-contiguous).  The
         # Triton kernel indexes A_scale_ptr with stride 1, so we MUST return
         # a contiguous 1-D tensor — otherwise the kernel reads garbage.
-        flat_scale = scale.reshape(-1, scale.shape[-1])
+        flat_scale = self.scale.reshape(-1, self.scale.shape[-1])
         per_token_scale = flat_scale[:, 0].contiguous()  # [M], stride-1
 
-        q_int8 = q.reshape(-1, q.shape[-1]).to(torch.int8)
+        if self.sym:
+            q, _scale = sym_quant(x, self.scale, self.maxq)
+            q_int8 = q.reshape(-1, q.shape[-1]).to(torch.int8)
+            zp_correction = None
+        else:
+            q, _scale, zero = asym_quant(x, self.scale, self.zero, self.maxq)
+            # q is in [0, maxq]. Shift into signed int8 range.
+            shift = (int(self.maxq.item()) + 1) // 2   # 128 for 8-bit
+            q_int8 = (q - shift).reshape(-1, q.shape[-1]).to(torch.int8)
 
-        if not self.static:
-            self.free()
+            flat_zero = zero.reshape(-1, zero.shape[-1])
+            per_token_zero = flat_zero[:, 0].contiguous()  # [M]
+            # Per-token correction: scale * (shift - zero)
+            zp_correction = per_token_scale * (shift - per_token_zero)
 
-        return q_int8, per_token_scale
+        self.free()
+
+        return q_int8, per_token_scale, zp_correction
 
     def configure(self, bits,
                   groupsize=-1,
@@ -289,7 +307,13 @@ class ActQuantWrapper(torch.nn.Module):
         self._buffers['w_int'] = None
         self.register_buffer('w_scale', None)
         self._buffers['w_scale'] = None
+        self.register_buffer('w_zp_correction', None)
+        self._buffers['w_zp_correction'] = None
         self.w_group_size = -1
+        # Calibration intermediates (set when _calibrating=True)
+        self._calibrating = False
+        self._cal_input = None     # post-rotation, pre-quantization
+        self._cal_output = None    # post-matmul, pre-output-quantization
 
     def prepare_int_gemm(self, w_bits, w_sym=True, w_group_size=-1,
                          acc_bits=32, acc_block_k=32, use_triton=True,
@@ -304,8 +328,25 @@ class ActQuantWrapper(torch.nn.Module):
         self.w_group_size = w_group_size
 
         w_int, w_scale = prepare_int_weights(self.module, w_bits, w_sym, w_group_size)
-        self.w_int = w_int.to(self.module.weight.device)
-        self.w_scale = w_scale.to(self.module.weight.device)
+        dev = self.module.weight.device
+        self.w_int = w_int.to(dev)
+        self.w_scale = w_scale.to(dev)
+
+        # Precompute per-output-channel zero-point correction for asymmetric
+        # activations:  w_zp_correction[j] = Σ_k  s_w(j,k) · q_w(j,k)
+        N, K = w_int.shape
+        if w_group_size > 0:
+            n_groups = w_scale.shape[1]
+            padded_K = n_groups * w_group_size
+            if padded_K > K:
+                w_int_padded = torch.nn.functional.pad(w_int.float(), (0, padded_K - K))
+            else:
+                w_int_padded = w_int.float()
+            # [N, n_groups, group_size] -> sum over group -> [N, n_groups]
+            group_sums = w_int_padded.reshape(N, n_groups, w_group_size).sum(dim=2)
+            self.w_zp_correction = (w_scale * group_sums).sum(dim=1)
+        else:
+            self.w_zp_correction = w_scale * w_int.float().sum(dim=1)
 
     def extra_repr(self) -> str:
         str_ = f'Input Quantizer Bits: {self.quantizer.bits}'
@@ -351,6 +392,9 @@ class ActQuantWrapper(torch.nn.Module):
                 x = x.to(x_dtype)
             x = x.reshape(init_shape)
 
+        if self._calibrating:
+            self._cal_input = x  # post-rotation, pre-quantization
+
         if self.use_int_gemm and self.quantizer.bits <= 8:
             # Integer GEMM path: quantize activations to int inside the kernel
             from int_acc_gemm import int_gemm_capped
@@ -365,6 +409,7 @@ class ActQuantWrapper(torch.nn.Module):
                 bias=self.bias,
                 use_triton=self.int_gemm_use_triton,
                 acc_wrap=self.acc_wrap,
+                w_zp_correction=self.w_zp_correction,
             ).to(x_dtype)
         else:
             # Original fake-quant path
@@ -374,6 +419,9 @@ class ActQuantWrapper(torch.nn.Module):
                 self.quantizer.free()
 
             x = self.module(x).to(x_dtype)
+
+        if self._calibrating:
+            self._cal_output = x  # post-matmul, pre-output-quantization
 
         if self.out_quantizer.bits < 16:  # Quantize the output, if needed
             # self.out_quantizer.find_params(x) # QuaRot 源码，现修改在 quantizer.forward 函数中
