@@ -207,8 +207,19 @@ def print_summary(runs):
     cols += ["Avg↑"]
 
     # Build data matrix — factor out common prefix from labels
-    raw_labels = [r[0] for r in runs]
-    common_prefix, labels = _factor_labels(raw_labels)
+    # Exclude "full" runs from factoring so they don't dilute the common prefix
+    full_indices = {i for i, (_, _, m) in enumerate(runs) if m == "full"}
+    non_full_labels = [r[0] for i, r in enumerate(runs) if i not in full_indices]
+    common_prefix, short_non_full = _factor_labels(non_full_labels)
+    # Reconstruct labels list with full runs keeping their original label
+    labels = []
+    nf_idx = 0
+    for i, (raw_label, _, mode) in enumerate(runs):
+        if i in full_indices:
+            labels.append("FP32 baseline")
+        else:
+            labels.append(short_non_full[nf_idx])
+            nf_idx += 1
     matrix = []  # matrix[run_idx][col_idx] = value or None
     is_ppl = []  # True for PPL columns
 
