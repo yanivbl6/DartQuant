@@ -49,7 +49,11 @@ Options:
   --acc_bits N         Accumulator bit-width                         (default: 32)
   --acc_block_k N      K-block size for accumulator capping          (default: 32)
   --acc_wrap           Use wrap-around instead of saturation on overflow
-  -F FAST          Enable fast model
+  --sd_check T         Compare static vs dynamic quantization per-layer (threshold T, 0=off)
+  --sd_check_norm N    Norm for sd_check: 1, 2, or inf                   (default: inf)
+  --selective-dyn P    Comma-separated layer patterns to force dynamic    (e.g., "v_proj,o_proj")
+  -F               Fast mode (skip lm_eval tasks)
+  --very-fast      Very fast mode (skip lm_eval, PPL on wikitext2 only)
   -h               Show this help message
 
 Notes:
@@ -106,6 +110,9 @@ INT_GEMM=0
 ACC_BITS=32
 ACC_BLOCK_K=32
 ACC_WRAP=0
+SD_CHECK=0
+SD_CHECK_NORM="inf"
+SELECTIVE_DYN=""
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -132,7 +139,11 @@ while [[ $# -gt 0 ]]; do
         --acc_bits)    ACC_BITS="$2";    shift 2 ;;
         --acc_block_k) ACC_BLOCK_K="$2"; shift 2 ;;
         --acc_wrap)    ACC_WRAP=1;        shift   ;;
+        --sd_check)    SD_CHECK="$2";    shift 2 ;;
+        --sd_check_norm) SD_CHECK_NORM="$2"; shift 2 ;;
+        --selective-dyn) SELECTIVE_DYN="$2"; shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
+        --very-fast) FAST=2;     shift   ;;
         -h|--help) usage ;;
         *)
             echo "Unknown option: $1"
@@ -288,6 +299,19 @@ if [ "$INT_GEMM" == "1" ]; then
     QUANT_TAG="${QUANT_TAG}${INTGEMM_TAG}"
 fi
 
+# --- Static vs Dynamic check flags ---
+SD_CHECK_FLAG=""
+if [ "$SD_CHECK" != "0" ]; then
+    SD_CHECK_FLAG="--sd_check ${SD_CHECK} --sd_check_norm ${SD_CHECK_NORM}"
+fi
+
+# --- Selective dynamic flags ---
+SELECTIVE_DYN_FLAG=""
+if [ -n "$SELECTIVE_DYN" ]; then
+    SELECTIVE_DYN_FLAG="--selective-dyn ${SELECTIVE_DYN}"
+    STATIC_TAG="seldyn_"
+fi
+
 # --- Static activation scales (after all tag components are finalized) ---
 STATIC_ACT_FLAG=""
 STATIC_TAG=""
@@ -308,6 +332,10 @@ if [ "$FAST" == "0" ]; then
     tasks="--tasks piqa hellaswag arc_easy arc_challenge winogrande lambada_openai social_iqa openbookqa mmlu"
     LM_EVAL_FLAG="--lm_eval"
     ppl_t="wikitext2 ptb c4"
+elif [ "$FAST" == "2" ]; then
+    tasks=""
+    LM_EVAL_FLAG=""
+    ppl_t="wikitext2"
 else
     tasks=""
     LM_EVAL_FLAG=""
@@ -350,6 +378,8 @@ python main_for_test.py \
     ${STATIC_ACT_FLAG} \
     ${PWL_ACT_FLAG} \
     ${INT_GEMM_FLAG} \
+    ${SD_CHECK_FLAG} \
+    ${SELECTIVE_DYN_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     --percdamp 0.1 \

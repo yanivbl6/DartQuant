@@ -23,7 +23,7 @@ The quantization of the hailo-sdk repository is in
 `/home/yanivbl/phase2-sdk/model_optimization/model_optimization_production/hailo_model_optimization/flows/optimization_flow.py`
 
 
-6. Integer GEMM with capped accumulator (`fake_quant/int_acc_gemm.py`): Triton kernel + PyTorch reference that simulates hardware integer GEMM with limited-width accumulator. Enabled via `--int_gemm --acc_bits N --acc_block_k N`. Integrated into inference, GPTQ propagation, and calibration.
+6. Integer GEMM with capped accumulator (`fake_quant/int_acc_gemm.py`): Triton kernel + PyTorch reference that simulates hardware integer GEMM with limited-width accumulator. Enabled via `--int_gemm --acc_bits N --acc_block_k N`. Integrated into inference, GPTQ propagation, and calibration. Calibration hooks attach to `ActQuantWrapper` (not inner Linear) and use stored `_cal_input`/`_cal_output` so int_gemm path is captured. Static mode uses per-group activation scales aligned with `acc_block_k` (per-column scales can't factor out of a dot product; per-group scales can because each K-block has one scalar scale). Dynamic mode uses per-token scales. The kernel supports both per-group activation scales (`A_GROUP_SIZE > 0`) and per-group weight scales (`GROUP_SIZE > 0`).
 
 for static configuration, we use `calibrater/calibrate_model.sh` before the run. it accepts r1/r2 and also runs gptq, which we cache.
 `multi_calibration.py` runs `calibrater/calibrate_model.sh` for 3 different experiments.
@@ -35,3 +35,6 @@ example run:
 `sh Script/experiments.sh -m 1b` 
 but it's very slow and uses shared GPU, so don't run it yourself
 
+
+The documentation file `documentation.md` include explainations about:
+1. Activation Quantization: Static vs Dynamic, GEMM vs GEMM-Int

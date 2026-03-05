@@ -39,9 +39,9 @@ Examples:
     cfg.add_model_arg(parser)
     cfg.add_quant_args(parser)
 
-    parser.add_argument('-g', '--gpus', type=int, nargs='+',
-                        default=[1, 2, 3, 4, 5, 6, 7],
-                        help='GPU IDs for experiments (default: 1 2 3 4 5 6 7)')
+    parser.add_argument('-g', '--gpus', type=str, default='1',
+                        help='GPU IDs: a single number S (expands to S,S+1,...,S+6) '
+                             'or a comma-separated list like "1,3,5,7,2,4,6" (default: "1")')
     parser.add_argument('--calibrate', action='store_true',
                         help='Run R1/R2 calibration (calibrate_model.sh) before experiments')
     parser.add_argument('--calibrate_gpu', type=int, default=None,
@@ -51,7 +51,13 @@ Examples:
     parser.add_argument('--gptq', action='store_true',
                         help='Delete cached GPTQ checkpoint and re-quantize')
     parser.add_argument('-F', '--fast', action='store_true',
-                        help='Fast mode (fewer eval tasks/datasets)')
+                        help='Fast mode (skip lm_eval tasks)')
+    parser.add_argument('--very-fast', action='store_true',
+                        help='Very fast mode (skip lm_eval, PPL on wikitext2 only)')
+
+    parser.add_argument('--skip', type=str, default=None,
+                        help='Experiments to skip (1-indexed by print order): '
+                             'a single number like "4" or comma-separated like "3,6"')
     parser.add_argument('--dry', action='store_true',
                         help='Print commands without running them')
 
@@ -71,7 +77,9 @@ def build_experiment_cmd(mode, gpu, quant_args, extra_flags, args):
         cmd.append('--overwrite')
     if args.gptq:
         cmd.append('--gptq')
-    if args.fast:
+    if args.very_fast:
+        cmd.append('--very-fast')
+    elif args.fast:
         cmd.append('-F')
 
     return cmd
@@ -95,9 +103,22 @@ def main():
     cfg.resolve_v_bits(args)
     quant_args = cfg.build_quant_args(args)
 
+    experiments = cfg.EXPERIMENTS
+    num_exp = len(experiments)
+
+    # Parse GPU specification
+    gpu_str = args.gpus
+    parts = gpu_str.split(',')
+    if len(parts) == 1:
+        # Single number S -> S, S+1, ..., S+num_exp-1
+        s = int(parts[0])
+        gpus = list(range(s, s + num_exp))
+    else:
+        gpus = [int(p) for p in parts]
+
     # --- Optional calibration ---
     if args.calibrate:
-        cal_gpu = args.calibrate_gpu if args.calibrate_gpu is not None else args.gpus[0]
+        cal_gpu = args.calibrate_gpu if args.calibrate_gpu is not None else gpus[0]
         if args.dry:
             script = os.path.join(SCRIPT_DIR, '..', 'calibrater', 'calibrate_model.sh')
             model_full = cfg.resolve_model(args.model)
@@ -105,24 +126,33 @@ def main():
         else:
             run_calibration(args.model, cal_gpu)
 
-    experiments = cfg.EXPERIMENTS
-    gpus = args.gpus
+    # Parse skip set (1-indexed)
+    skip_set = set()
+    if args.skip:
+        skip_set = {int(x) for x in args.skip.split(',')}
 
     # --- Build and optionally print commands ---
     print(f"=== {len(experiments)} experiments ===\n")
 
     cmds = []
     for i, (name, mode, extra_flags) in enumerate(experiments):
+        idx = i + 1  # 1-indexed
         gpu = gpus[i % len(gpus)]
         cmd = build_experiment_cmd(mode, gpu, quant_args, extra_flags, args)
-        cmds.append((name, cmd))
-        print(f"  [GPU {gpu}] {name}: {' '.join(cmd)}")
+        if idx in skip_set:
+            cmds.append((name, cmd, True))
+            print(f"  [skipped] {name}: {' '.join(cmd)}")
+        else:
+            cmds.append((name, cmd, False))
+            print(f"  [GPU {gpu}] {name}: {' '.join(cmd)}")
 
     if args.dry:
         return
 
     # --- Clean old result files ---
-    for name, _, _ in experiments:
+    for name, _, skipped in cmds:
+        if skipped:
+            continue
         for ext in ('out', 'err'):
             path = f'/tmp/{name}_results.{ext}'
             if os.path.exists(path):
@@ -131,7 +161,9 @@ def main():
     # --- Launch experiments in parallel ---
     print()
     procs = []
-    for name, cmd in cmds:
+    for name, cmd, skipped in cmds:
+        if skipped:
+            continue
         out_f = open(f'/tmp/{name}_results.out', 'w')
         err_f = open(f'/tmp/{name}_results.err', 'w')
         proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f)
@@ -150,9 +182,14 @@ def main():
             print(f"  [FAIL] {name} (see /tmp/{name}_results.err)")
             failed += 1
 
+    num_run = len(procs)
+    num_skipped = len(skip_set)
     print()
     if failed == 0:
-        print(f"=== All {len(experiments)} experiments completed successfully ===")
+        msg = f"=== All {num_run} experiments completed successfully ==="
+        if num_skipped:
+            msg += f" ({num_skipped} skipped)"
+        print(msg)
     else:
         print(f"=== {failed} experiment(s) failed ===")
         sys.exit(1)

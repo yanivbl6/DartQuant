@@ -8,11 +8,11 @@ trains them first (on the first available GPU) before launching the three
 calibrations in parallel.
 
 Usage:
-    python multi_calibration.py -m 1b --sym --kv_ex 8 --proj_ex 15 -k 8 -v 8 -g 2 3 4
-    python multi_calibration.py -m 3b --sym -g 0 1 2
+    python multi_calibration.py -m 1b --sym --kv_ex 8 --proj_ex 15 -k 8 -v 8 -g 2
+    python multi_calibration.py -m 3b --sym -g 3,6,8
 
 The first GPU is used for dart (and for R1/R2 training if needed), the second
-for quarot, the third for baseline.  With fewer GPUs the jobs are queued.
+for quarot, the third for baseline.
 """
 
 import argparse
@@ -20,7 +20,6 @@ import subprocess
 import sys
 import os
 import threading
-import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import experiment_config as cfg
@@ -112,13 +111,14 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python multi_calibration.py -m 1b --sym --kv_ex 8 --proj_ex 15 -k 8 -v 8 -g 2 3 4
-  python multi_calibration.py -m 3b --sym -g 0 1 2
+  python multi_calibration.py -m 1b --sym --kv_ex 8 --proj_ex 15 -k 8 -v 8 -g 2
+  python multi_calibration.py -m 3b --sym -g 3,6,8
 """ + extra_help)
 
     cfg.add_model_arg(parser)
-    parser.add_argument('-g', '--gpus', type=int, nargs='+', required=True,
-                        help='GPU IDs to use (at least 1; up to 3 for full parallelism)')
+    parser.add_argument('-g', '--gpus', type=str, default='1',
+                        help='GPU IDs: a single number S (expands to S,S+1,S+2) '
+                             'or a comma-separated list like "3,6,8" (default: "1")')
     cfg.add_quant_args(parser)
     parser.add_argument('--dry', action='store_true',
                         help='Print commands without running them')
@@ -132,7 +132,19 @@ def main():
     cfg.resolve_v_bits(args)
     quant_args = cfg.build_quant_args(args)
 
-    gpus = args.gpus
+    # Parse GPU specification
+    gpu_str = args.gpus
+    parts = gpu_str.split(',')
+    if len(parts) == 1:
+        # Single number S -> S, S+1, S+2
+        s = int(parts[0])
+        gpus = [s, s + 1, s + 2]
+    elif len(parts) == 3:
+        gpus = [int(p) for p in parts]
+    else:
+        print(f"Error: --gpus expects a single number or exactly 3 comma-separated IDs, got '{gpu_str}'")
+        sys.exit(1)
+
     model_short = args.model
 
     # Resolve model name for R1/R2 existence check
@@ -178,46 +190,10 @@ def main():
         t = threading.Thread(target=worker, args=(mode, gpu), daemon=True)
         threads.append((mode, t))
 
-    # If we have fewer GPUs than modes, stagger launches so jobs sharing
-    # a GPU don't compete.  With >= 3 GPUs, all start immediately.
-    if len(gpus) >= len(modes):
-        # All parallel
-        for _, t in threads:
-            t.start()
-        for _, t in threads:
-            t.join()
-    else:
-        # Launch in waves grouped by GPU
-        from collections import defaultdict
-        waves = defaultdict(list)
-        for i, (mode, t) in enumerate(threads):
-            waves[i % len(gpus)].append((mode, t))
-
-        # Start first wave (one job per GPU)
-        active = []
-        pending = []
-        for gpu_slot, jobs in waves.items():
-            mode, t = jobs[0]
-            t.start()
-            active.append((gpu_slot, mode, t))
-            pending.extend(jobs[1:])
-
-        # As jobs finish, launch the next pending job for that GPU slot
-        while active or pending:
-            still_active = []
-            for gpu_slot, mode, t in active:
-                t.join(timeout=1.0)
-                if t.is_alive():
-                    still_active.append((gpu_slot, mode, t))
-                else:
-                    # Slot freed, launch next pending job for any slot
-                    if pending:
-                        next_mode, next_t = pending.pop(0)
-                        next_t.start()
-                        still_active.append((gpu_slot, next_mode, next_t))
-            active = still_active
-            if active:
-                time.sleep(0.5)
+    for _, t in threads:
+        t.start()
+    for _, t in threads:
+        t.join()
 
     # --- Summary ---
     print(f"\n{'='*60}")

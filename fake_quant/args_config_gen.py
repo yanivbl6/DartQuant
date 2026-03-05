@@ -61,6 +61,9 @@ def parser_gen():
     parser.add_argument('--act_scales_path', type=str, default=None,
                         help='Path to pre-calibrated activation scales (.pt). '
                              'When set, static quantization is used instead of dynamic.')
+    parser.add_argument('--selective-dyn', type=str, default=None,
+                        help='Comma-separated layer name patterns to force dynamic quantization. '
+                             'E.g., "v_proj,o_proj" matches any layer whose name contains those substrings.')
 
     # PWL Activation Approximation Arguments
     parser.add_argument('--pwl_act', action=argparse.BooleanOptionalAction, default=False,
@@ -97,6 +100,14 @@ def parser_gen():
     parser.add_argument('--int_gemm_use_triton', action=argparse.BooleanOptionalAction, default=True,
                         help='Use Triton kernel for integer GEMM (default: True). '
                              'Set --no-int_gemm_use_triton for pure-PyTorch reference.')
+
+    # Static vs Dynamic comparison diagnostic
+    parser.add_argument('--sd_check', type=float, default=0,
+                        help='Compare static vs dynamic quantization per-layer. '
+                             'Warn if relative error exceeds this threshold. 0=off.')
+    parser.add_argument('--sd_check_norm', type=str, default='inf',
+                        choices=['1', '2', 'inf'],
+                        help='Norm for sd_check relative error (default: inf/max)')
 
     # Weight Quantization Arguments
     parser.add_argument('--w_bits', type=int, default=16,
@@ -244,9 +255,6 @@ def parser_gen():
     if args.int_gemm:
         assert args.a_bits <= 8, 'Integer GEMM requires activation bits <= 8'
         assert args.w_bits <= 8, 'Integer GEMM requires weight bits <= 8'
-        if args.a_asym:
-            logging.warning('Integer GEMM requires symmetric activations. Forcing --no-a_asym.')
-            args.a_asym = False
         if args.w_groupsize > 0:
             assert args.acc_block_k <= args.w_groupsize, (
                 f'acc_block_k ({args.acc_block_k}) must be <= w_groupsize ({args.w_groupsize}) '

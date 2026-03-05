@@ -326,6 +326,146 @@ def main():
 
         logging.info("Static activation scales applied to all quantizers.")
 
+    # Convert per-column static scales to per-group for int_gemm layers.
+    # Per-column scales can't factor out of a dot product.  Per-group scales
+    # (one per acc_block_k columns) can — each K-block gets its own scale.
+    if args.int_gemm and args.act_scales_path:
+        G = args.acc_block_k
+        qlayers_pg = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        n_converted = 0
+        for name, qlayer in qlayers_pg.items():
+            if not getattr(qlayer, 'use_int_gemm', False):
+                continue
+            q = qlayer.quantizer
+            if not q.static:
+                continue
+            col_scale = q.scale.flatten()  # [K] from calibration
+            col_zero = q.zero.flatten()   # [K] from calibration
+            K = col_scale.shape[0]
+            assert K % G == 0, (
+                f"K={K} not divisible by acc_block_k={G} for {name}")
+            n_groups = K // G
+            maxq = q.maxq.float()
+
+            if q.sym:
+                # Symmetric: group scale = max of column scales within group
+                q.scale = col_scale.reshape(n_groups, G).max(dim=1)[0]
+                q.zero = torch.zeros(n_groups)
+            else:
+                # Asymmetric: derive per-group (scale, zero) from representable ranges
+                col_min = -(col_zero * col_scale)            # [K]
+                col_max = (maxq - col_zero) * col_scale      # [K]
+                group_min = col_min.reshape(n_groups, G).min(dim=1)[0]
+                group_max = col_max.reshape(n_groups, G).max(dim=1)[0]
+                group_scale = (group_max - group_min) / maxq
+                group_zero = torch.round(-group_min / group_scale)
+                dead = (group_min == 0) & (group_max == 0)
+                group_scale[dead] = 1.0
+                group_zero[dead] = 0.0
+                q.scale = group_scale
+                q.zero = group_zero
+
+            q.groupsize = G
+            n_converted += 1
+        if n_converted:
+            logging.info("Converted %d int_gemm quantizers to per-group scales "
+                         "(group_size=%d)", n_converted, G)
+            # Precompute static zero-point correction for asymmetric per-group mode
+            for name, qlayer in qlayers_pg.items():
+                if getattr(qlayer, 'use_int_gemm', False) and qlayer.quantizer.static:
+                    qlayer.compute_static_zp_bias()
+
+    # --- Selective dynamic: revert matching layers from static to dynamic ---
+    if args.act_scales_path and getattr(args, 'selective_dyn', None):
+        patterns = [p.strip() for p in args.selective_dyn.split(',')]
+        n_reverted = 0
+
+        # ActQuantWrapper quantizers
+        qlayers_sd = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        for name, qlayer in qlayers_sd.items():
+            if any(p in name for p in patterns):
+                if qlayer.quantizer.static:
+                    qlayer.quantizer.static = False
+                    qlayer.quantizer.groupsize = -1  # undo per-group conversion
+                    logging.info("  selective-dyn: %s.quantizer -> dynamic", name)
+                    n_reverted += 1
+                if qlayer.out_quantizer.static:
+                    qlayer.out_quantizer.static = False
+                    logging.info("  selective-dyn: %s.out_quantizer -> dynamic", name)
+                    n_reverted += 1
+
+        # QKRotationWrapper k_quantizers
+        layers_sd = model_utils.get_layers(model)
+        for i, layer in enumerate(layers_sd):
+            rope_fn = model_utils.get_rope_function_name(model)
+            wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
+            if hasattr(layer.self_attn, wrapper_attr):
+                wrapper = getattr(layer.self_attn, wrapper_attr)
+                kq_name = f'layer.{i}.k_quantizer'
+                if any(p in kq_name for p in patterns) and wrapper.k_quantizer.static:
+                    wrapper.k_quantizer.static = False
+                    logging.info("  selective-dyn: %s -> dynamic", kq_name)
+                    n_reverted += 1
+
+        # PWL quantizers
+        if args.pwl_act:
+            import pwl_utils
+            for name, pwl_mod in pwl_utils.find_pwl_activations(model).items():
+                if any(p in name for p in patterns):
+                    if pwl_mod.input_quantizer.static:
+                        pwl_mod.input_quantizer.static = False
+                        logging.info("  selective-dyn: %s.input_quantizer -> dynamic", name)
+                        n_reverted += 1
+                    if pwl_mod.output_quantizer.static:
+                        pwl_mod.output_quantizer.static = False
+                        logging.info("  selective-dyn: %s.output_quantizer -> dynamic", name)
+                        n_reverted += 1
+
+        logging.info("selective-dyn: reverted %d quantizers to dynamic (patterns: %s)",
+                     n_reverted, patterns)
+
+    # Configure sd_check on all static quantizers
+    if getattr(args, 'sd_check', 0) > 0:
+        _norm_map = {'1': 1, '2': 2, 'inf': float('inf')}
+        _sd_norm = _norm_map[args.sd_check_norm]
+        _sd_thr = args.sd_check
+
+        def _setup_sd(quantizer, name):
+            quantizer._sd_check = _sd_thr
+            quantizer._sd_norm = _sd_norm
+            quantizer._sd_name = name
+
+        qlayers_sd = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        for name, qlayer in qlayers_sd.items():
+            # Skip proj_ex quantizers: they use a different bit-width to bypass
+            # int_gemm, so per-column vs per-token is not a valid comparison.
+            if 'down_proj' in name and args.proj_ex != 0:
+                continue
+            if qlayer.quantizer.static:
+                _setup_sd(qlayer.quantizer, f'{name}.quantizer')
+            if qlayer.out_quantizer.static:
+                _setup_sd(qlayer.out_quantizer, f'{name}.out_quantizer')
+
+        layers_sd = model_utils.get_layers(model)
+        for i, layer in enumerate(layers_sd):
+            rope_fn = model_utils.get_rope_function_name(model)
+            wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
+            if hasattr(layer.self_attn, wrapper_attr):
+                wrapper = getattr(layer.self_attn, wrapper_attr)
+                if wrapper.k_quantizer.static:
+                    _setup_sd(wrapper.k_quantizer, f'layer.{i}.k_quantizer')
+
+        if args.pwl_act:
+            import pwl_utils
+            pwl_modules = pwl_utils.find_pwl_activations(model)
+            for name, pwl_mod in pwl_modules.items():
+                if pwl_mod.input_quantizer.static:
+                    _setup_sd(pwl_mod.input_quantizer, f'{name}.input_quantizer')
+                if pwl_mod.output_quantizer.static:
+                    _setup_sd(pwl_mod.output_quantizer, f'{name}.output_quantizer')
+
+        logging.info("sd_check enabled: threshold=%.4e, norm=%s", _sd_thr, args.sd_check_norm)
+
     if args.distribute:
         utils.distribute_model(model)
     else:

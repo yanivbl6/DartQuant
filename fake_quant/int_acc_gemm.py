@@ -36,7 +36,7 @@ if _HAS_TRITON:
     def _int_gemm_capped_acc_kernel(
         # Pointers
         A_ptr, B_ptr, C_ptr,
-        A_scale_ptr,   # [M]  per-token activation scale
+        A_scale_ptr,   # [M]  per-token activation scale  (used when A_GROUP_SIZE <= 0)
         B_scale_ptr,   # [N]  per-channel weight scale  (used when GROUP_SIZE <= 0)
         bias_ptr,
         # Dimensions
@@ -51,6 +51,9 @@ if _HAS_TRITON:
         # Grouped weight scales — [N, K // GROUP_SIZE] (only when GROUP_SIZE > 0)
         B_gscale_ptr,
         stride_bgs_n, stride_bgs_g,
+        # Per-group activation scales — [K // A_GROUP_SIZE] (only when A_GROUP_SIZE > 0)
+        A_GROUP_SIZE: tl.constexpr,     # activation group size (-1 = per-token)
+        A_gscale_ptr,
         # Accumulator cap
         ACC_MAX: tl.constexpr,
         ACC_MIN: tl.constexpr,
@@ -97,28 +100,38 @@ if _HAS_TRITON:
                 # Saturation (clamp)
                 partial = tl.minimum(tl.maximum(partial, ACC_MIN), ACC_MAX)
 
+            partial_f = partial.to(tl.float32)
+
+            # Per-group activation scale (static mode)
+            if A_GROUP_SIZE > 0:
+                a_g_idx = k_start // A_GROUP_SIZE
+                a_g_scale = tl.load(A_gscale_ptr + a_g_idx)
+                partial_f = partial_f * a_g_scale
+
             if GROUP_SIZE > 0:
                 # Grouped weight scales — one scale per (N, group_index)
                 g_idx = k_start // GROUP_SIZE
                 g_scale = tl.load(
                     B_gscale_ptr + offs_n * stride_bgs_n + g_idx * stride_bgs_g,
                     mask=offs_n < N, other=1.0)
-                acc += partial.to(tl.float32) * g_scale[None, :]
+                acc += partial_f * g_scale[None, :]
             else:
-                acc += partial.to(tl.float32)
+                acc += partial_f
 
             # Advance pointers
             a_ptrs += BLOCK_K * stride_ak
             b_ptrs += BLOCK_K * stride_bk
 
-        # Apply scales: per-token activation scale * per-channel weight scale
-        a_scale = tl.load(A_scale_ptr + offs_m, mask=offs_m < M, other=1.0)
-        if GROUP_SIZE > 0:
-            # Grouped: weight scales already folded in above
+        # Apply scales that weren't folded in during the K-block loop
+        if A_GROUP_SIZE <= 0:
+            # Per-token activation scale (dynamic mode)
+            a_scale = tl.load(A_scale_ptr + offs_m, mask=offs_m < M, other=1.0)
             acc = acc * a_scale[:, None]
-        else:
+
+        if GROUP_SIZE <= 0:
+            # Per-channel weight scale
             b_scale = tl.load(B_scale_ptr + offs_n, mask=offs_n < N, other=1.0)
-            acc = acc * a_scale[:, None] * b_scale[None, :]
+            acc = acc * b_scale[None, :]
 
         # Add bias
         if HAS_BIAS:
@@ -136,7 +149,7 @@ if _HAS_TRITON:
 # ---------------------------------------------------------------------------
 def int_gemm_capped_reference(
     a_int: torch.Tensor,        # [M, K] int8
-    a_scale: torch.Tensor,      # [M] float
+    a_scale: torch.Tensor,      # [M] float  (used when a_group_size <= 0)
     w_int: torch.Tensor,        # [N, K] int8
     w_scale: torch.Tensor,      # [N] or [N, n_groups] float
     acc_bits: int,
@@ -144,6 +157,8 @@ def int_gemm_capped_reference(
     w_group_size: int = -1,
     bias: Optional[torch.Tensor] = None,
     acc_wrap: bool = False,
+    a_group_scale: Optional[torch.Tensor] = None,  # [n_a_groups] float
+    a_group_size: int = -1,
 ) -> torch.Tensor:
     """Pure-PyTorch reference for capped-accumulator integer GEMM."""
     M, K = a_int.shape
@@ -168,17 +183,23 @@ def int_gemm_capped_reference(
             # Saturation (clamp)
             partial = partial.clamp(acc_min, acc_max)
 
+        # Per-group activation scale (static mode)
+        if a_group_size > 0 and a_group_scale is not None:
+            a_g_idx = k_start // a_group_size
+            partial = partial * a_group_scale[a_g_idx]
+
         if w_group_size > 0:
             g_idx = k_start // w_group_size
             output += partial.float() * w_scale[:, g_idx].unsqueeze(0)
         else:
             output += partial.float()
 
-    # Apply scales
-    if w_group_size > 0:
+    # Apply scales that weren't folded in during the K-block loop
+    if a_group_size <= 0:
         output *= a_scale.unsqueeze(1)
-    else:
-        output *= a_scale.unsqueeze(1) * w_scale.unsqueeze(0)
+
+    if w_group_size <= 0:
+        output *= w_scale.unsqueeze(0)
 
     if bias is not None:
         output += bias.unsqueeze(0)
@@ -233,15 +254,32 @@ def int_gemm_capped(
     # Quantize activations to int8
     a_int, a_scale, a_zp_correction = act_quantizer.quantize_to_int(x_2d)
 
+    # Detect per-group activation mode: quantize_to_int returns [n_groups]
+    # instead of [M] when using static per-group scales.
+    use_act_groups = (getattr(act_quantizer, 'groupsize', -1) > 0
+                      and act_quantizer.static)
+    if use_act_groups:
+        a_group_scale = a_scale      # [n_groups]
+        a_group_size = act_quantizer.groupsize
+        a_token_scale = torch.empty(0, device=x_float.device)
+    else:
+        a_group_scale = None
+        a_group_size = -1
+        a_token_scale = a_scale      # [M]
+
     # Dispatch
     if use_triton and _HAS_TRITON and x_float.is_cuda:
-        output = _triton_int_gemm(a_int, a_scale, w_int, w_scale,
+        output = _triton_int_gemm(a_int, a_token_scale, w_int, w_scale,
                                   acc_bits, block_k, w_group_size, bias,
-                                  M, N, K, acc_wrap)
+                                  M, N, K, acc_wrap,
+                                  a_gscale=a_group_scale,
+                                  a_group_size=a_group_size)
     else:
-        output = int_gemm_capped_reference(a_int, a_scale, w_int, w_scale,
+        output = int_gemm_capped_reference(a_int, a_token_scale, w_int, w_scale,
                                            acc_bits, block_k, w_group_size,
-                                           bias, acc_wrap)
+                                           bias, acc_wrap,
+                                           a_group_scale=a_group_scale,
+                                           a_group_size=a_group_size)
 
     # Zero-point correction for asymmetric activations (applied in float,
     # outside the capped accumulator).
@@ -255,6 +293,7 @@ def _triton_int_gemm(
     a_int, a_scale, w_int, w_scale,
     acc_bits, block_k, w_group_size, bias,
     M, N, K, acc_wrap=False,
+    a_gscale=None, a_group_size=-1,
 ):
     """Launch the Triton kernel."""
     BLOCK_M = 32
@@ -282,6 +321,12 @@ def _triton_int_gemm(
         stride_bgs_n = 0
         stride_bgs_g = 0
 
+    # Per-group activation scales
+    if a_gscale is not None and a_group_size > 0:
+        a_gscale_ptr = a_gscale  # [n_a_groups]
+    else:
+        a_gscale_ptr = torch.empty(0, device=a_int.device)
+
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _int_gemm_capped_acc_kernel[grid](
@@ -298,6 +343,8 @@ def _triton_int_gemm(
         B_gscale_ptr=b_gscale,
         stride_bgs_n=stride_bgs_n,
         stride_bgs_g=stride_bgs_g,
+        A_GROUP_SIZE=a_group_size,
+        A_gscale_ptr=a_gscale_ptr,
         ACC_MAX=acc_max,
         ACC_MIN=acc_min,
         ACC_WRAP=acc_wrap,

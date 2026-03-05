@@ -102,12 +102,47 @@ class ActQuantizer(torch.nn.Module):
         self.register_buffer('zero', torch.zeros(1))
         self.bits = 16
         self.static = False
+        # sd_check: compare static vs dynamic quantization
+        self._sd_check = 0        # threshold (0 = disabled)
+        self._sd_norm = float('inf')
+        self._sd_name = ''
+        self._in_sd_check = False  # re-entry guard
+        self._sd_logged_first = False
 
     def free(self):
         if self.static:
             return  # keep pre-calibrated scales
         self.zero = None
         self.scale = None
+
+    def _sd_report(self, result_static, result_dynamic):
+        """Report sd_check relative error between static and dynamic results."""
+        diff = result_static.float() - result_dynamic.float()
+        denom = torch.linalg.vector_norm(result_dynamic.float(), ord=self._sd_norm)
+        rel_err = (torch.linalg.vector_norm(diff, ord=self._sd_norm) / denom).item() if denom > 0 else 0.0
+
+        norm_str = {1: 'L1', 2: 'L2', float('inf'): 'Linf'}[self._sd_norm]
+        if not self._sd_logged_first:
+            print(f"[sd_check] {self._sd_name}: {norm_str}_rel_err={rel_err:.4e}", flush=True)
+            self._sd_logged_first = True
+        if rel_err > self._sd_check:
+            print(f"[sd_check] {self._sd_name}: {norm_str}_rel_err={rel_err:.4e} "
+                  f"EXCEEDS threshold {self._sd_check:.4e}", flush=True)
+
+    def _compare_sd(self, x, q_static):
+        """Compare static fake-quant result with what dynamic would produce."""
+        saved_scale = self.scale.clone()
+        saved_zero = self.zero.clone() if self.zero is not None else None
+        self.static = False
+        self._in_sd_check = True
+        q_dynamic = self.forward(x)
+        self._in_sd_check = False
+        self.static = True
+        self.scale = saved_scale
+        if saved_zero is not None:
+            self.zero = saved_zero
+
+        self._sd_report(q_static, q_dynamic)
 
     def forward(self, x):
         x_dtype = x.dtype
@@ -125,17 +160,22 @@ class ActQuantizer(torch.nn.Module):
 
                 self.find_params(x - tmp_q)  # 为残差重新计算参数
                 residual_q = sym_quant_dequant(x - tmp_q, self.scale, self.maxq).to(x_dtype)
-                return tmp_q + residual_q
+                result = tmp_q + residual_q
             else:
                 tmp_q = asym_quant_dequant(x, self.scale, self.zero, self.maxq).to(x_dtype)
 
                 self.find_params(x - tmp_q)  # 为残差重新计算参数
                 residual_q = asym_quant_dequant(x - tmp_q, self.scale, self.zero, self.maxq).to(x_dtype)
-                return tmp_q + residual_q
+                result = tmp_q + residual_q
         elif self.sym:
-            return sym_quant_dequant(x, self.scale, self.maxq).to(x_dtype)
+            result = sym_quant_dequant(x, self.scale, self.maxq).to(x_dtype)
         else:
-            return asym_quant_dequant(x, self.scale, self.zero, self.maxq).to(x_dtype)
+            result = asym_quant_dequant(x, self.scale, self.zero, self.maxq).to(x_dtype)
+
+        if self._sd_check > 0 and self.static and not self._in_sd_check:
+            self._compare_sd(x, result)
+
+        return result
 
     # Different from `forward`, this method returns quantized integers, scales (and zeros if asymmetric).
     def quantize(self, x):
@@ -145,30 +185,107 @@ class ActQuantizer(torch.nn.Module):
             return asym_quant(x, self.scale, self.zero, self.maxq)
 
     def quantize_to_int(self, x):
-        """Quantize activations to int8 and return (q_int8, per_token_scale, zp_correction).
+        """Quantize activations to int8 and return (q_int8, scale_vec, zp_correction).
 
         Unlike ``forward`` (fake-quant) or ``quantize`` (returns float integers),
-        this method returns *actual* int8 values and a 1-D per-token scale vector,
+        this method returns *actual* int8 values and a 1-D scale vector,
         suitable for feeding into the integer GEMM kernel.
 
+        Static mode with groupsize > 0: per-group scales along K, aligned with
+        acc_block_k.  Each group of G columns shares one scale.  Returns
+        ``(q_int8[M,K], group_scales[n_groups], None)``.
+
+        Static mode with groupsize <= 0: per-tensor scale (max of all column
+        scales).  Returns ``(q_int8[M,K], per_token_scale[M], zp_correction)``.
+
+        Dynamic mode: computes per-token scales from x at runtime.
+        Returns ``(q_int8[M,K], per_token_scale[M], zp_correction)``.
+
         For asymmetric quantization, q is shifted into signed int8 range and a
-        per-token zero-point correction factor is returned.  The caller must
-        combine it with the precomputed ``w_zp_correction`` vector:
+        zero-point correction factor is returned.  The caller must combine it
+        with the precomputed ``w_zp_correction`` vector:
 
             output += zp_correction[:, None] * w_zp_correction[None, :]
 
-        Requires per-token (groupsize <= 0) quantization, bits <= 8.
+        Requires bits <= 8.
         """
         assert self.bits <= 8, \
             f"quantize_to_int requires bits <= 8 (got {self.bits}); values would overflow int8"
-        assert self.groupsize <= 0 or not hasattr(self, 'groupsize'), \
-            "quantize_to_int requires per-token quantization (groupsize <= 0)"
 
-        # Always compute per-token scales from x, even in static mode.
-        # Static calibration produces per-column scales [K], but int_gemm needs
-        # per-token scales [M] — per-column scales can't be factored out of a
-        # dot product.  The fake-quant path (self.quantizer(x)) still uses the
-        # static per-column scales correctly via element-wise dequantization.
+        dev = x.device
+        self.maxq = self.maxq.to(dev)
+        K = x.shape[-1]
+        M = x.reshape(-1, K).shape[0]
+
+        if self.static and self.groupsize > 0:
+            # Per-group static scales, pre-derived from per-column calibration.
+            # self.scale is [n_groups] (set during setup in main_for_test.py).
+            G = self.groupsize
+            n_groups = K // G
+            group_scale = self.scale.to(dev)  # [n_groups]
+            group_zero = self.zero.to(dev)    # [n_groups]
+
+            x_2d = x.reshape(M, K)
+            x_grouped = x_2d.reshape(M, n_groups, G)
+
+            if self.sym:
+                q_grouped = torch.clamp(
+                    torch.round(x_grouped / group_scale[None, :, None]),
+                    -(self.maxq + 1), self.maxq)
+                q_int8 = q_grouped.reshape(M, K).to(torch.int8)
+            else:
+                # Asymmetric: quantize to [0, maxq], shift to signed int8
+                q_grouped = torch.clamp(
+                    torch.round(x_grouped / group_scale[None, :, None])
+                    + group_zero[None, :, None],
+                    0, self.maxq)
+                shift = (int(self.maxq.item()) + 1) // 2  # 128 for 8-bit
+                q_int8 = (q_grouped - shift).reshape(M, K).to(torch.int8)
+
+            # zp_correction is None: for per-group static asymmetric, the
+            # correction is precomputed as static_zp_bias in ActQuantWrapper.
+            return q_int8, group_scale, None
+
+        if self.static:
+            # Per-tensor static scale (groupsize <= 0 fallback).
+            # Collapse per-column scales to a single scalar = max over columns.
+            col_scale = self.scale.to(dev).flatten()
+
+            if self.sym:
+                per_tensor_scale = col_scale.max()
+                q = torch.clamp(torch.round(x / per_tensor_scale),
+                                -(self.maxq + 1), self.maxq)
+                q_int8 = q.reshape(-1, q.shape[-1]).to(torch.int8)
+                per_token_scale = torch.full((M,), per_tensor_scale.item(),
+                                             device=dev, dtype=col_scale.dtype)
+                zp_correction = None
+            else:
+                col_zero = self.zero.to(dev).flatten()
+                # Recover representable range per column, then global extremes
+                col_min = -col_zero * col_scale
+                col_max = (self.maxq - col_zero) * col_scale
+                global_min = col_min.min()
+                global_max = col_max.max()
+                per_tensor_scale = (global_max - global_min) / self.maxq
+                if per_tensor_scale == 0:
+                    per_tensor_scale = torch.ones_like(per_tensor_scale)
+                global_zero = torch.round(-global_min / per_tensor_scale)
+
+                q = torch.clamp(torch.round(x / per_tensor_scale) + global_zero,
+                                0, self.maxq)
+                shift = (int(self.maxq.item()) + 1) // 2
+                q_int8 = (q - shift).reshape(-1, q.shape[-1]).to(torch.int8)
+                per_token_scale = torch.full((M,), per_tensor_scale.item(),
+                                             device=dev, dtype=col_scale.dtype)
+                zp_corr_scalar = per_tensor_scale * (shift - global_zero)
+                zp_correction = torch.full((M,), zp_corr_scalar.item(),
+                                           device=dev, dtype=col_scale.dtype)
+
+            return q_int8, per_token_scale, zp_correction
+
+        # Dynamic: compute per-token scales from x at runtime.
+        assert self.groupsize <= 0, \
+            "quantize_to_int with groupsize > 0 requires static mode"
         self.find_params(x)
 
         # Extract per-token scalar scale (works for both sym and asym).
@@ -310,6 +427,8 @@ class ActQuantWrapper(torch.nn.Module):
         self.register_buffer('w_zp_correction', None)
         self._buffers['w_zp_correction'] = None
         self.w_group_size = -1
+        self.register_buffer('static_zp_bias', None)
+        self._buffers['static_zp_bias'] = None
         # Calibration intermediates (set when _calibrating=True)
         self._calibrating = False
         self._cal_input = None     # post-rotation, pre-quantization
@@ -347,6 +466,49 @@ class ActQuantWrapper(torch.nn.Module):
             self.w_zp_correction = (w_scale * group_sums).sum(dim=1)
         else:
             self.w_zp_correction = w_scale * w_int.float().sum(dim=1)
+
+    def compute_static_zp_bias(self):
+        """Precompute [N] zero-point correction for static asymmetric per-group mode.
+
+        Must be called AFTER per-group scale conversion AND prepare_int_gemm.
+        For asymmetric, the int8 shift creates a per-group bias that depends
+        only on calibration-derived (scale, zero) and the fixed weight integers.
+        This collapses to a constant [N] vector added to the output.
+        """
+        q = self.quantizer
+        if q.sym or not q.static or q.groupsize <= 0:
+            return
+        if self.w_int is None:
+            return
+
+        dev = self.w_int.device
+        G = q.groupsize
+        group_scale = q.scale.to(dev)     # [n_groups]
+        group_zero = q.zero.to(dev)       # [n_groups]
+        maxq = q.maxq.to(dev)
+        shift = (int(maxq.item()) + 1) // 2  # 128 for 8-bit
+
+        # a_zp_corr[g] = group_scale[g] * (shift - group_zero[g])
+        a_zp_corr = group_scale * (shift - group_zero)  # [n_groups]
+
+        N, K = self.w_int.shape
+        n_act_groups = K // G
+
+        # Sum of weight integers per (output_channel, act_group): [N, n_act_groups]
+        w_int_grouped = self.w_int.float().reshape(N, n_act_groups, G)
+        w_int_group_sum = w_int_grouped.sum(dim=2)
+
+        # Map each activation group to its weight group scale
+        if self.w_group_size > 0:
+            act_group_starts = torch.arange(n_act_groups, device=dev) * G
+            w_group_idx = act_group_starts // self.w_group_size  # [n_act_groups]
+            w_scale_per_ag = self.w_scale[:, w_group_idx]  # [N, n_act_groups]
+        else:
+            w_scale_per_ag = self.w_scale.unsqueeze(1).expand(N, n_act_groups)
+
+        # static_zp_bias[j] = Σ_g a_zp_corr[g] * w_scale[j,g] * w_int_group_sum[j,g]
+        weighted = w_scale_per_ag * w_int_group_sum  # [N, n_act_groups]
+        self.static_zp_bias = (a_zp_corr.unsqueeze(0) * weighted).sum(dim=1)  # [N]
 
     def extra_repr(self) -> str:
         str_ = f'Input Quantizer Bits: {self.quantizer.bits}'
@@ -398,19 +560,36 @@ class ActQuantWrapper(torch.nn.Module):
         if self.use_int_gemm and self.quantizer.bits <= 8:
             # Integer GEMM path: quantize activations to int inside the kernel
             from int_acc_gemm import int_gemm_capped
-            x = int_gemm_capped(
-                x_float=x,
-                w_int=self.w_int,
-                w_scale=self.w_scale,
-                act_quantizer=self.quantizer,
-                acc_bits=self.acc_bits,
-                block_k=self.acc_block_k,
-                w_group_size=self.w_group_size,
-                bias=self.bias,
-                use_triton=self.int_gemm_use_triton,
-                acc_wrap=self.acc_wrap,
-                w_zp_correction=self.w_zp_correction,
-            ).to(x_dtype)
+            _ig_kwargs = dict(
+                w_int=self.w_int, w_scale=self.w_scale,
+                act_quantizer=self.quantizer, acc_bits=self.acc_bits,
+                block_k=self.acc_block_k, w_group_size=self.w_group_size,
+                bias=self.bias, use_triton=self.int_gemm_use_triton,
+                acc_wrap=self.acc_wrap, w_zp_correction=self.w_zp_correction,
+            )
+            x_pre = x  # save pre-quantization input for sd_check
+            x = int_gemm_capped(x_float=x, **_ig_kwargs).to(x_dtype)
+
+            # Static asymmetric per-group zero-point correction (precomputed bias)
+            if self.quantizer.static and self.static_zp_bias is not None:
+                x = x + self.static_zp_bias.to(device=x.device, dtype=x.dtype)
+
+            # sd_check: compare static int_gemm vs dynamic int_gemm
+            q = self.quantizer
+            if q._sd_check > 0 and q.static and not q._in_sd_check:
+                saved = (q.static, q.groupsize,
+                         q.scale.clone(),
+                         q.zero.clone() if q.zero is not None else None)
+                q.static = False
+                q.groupsize = -1
+                q._in_sd_check = True
+                x_dyn = int_gemm_capped(x_float=x_pre, **_ig_kwargs).to(x_dtype)
+                q._in_sd_check = False
+                q.static, q.groupsize = saved[0], saved[1]
+                q.scale = saved[2]
+                if saved[3] is not None:
+                    q.zero = saved[3]
+                q._sd_report(x, x_dyn)
         else:
             # Original fake-quant path
             if self.quantizer.bits < 16:  # Quantize, if needed
