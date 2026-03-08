@@ -49,6 +49,7 @@ Options:
   --acc_bits N         Accumulator bit-width                         (default: 32)
   --acc_block_k N      K-block size for accumulator capping          (default: 32)
   --acc_wrap           Use wrap-around instead of saturation on overflow
+  --smq N              Softmax output quantization bits (0=disabled, default: 0)
   --sd_check T         Compare static vs dynamic quantization per-layer (threshold T, 0=off)
   --sd_check_norm N    Norm for sd_check: 1, 2, or inf                   (default: inf)
   --selective-dyn P    Comma-separated layer patterns to force dynamic    (e.g., "v_proj,o_proj")
@@ -110,6 +111,7 @@ INT_GEMM=0
 ACC_BITS=32
 ACC_BLOCK_K=32
 ACC_WRAP=0
+SMQ=0
 SD_CHECK=0
 SD_CHECK_NORM="inf"
 SELECTIVE_DYN=""
@@ -139,6 +141,7 @@ while [[ $# -gt 0 ]]; do
         --acc_bits)    ACC_BITS="$2";    shift 2 ;;
         --acc_block_k) ACC_BLOCK_K="$2"; shift 2 ;;
         --acc_wrap)    ACC_WRAP=1;        shift   ;;
+        --smq)         SMQ="$2";         shift 2 ;;
         --sd_check)    SD_CHECK="$2";    shift 2 ;;
         --sd_check_norm) SD_CHECK_NORM="$2"; shift 2 ;;
         --selective-dyn) SELECTIVE_DYN="$2"; shift 2 ;;
@@ -299,6 +302,17 @@ if [ "$INT_GEMM" == "1" ]; then
     QUANT_TAG="${QUANT_TAG}${INTGEMM_TAG}"
 fi
 
+# --- SMQ tag ---
+if [ "$SMQ" != "0" ]; then
+    QUANT_TAG="${QUANT_TAG}_smq${SMQ}"
+fi
+
+# --- SMQ flags ---
+SMQ_FLAG=""
+if [ "$SMQ" != "0" ]; then
+    SMQ_FLAG="--smq ${SMQ}"
+fi
+
 # --- Static vs Dynamic check flags ---
 SD_CHECK_FLAG=""
 if [ "$SD_CHECK" != "0" ]; then
@@ -378,6 +392,7 @@ python main_for_test.py \
     ${STATIC_ACT_FLAG} \
     ${PWL_ACT_FLAG} \
     ${INT_GEMM_FLAG} \
+    ${SMQ_FLAG} \
     ${SD_CHECK_FLAG} \
     ${SELECTIVE_DYN_FLAG} \
     --kv_ex ${KV_EX} \

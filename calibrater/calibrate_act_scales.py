@@ -395,6 +395,10 @@ Examples:
     parser.add_argument('--acc_wrap', action='store_true',
                         help='Use wrap-around instead of saturation on accumulator overflow')
 
+    # Softmax Output Quantization
+    parser.add_argument('--smq', type=int, default=0,
+                        help='Softmax output quantization bits (0=disabled)')
+
     # Output paths (auto-deduced if not specified)
     parser.add_argument('--save_path', type=str, default=None,
                         help='Where to save scales .pt (auto-deduced if omitted)')
@@ -468,6 +472,9 @@ def main():
             acc_block_k=args.acc_block_k,
             acc_wrap=args.acc_wrap,
         )
+    if args.smq > 0:
+        from smq_utils import smq_tag
+        quant_tag += smq_tag(args.smq)
     save_prefix = args.mode
 
     # --- Auto-deduce output paths ---
@@ -690,6 +697,12 @@ def main():
             n_ig += 1
             print(f"    done.", flush=True)
         print(f"Integer GEMM prepared for {n_ig} layers", flush=True)
+
+    # --- Enable softmax output quantization ---
+    if args.smq > 0:
+        import smq_utils
+        smq_utils.enable_smq(args.smq)
+        print(f"Enabled softmax output quantization: {args.smq} bits")
 
     # --- Get calibration data ---
     dataloader = data_utils.get_loaders(

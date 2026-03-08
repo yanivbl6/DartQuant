@@ -43,6 +43,12 @@ def main():
         logging.info("proj_ex=%d: disabling R4, setting down_proj input bits=%d", args.proj_ex, args.proj_ex)
         args.use_r4 = False
 
+    # Enable softmax output quantization (replaces SDPA globally)
+    if args.smq > 0:
+        import smq_utils
+        smq_utils.enable_smq(args.smq)
+        logging.info("Enabled softmax output quantization: %d bits", args.smq)
+
     # Rotate the weights
     if args.fuse_norm:
         logging.info("Fuse LayerNorms")

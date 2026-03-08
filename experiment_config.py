@@ -119,6 +119,10 @@ def add_quant_args(parser):
     parser.add_argument('--acc_wrap', action='store_true',
                         help='Wrap-around instead of saturation')
 
+    # Softmax Output Quantization
+    parser.add_argument('--smq', type=int, default=0,
+                        help='Softmax output quantization bits (0=disabled)')
+
 
 def resolve_v_bits(args):
     """Default v_bits to k_bits when not explicitly given."""
@@ -152,4 +156,6 @@ def build_quant_args(args):
                 '--acc_block_k', str(args.acc_block_k)]
         if args.acc_wrap:
             cmd.append('--acc_wrap')
+    if getattr(args, 'smq', 0) > 0:
+        cmd += ['--smq', str(args.smq)]
     return cmd

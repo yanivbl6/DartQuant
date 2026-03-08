@@ -84,6 +84,10 @@ def parser_gen():
     parser.add_argument('--pwl_no_hw_sim', action=argparse.BooleanOptionalAction, default=False,
                         help='Disable HW precision simulation for PWL (pure float PWL)')
 
+    # Softmax Output Quantization
+    parser.add_argument('--smq', type=int, default=0,
+                        help='Softmax output quantization bit-width (0=disabled)')
+
     # Integer GEMM / Capped Accumulator Arguments
     parser.add_argument('--int_gemm', action=argparse.BooleanOptionalAction, default=False,
                         help='Use integer GEMM with capped accumulator instead of float matmul. '
