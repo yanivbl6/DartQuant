@@ -399,6 +399,13 @@ Examples:
     parser.add_argument('--smq', type=int, default=0,
                         help='Softmax output quantization bits (0=disabled)')
 
+    # GGUF pre-quantized weights
+    parser.add_argument('--gguf', type=str, default=None, nargs='?', const='auto',
+                        help='Use GGUF pre-quantized weights. "auto" resolves from model name, '
+                             'or provide explicit path to .gguf file.')
+    parser.add_argument('--quant_warnings', action='store_true',
+                        help='Warn when quantization params mismatch GGUF tensor specs')
+
     # Weight sparsity stats
     parser.add_argument('--weights_stats', type=str, default=None,
                         help='Path to output file for weight sparsity stats.')
@@ -479,6 +486,17 @@ def main():
     if args.smq > 0:
         from smq_utils import smq_tag
         quant_tag += smq_tag(args.smq)
+
+    # Resolve GGUF path and add to tag
+    gguf_path = None
+    if args.gguf is not None:
+        gguf_path = cfg.resolve_gguf_path(args.gguf, args.model)
+        gguf_basename = os.path.basename(gguf_path).replace('.gguf', '')
+        # Extract quant type (e.g., Q4_K_M from Llama-3.2-1B-Instruct-Q4_K_M)
+        parts = gguf_basename.split('-')
+        gguf_qtype = '-'.join(p for p in parts if p.startswith('Q')) or 'gguf'
+        quant_tag += f"_gguf_{gguf_qtype}"
+
     save_prefix = args.mode
 
     # --- Auto-deduce output paths ---
@@ -495,11 +513,24 @@ def main():
     print(f"R2 path:    {args.r2_path}")
     print(f"GPTQ ckpt:  {args.gptq_checkpoint_path}")
     print(f"Save path:  {args.save_path}")
+    if gguf_path:
+        print(f"GGUF:       {gguf_path}")
     print()
 
     model = model_utils.get_model(args.model, args.hf_token)
     model.eval()
     model.model_name = model_name
+
+    # --- Load GGUF pre-quantized weights (before rotations) ---
+    if gguf_path:
+        import gguf_utils
+        gguf_utils.load_gguf_weights(
+            model, gguf_path,
+            quant_warnings=args.quant_warnings,
+            w_bits=args.w_bits,
+            w_groupsize=args.w_groupsize,
+            w_sym=not args.w_asym,
+        )
 
     # --- Set up rotations to match experiment pipeline ---
     if args.mode in ('quarot', 'dart'):

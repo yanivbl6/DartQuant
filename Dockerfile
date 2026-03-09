@@ -22,6 +22,7 @@ RUN git clone -b hw_checks https://github.com/yanivbl6/DartQuant.git /workspace/
     && pip install -r /workspace/DartQuant/requirement.txt
 
 RUN rm -rf /workspace/DartQuant/data && ln -s /data/users/yanivbl /workspace/DartQuant/data
+RUN ln -s ~/quantized_models/ /workspace/quantized_models
 
 RUN cd /workspace/DartQuant/ && pip install -r /workspace/DartQuant/requirements.txt
 
