@@ -184,8 +184,10 @@ def calibrate_act_scales(model, dataloader, args):
                         (bsz, num_heads, seq_len, head_dim) = k.shape
                         if wrap.k_groupsize == -1:
                             flat_k = k.transpose(1, 2).reshape(-1, num_heads * head_dim)
-                        else:
+                        elif wrap.k_groupsize >= head_dim:
                             flat_k = k.reshape(-1, head_dim)
+                        else:
+                            flat_k = k.reshape(-1, wrap.k_groupsize)
                         cmin = flat_k.float().min(dim=0)[0]
                         cmax = flat_k.float().max(dim=0)[0]
                         cname = f'layer.{layer_idx}.k_quantizer'
@@ -742,13 +744,9 @@ def main():
     if args.k_bits < 16:
         rope_function_name = model_utils.get_rope_function_name(model)
         layers = model_utils.get_layers(model)
-        # Cap k_groupsize at head_dim (mirrors shell script logic for small-head models)
-        head_dim = model.config.hidden_size // model.config.num_attention_heads
-        k_groupsize = args.k_groupsize
-        if k_groupsize > 0 and k_groupsize > head_dim:
-            k_groupsize = head_dim
+        # QKRotationWrapper clamps k_groupsize to a valid divisor of head_dim
         k_quant_config = {
-            'k_bits': args.k_bits, 'k_groupsize': k_groupsize,
+            'k_bits': args.k_bits, 'k_groupsize': args.k_groupsize,
             'k_sym': not args.k_asym, 'k_clip_ratio': args.k_clip_ratio,
             'use_r3': (args.mode in ('quarot', 'dart')) and (args.kv_ex == 0),
         }
