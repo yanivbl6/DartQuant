@@ -15,6 +15,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import experiment_config as cfg
@@ -58,20 +59,31 @@ Examples:
     parser.add_argument('--skip', type=str, default=None,
                         help='Experiments to skip (1-indexed by print order): '
                              'a single number like "4" or comma-separated like "3,6"')
+    parser.add_argument('--sequential', action='store_true',
+                        help='Run experiments one at a time, each with --wait for a clear GPU')
+    parser.add_argument('--max_used_mb', type=int, default=200,
+                        help='Max used memory (MiB) for --sequential GPU waiting (default: 200)')
     parser.add_argument('--dry', action='store_true',
                         help='Print commands without running them')
 
     return parser.parse_args()
 
 
-def build_experiment_cmd(mode, gpu, quant_args, extra_flags, args):
+def build_experiment_cmd(mode, gpu, quant_args, extra_flags, args, use_wait=False):
     """Build the dart_gptq_wxaykvz.sh command for one experiment."""
     script = os.path.join(SCRIPT_DIR, 'Script', 'dart_gptq_wxaykvz.sh')
-    cmd = [script, mode, '-g', str(gpu), '-m', args.model]
+    if use_wait:
+        cmd = [script, mode, '--wait', '--max_used_mb', str(args.max_used_mb), '-m', args.model]
+    else:
+        cmd = [script, mode, '-g', str(gpu), '-m', args.model]
 
     if mode != 'full':
         cmd += quant_args
         cmd += extra_flags
+    else:
+        # GGUF affects even the full-precision run (replaces base weights)
+        if getattr(args, 'gguf', None):
+            cmd += ['--gguf', args.gguf]
 
     if args.overwrite:
         cmd.append('--overwrite')
@@ -138,10 +150,14 @@ def main():
     for i, (name, mode, extra_flags) in enumerate(experiments):
         idx = i + 1  # 1-indexed
         gpu = gpus[i % len(gpus)]
-        cmd = build_experiment_cmd(mode, gpu, quant_args, extra_flags, args)
+        cmd = build_experiment_cmd(mode, gpu, quant_args, extra_flags, args,
+                                   use_wait=args.sequential)
         if idx in skip_set:
             cmds.append((name, cmd, True))
             print(f"  [skipped] {name}: {' '.join(cmd)}")
+        elif args.sequential:
+            cmds.append((name, cmd, False))
+            print(f"  [wait] {name}: {' '.join(cmd)}")
         else:
             cmds.append((name, cmd, False))
             print(f"  [GPU {gpu}] {name}: {' '.join(cmd)}")
@@ -158,31 +174,59 @@ def main():
             if os.path.exists(path):
                 os.remove(path)
 
-    # --- Launch experiments in parallel ---
+    # --- Launch experiments ---
     print()
-    procs = []
-    for name, cmd, skipped in cmds:
-        if skipped:
-            continue
-        out_f = open(f'/tmp/{name}_results.out', 'w')
-        err_f = open(f'/tmp/{name}_results.err', 'w')
-        proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f)
-        procs.append((name, proc, out_f, err_f))
+    active_cmds = [(name, cmd) for name, cmd, skipped in cmds if not skipped]
+    num_run = len(active_cmds)
 
-    print(f"=== Waiting for all experiments ===\n")
+    if args.sequential:
+        # Run one at a time; between runs wait 30s then poll for a clear GPU
+        sys.path.insert(0, os.path.join(SCRIPT_DIR, '..', 'utils'))
+        from gpu_wait import wait_for_gpu
 
-    failed = 0
-    for name, proc, out_f, err_f in procs:
-        proc.wait()
-        out_f.close()
-        err_f.close()
-        if proc.returncode == 0:
-            print(f"  [done] {name}")
-        else:
-            print(f"  [FAIL] {name} (see /tmp/{name}_results.err)")
-            failed += 1
+        print(f"=== Running {num_run} experiments sequentially ===\n")
+        failed = 0
+        for i, (name, cmd) in enumerate(active_cmds):
+            print(f"  [{i+1}/{num_run}] Launching {name} ...")
+            out_f = open(f'/tmp/{name}_results.out', 'w')
+            err_f = open(f'/tmp/{name}_results.err', 'w')
+            proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f)
+            proc.wait()
+            out_f.close()
+            err_f.close()
+            if proc.returncode == 0:
+                print(f"  [done] {name}")
+            else:
+                print(f"  [FAIL] {name} (see /tmp/{name}_results.err)")
+                failed += 1
 
-    num_run = len(procs)
+            # After each run (except the last), wait 30s then poll for a clear GPU
+            if i < len(active_cmds) - 1:
+                print(f"  Cooling down 30s before next experiment ...")
+                time.sleep(30)
+                wait_for_gpu(max_used_mb=args.max_used_mb, poll_interval=30)
+    else:
+        # Launch all in parallel
+        procs = []
+        for name, cmd in active_cmds:
+            out_f = open(f'/tmp/{name}_results.out', 'w')
+            err_f = open(f'/tmp/{name}_results.err', 'w')
+            proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f)
+            procs.append((name, proc, out_f, err_f))
+
+        print(f"=== Waiting for all experiments ===\n")
+
+        failed = 0
+        for name, proc, out_f, err_f in procs:
+            proc.wait()
+            out_f.close()
+            err_f.close()
+            if proc.returncode == 0:
+                print(f"  [done] {name}")
+            else:
+                print(f"  [FAIL] {name} (see /tmp/{name}_results.err)")
+                failed += 1
+
     num_skipped = len(skip_set)
     print()
     if failed == 0:

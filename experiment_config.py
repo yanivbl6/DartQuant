@@ -71,24 +71,24 @@ def resolve_gguf_path(gguf_arg, model_path):
     """Resolve --gguf value to an actual .gguf file path.
 
     gguf_arg can be:
-      - None  -> return None
-      - 'auto' -> auto-resolve from ../quantized_models/<ModelName>*.gguf
-      - explicit path -> return as-is
+      - None      -> return None
+      - 'Q4_K_M'  -> lookup ../quantized_models/<ModelName>-Q4_K_M.gguf
+      - 'Q4_K_S'  -> lookup ../quantized_models/<ModelName>-Q4_K_S.gguf
+      - '/path/to/file.gguf' -> return as-is
     """
     if gguf_arg is None:
         return None
-    if gguf_arg != 'auto':
-        return gguf_arg  # explicit path
+    # If it looks like a path (contains / or ends with .gguf), use directly
+    if '/' in gguf_arg or gguf_arg.endswith('.gguf'):
+        return gguf_arg
+    # Otherwise treat as a quant-type shorthand (e.g. Q4_K_M, Q4_K_S)
     model_name = model_name_from_path(model_path)
-    # Prefer Q4_K_M
-    candidate = os.path.join(GGUF_DIR, f'{model_name}-Q4_K_M.gguf')
+    candidate = os.path.join(GGUF_DIR, f'{model_name}-{gguf_arg}.gguf')
     if os.path.isfile(candidate):
         return candidate
-    # Try any .gguf matching the model name
-    matches = glob.glob(os.path.join(GGUF_DIR, f'{model_name}*.gguf'))
-    if matches:
-        return sorted(matches)[0]
-    raise FileNotFoundError(f'No GGUF file found for {model_name} in {GGUF_DIR}')
+    raise FileNotFoundError(
+        f'No GGUF file found: {candidate}\n'
+        f'Available: {glob.glob(os.path.join(GGUF_DIR, f"{model_name}*.gguf"))}')
 
 
 # ── Default experiment definitions ───────────────────────────────────────────
@@ -154,9 +154,10 @@ def add_quant_args(parser):
                         help='Softmax output quantization bits (0=disabled)')
 
     # GGUF pre-quantized weights
-    parser.add_argument('--gguf', type=str, default=None, nargs='?', const='auto',
-                        help='Use GGUF pre-quantized weights. "auto" resolves from model name, '
-                             'or provide explicit path to .gguf file.')
+    parser.add_argument('--gguf', type=str, default=None,
+                        help='Use GGUF pre-quantized weights. Pass a quant type '
+                             '(e.g. Q4_K_M, Q4_K_S) to lookup from quantized_models/, '
+                             'or an explicit path to a .gguf file.')
     parser.add_argument('--quant_warnings', action='store_true',
                         help='Warn when quantization params mismatch GGUF tensor specs')
 

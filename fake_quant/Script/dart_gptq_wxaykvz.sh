@@ -54,8 +54,10 @@ Options:
   --sd_check_norm N    Norm for sd_check: 1, 2, or inf                   (default: inf)
   --selective-dyn P    Comma-separated layer patterns to force dynamic    (e.g., "v_proj,o_proj")
   --weights_stats F  Write weight sparsity stats to file F
-  --gguf PATH      Use GGUF pre-quantized weights ("auto" or explicit path)
+  --gguf TYPE      Use GGUF pre-quantized weights (e.g. Q4_K_M, Q4_K_S, or path)
   --quant_warnings Warn on GGUF vs config quantization mismatches
+  --wait           Wait for a clear GPU (polls every 20s, overrides -g)
+  --max_used_mb N  Max used memory (MiB) for a GPU to be "clear"   (default: 200)
   -F               Fast mode (skip lm_eval tasks)
   --very-fast      Very fast mode (skip lm_eval, PPL on wikitext2 only)
   -h               Show this help message
@@ -121,6 +123,8 @@ SELECTIVE_DYN=""
 WEIGHTS_STATS=""
 GGUF=""
 QUANT_WARNINGS=0
+WAIT_GPU=0
+MAX_USED_MB=200
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -154,6 +158,8 @@ while [[ $# -gt 0 ]]; do
         --weights_stats) WEIGHTS_STATS="$2"; shift 2 ;;
         --gguf)        GGUF="$2";           shift 2 ;;
         --quant_warnings) QUANT_WARNINGS=1; shift   ;;
+        --wait)        WAIT_GPU=1;         shift   ;;
+        --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
         --very-fast) FAST=2;     shift   ;;
         -h|--help) usage ;;
@@ -200,26 +206,23 @@ fi
 MODEL_NAME=$(basename "${MODEL%/}")
 
 # --- Resolve GGUF path ---
-if [ "$GGUF" == "auto" ]; then
+# GGUF can be a quant-type shorthand (Q4_K_M, Q4_K_S) or an explicit path.
+if [ -n "$GGUF" ] && [[ "$GGUF" != */* ]] && [[ "$GGUF" != *.gguf ]]; then
+    # Shorthand like Q4_K_M -> look up in quantized_models/
     SCRIPT_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
     GGUF_DIR="${SCRIPT_BASE}/../quantized_models"
-    GGUF_FILE=$(ls ${GGUF_DIR}/${MODEL_NAME}*Q4_K_M*.gguf 2>/dev/null | head -1)
-    if [ -z "$GGUF_FILE" ]; then
-        GGUF_FILE=$(ls ${GGUF_DIR}/${MODEL_NAME}*.gguf 2>/dev/null | head -1)
-    fi
-    if [ -z "$GGUF_FILE" ]; then
-        echo "Error: No GGUF file found for ${MODEL_NAME} in ${GGUF_DIR}"
+    GGUF_FILE="${GGUF_DIR}/${MODEL_NAME}-${GGUF}.gguf"
+    if [ ! -f "$GGUF_FILE" ]; then
+        echo "Error: GGUF file not found: ${GGUF_FILE}"
+        echo "Available: $(ls ${GGUF_DIR}/${MODEL_NAME}*.gguf 2>/dev/null)"
         exit 1
     fi
     GGUF="$GGUF_FILE"
-    echo "Auto-resolved GGUF: $GGUF"
+    echo "Resolved GGUF: $GGUF"
 fi
 
-# Cap K_GROUPSIZE at head_dim for models with small heads (1B: head_dim=64)
-case "$MODEL_NAME" in
-    *1B*) K_GROUPSIZE=64 ;;
-    *)    K_GROUPSIZE=$GROUPSIZE ;;
-esac
+# K_GROUPSIZE follows GROUPSIZE; Python clamps to valid divisor of head_dim if needed
+K_GROUPSIZE=$GROUPSIZE
 
 # --- Build rotation flags based on mode ---
 if [ "$MODE" == "full" ] || [ "$MODE" == "baseline" ]; then
@@ -338,7 +341,9 @@ QUANT_WARN_FLAG=""
 if [ -n "$GGUF" ]; then
     GGUF_BASENAME=$(basename "$GGUF" .gguf)
     GGUF_QTYPE=$(echo "$GGUF_BASENAME" | grep -oP '(?<=-)(Q[^.]+)$' || echo "gguf")
-    QUANT_TAG="${QUANT_TAG}_gguf_${GGUF_QTYPE}"
+    # Use dashes in tag: gguf-Q4-K-M
+    GGUF_TAG=$(echo "$GGUF_QTYPE" | tr '_' '-')
+    QUANT_TAG="${QUANT_TAG}_gguf-${GGUF_TAG}"
     GGUF_FLAG="--gguf_path ${GGUF}"
 fi
 if [ "$QUANT_WARNINGS" == "1" ]; then
@@ -417,6 +422,15 @@ if [ "$REDO_GPTQ" == "1" ]; then
         echo "Removing cached GPTQ checkpoint: $GPTQ_DIR"
         rm -rf "$GPTQ_DIR"
     fi
+fi
+
+# --- Wait for a clear GPU if requested ---
+if [ "$WAIT_GPU" == "1" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    GPU_WAIT_SCRIPT="${SCRIPT_DIR}/../../utils/gpu_wait.py"
+    echo "Waiting for a clear GPU (max_used_mb=${MAX_USED_MB}) ..."
+    GPU_ID=$(python "$GPU_WAIT_SCRIPT" --max_used_mb "$MAX_USED_MB")
+    echo "Selected GPU ${GPU_ID}"
 fi
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} \

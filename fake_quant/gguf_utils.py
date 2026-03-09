@@ -33,6 +33,9 @@ GGUF_TO_HF_LAYER = {
 
 SKIP_TENSORS = {"rope_freqs.weight"}
 
+# GGUF tensor suffixes that need Q/K reverse-permutation
+_QK_PERMUTED = {"attn_q.weight", "attn_k.weight"}
+
 # ── GGUF quantization type specs (for --quant_warnings) ──
 
 GGUF_TYPE_SPECS = {
@@ -62,6 +65,17 @@ def gguf_name_to_hf(name):
         if suffix in GGUF_TO_HF_LAYER:
             return f"model.layers.{layer_idx}.{GGUF_TO_HF_LAYER[suffix]}"
     return None
+
+
+def _reverse_permute(weights, n_head):
+    """Reverse the Q/K row permutation applied by llama.cpp's convert.py.
+
+    During GGUF creation, Q and K weight rows are interleaved by head-halves
+    for efficient RoPE computation.  This undoes that permutation back to HF order.
+    """
+    return (weights.reshape(n_head, weights.shape[0] // n_head // 2, 2, *weights.shape[1:])
+            .swapaxes(1, 2)
+            .reshape(weights.shape))
 
 
 def _dequantize_tensor(gguf_tensor):
@@ -98,6 +112,7 @@ def load_gguf_weights(model, gguf_path, quant_warnings=False,
     """Load dequantized GGUF weights into a HuggingFace model.
 
     Replaces model weights in-place, preserving the original dtype.
+    Automatically reverses the Q/K row permutation applied by llama.cpp.
     Returns a dict mapping HF key -> GGUF quant type name.
     """
     logging.info("Loading GGUF weights from: %s", gguf_path)
@@ -108,6 +123,11 @@ def load_gguf_weights(model, gguf_path, quant_warnings=False,
     has_output = "output.weight" in gguf_tensors
     replaced = {}
     skipped = []
+
+    # Read head counts from model config for Q/K reverse permutation
+    config = model.config
+    n_heads = getattr(config, 'num_attention_heads', None)
+    n_kv_heads = getattr(config, 'num_key_value_heads', n_heads)
 
     for gguf_name, gguf_tensor in gguf_tensors.items():
         hf_name = gguf_name_to_hf(gguf_name)
@@ -136,6 +156,12 @@ def load_gguf_weights(model, gguf_path, quant_warnings=False,
             logging.warning("Shape mismatch for %s: GGUF %s vs HF %s, skipping",
                             gguf_name, data.shape, target_shape)
             continue
+
+        # Reverse Q/K row permutation from llama.cpp's convert.py
+        suffix = gguf_name.split(".", 2)[-1] if "." in gguf_name else gguf_name
+        if suffix in _QK_PERMUTED and n_heads is not None:
+            n_head = n_heads if "attn_q" in gguf_name else n_kv_heads
+            data = _reverse_permute(data, n_head)
 
         # Convert to torch tensor, preserving original dtype
         original_dtype = sd[hf_name].dtype

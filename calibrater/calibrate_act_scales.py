@@ -400,15 +400,22 @@ Examples:
                         help='Softmax output quantization bits (0=disabled)')
 
     # GGUF pre-quantized weights
-    parser.add_argument('--gguf', type=str, default=None, nargs='?', const='auto',
-                        help='Use GGUF pre-quantized weights. "auto" resolves from model name, '
-                             'or provide explicit path to .gguf file.')
+    parser.add_argument('--gguf', type=str, default=None,
+                        help='Use GGUF pre-quantized weights. Pass a quant type '
+                             '(e.g. Q4_K_M, Q4_K_S) to lookup from quantized_models/, '
+                             'or an explicit path to a .gguf file.')
     parser.add_argument('--quant_warnings', action='store_true',
                         help='Warn when quantization params mismatch GGUF tensor specs')
 
     # Weight sparsity stats
     parser.add_argument('--weights_stats', type=str, default=None,
                         help='Path to output file for weight sparsity stats.')
+
+    # GPU waiting
+    parser.add_argument('--wait', action='store_true',
+                        help='Wait for a clear GPU (polls nvidia-smi, overrides CUDA_VISIBLE_DEVICES)')
+    parser.add_argument('--max_used_mb', type=int, default=200,
+                        help='Max used memory (MiB) for a GPU to be "clear" (default: 200)')
 
     # Output paths (auto-deduced if not specified)
     parser.add_argument('--save_path', type=str, default=None,
@@ -423,6 +430,15 @@ Examples:
 
 def main():
     args = parse_args()
+
+    # --- Wait for a clear GPU before any CUDA initialization ---
+    if args.wait:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'utils'))
+        from gpu_wait import wait_for_gpu
+        gpu_id = wait_for_gpu(max_used_mb=args.max_used_mb)
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+        print(f"Selected GPU {gpu_id}")
+
     cfg.resolve_v_bits(args)
     import transformers
     transformers.set_seed(args.seed)
@@ -495,7 +511,9 @@ def main():
         # Extract quant type (e.g., Q4_K_M from Llama-3.2-1B-Instruct-Q4_K_M)
         parts = gguf_basename.split('-')
         gguf_qtype = '-'.join(p for p in parts if p.startswith('Q')) or 'gguf'
-        quant_tag += f"_gguf_{gguf_qtype}"
+        # Use dashes in tag: gguf-Q4-K-M
+        gguf_tag = gguf_qtype.replace('_', '-')
+        quant_tag += f"_gguf-{gguf_tag}"
 
     save_prefix = args.mode
 

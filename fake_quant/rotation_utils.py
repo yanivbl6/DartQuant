@@ -372,8 +372,19 @@ class QKRotationWrapper(torch.nn.Module):
         object.__setattr__(self, 'k_quantizer', quant_utils.ActQuantizer())
         self.k_bits = 16
         if kwargs is not None:
-            assert kwargs['k_groupsize'] in [-1,
-                                             head_dim], f'Only token-wise/{head_dim}g quantization is supported for K-cache'
+            # Clamp k_groupsize to a valid divisor of head_dim
+            req_gs = kwargs['k_groupsize']
+            if req_gs > 0 and req_gs != head_dim:
+                if head_dim % req_gs != 0:
+                    # Find largest divisor of head_dim <= requested
+                    clamped = head_dim  # fallback
+                    for d in range(req_gs, 0, -1):
+                        if head_dim % d == 0:
+                            clamped = d
+                            break
+                    logging.warning("K-cache groupsize %d doesn't divide head_dim %d, clamped to %d",
+                                    req_gs, head_dim, clamped)
+                    kwargs['k_groupsize'] = clamped
             self.k_bits = kwargs['k_bits']
             self.k_groupsize = kwargs['k_groupsize']
             self.k_sym = kwargs['k_sym']
@@ -410,11 +421,16 @@ class QKRotationWrapper(torch.nn.Module):
             if not self.k_quantizer.static:
                 self.k_quantizer.find_params(token_wise_k)
             k = self.k_quantizer(token_wise_k).reshape((bsz, seq_len, num_heads, head_dim)).transpose(1, 2).to(q)
-        else:  # head-wise quantization
+        elif self.k_groupsize >= head_dim:  # head-wise quantization
             per_head_k = k.reshape(-1, head_dim)
             if not self.k_quantizer.static:
                 self.k_quantizer.find_params(per_head_k)
             k = self.k_quantizer(per_head_k).reshape((bsz, num_heads, seq_len, head_dim)).to(q)
+        else:  # sub-head group-wise quantization
+            per_group_k = k.reshape(-1, self.k_groupsize)
+            if not self.k_quantizer.static:
+                self.k_quantizer.find_params(per_group_k)
+            k = self.k_quantizer(per_group_k).reshape((bsz, num_heads, seq_len, head_dim)).to(q)
 
         self.k_quantizer.free()
 
