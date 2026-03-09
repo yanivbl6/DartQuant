@@ -500,7 +500,7 @@ def main():
     model = model_utils.get_model(args.model, args.hf_token)
     model.eval()
     model.model_name = model_name
-q
+
     # --- Set up rotations to match experiment pipeline ---
     if args.mode in ('quarot', 'dart'):
         rotation_utils.fuse_layer_norms(model)

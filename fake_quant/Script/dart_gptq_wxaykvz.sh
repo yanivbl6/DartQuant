@@ -54,6 +54,8 @@ Options:
   --sd_check_norm N    Norm for sd_check: 1, 2, or inf                   (default: inf)
   --selective-dyn P    Comma-separated layer patterns to force dynamic    (e.g., "v_proj,o_proj")
   --weights_stats F  Write weight sparsity stats to file F
+  --gguf PATH      Use GGUF pre-quantized weights ("auto" or explicit path)
+  --quant_warnings Warn on GGUF vs config quantization mismatches
   -F               Fast mode (skip lm_eval tasks)
   --very-fast      Very fast mode (skip lm_eval, PPL on wikitext2 only)
   -h               Show this help message
@@ -117,6 +119,8 @@ SD_CHECK=0
 SD_CHECK_NORM="inf"
 SELECTIVE_DYN=""
 WEIGHTS_STATS=""
+GGUF=""
+QUANT_WARNINGS=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -148,6 +152,8 @@ while [[ $# -gt 0 ]]; do
         --sd_check_norm) SD_CHECK_NORM="$2"; shift 2 ;;
         --selective-dyn) SELECTIVE_DYN="$2"; shift 2 ;;
         --weights_stats) WEIGHTS_STATS="$2"; shift 2 ;;
+        --gguf)        GGUF="$2";           shift 2 ;;
+        --quant_warnings) QUANT_WARNINGS=1; shift   ;;
         -F|--fast) FAST=1;        shift   ;;
         --very-fast) FAST=2;     shift   ;;
         -h|--help) usage ;;
@@ -192,6 +198,22 @@ else
 fi
 
 MODEL_NAME=$(basename "${MODEL%/}")
+
+# --- Resolve GGUF path ---
+if [ "$GGUF" == "auto" ]; then
+    SCRIPT_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
+    GGUF_DIR="${SCRIPT_BASE}/../quantized_models"
+    GGUF_FILE=$(ls ${GGUF_DIR}/${MODEL_NAME}*Q4_K_M*.gguf 2>/dev/null | head -1)
+    if [ -z "$GGUF_FILE" ]; then
+        GGUF_FILE=$(ls ${GGUF_DIR}/${MODEL_NAME}*.gguf 2>/dev/null | head -1)
+    fi
+    if [ -z "$GGUF_FILE" ]; then
+        echo "Error: No GGUF file found for ${MODEL_NAME} in ${GGUF_DIR}"
+        exit 1
+    fi
+    GGUF="$GGUF_FILE"
+    echo "Auto-resolved GGUF: $GGUF"
+fi
 
 # Cap K_GROUPSIZE at head_dim for models with small heads (1B: head_dim=64)
 case "$MODEL_NAME" in
@@ -310,6 +332,19 @@ if [ "$SMQ" != "0" ]; then
     QUANT_TAG="${QUANT_TAG}_smq${SMQ}"
 fi
 
+# --- GGUF tag ---
+GGUF_FLAG=""
+QUANT_WARN_FLAG=""
+if [ -n "$GGUF" ]; then
+    GGUF_BASENAME=$(basename "$GGUF" .gguf)
+    GGUF_QTYPE=$(echo "$GGUF_BASENAME" | grep -oP '(?<=-)(Q[^.]+)$' || echo "gguf")
+    QUANT_TAG="${QUANT_TAG}_gguf_${GGUF_QTYPE}"
+    GGUF_FLAG="--gguf_path ${GGUF}"
+fi
+if [ "$QUANT_WARNINGS" == "1" ]; then
+    QUANT_WARN_FLAG="--quant_warnings"
+fi
+
 # --- SMQ flags ---
 SMQ_FLAG=""
 if [ "$SMQ" != "0" ]; then
@@ -412,6 +447,8 @@ python main_for_test.py \
     ${SD_CHECK_FLAG} \
     ${SELECTIVE_DYN_FLAG} \
     ${WEIGHTS_STATS_FLAG} \
+    ${GGUF_FLAG} \
+    ${QUANT_WARN_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     --percdamp 0.1 \

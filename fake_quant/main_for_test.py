@@ -33,6 +33,17 @@ def main():
     model.eval()
     model.model_name = args.model.split('/')[-1]
 
+    # --- Load GGUF pre-quantized weights (before rotations) ---
+    if args.gguf_path:
+        import gguf_utils
+        gguf_utils.load_gguf_weights(
+            model, args.gguf_path,
+            quant_warnings=args.quant_warnings,
+            w_bits=args.w_bits,
+            w_groupsize=args.w_groupsize,
+            w_sym=not args.w_asym,
+        )
+
     # --- kv_ex / proj_ex overrides (must be before rotate_model) ---
     if args.kv_ex != 0:
         logging.info("kv_ex=%d: disabling R3, setting k_bits=%d", args.kv_ex, args.kv_ex)

@@ -7,6 +7,7 @@ Imported by:
 """
 
 import argparse
+import glob
 import os
 
 # ── Model paths ──────────────────────────────────────────────────────────────
@@ -59,6 +60,35 @@ def resolve_model(model_short):
 def model_name_from_path(model_path):
     """Extract model name from a full path."""
     return os.path.basename(model_path.rstrip('/'))
+
+
+# ── GGUF resolution ──────────────────────────────────────────────────────────
+
+GGUF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'quantized_models')
+
+
+def resolve_gguf_path(gguf_arg, model_path):
+    """Resolve --gguf value to an actual .gguf file path.
+
+    gguf_arg can be:
+      - None  -> return None
+      - 'auto' -> auto-resolve from ../quantized_models/<ModelName>*.gguf
+      - explicit path -> return as-is
+    """
+    if gguf_arg is None:
+        return None
+    if gguf_arg != 'auto':
+        return gguf_arg  # explicit path
+    model_name = model_name_from_path(model_path)
+    # Prefer Q4_K_M
+    candidate = os.path.join(GGUF_DIR, f'{model_name}-Q4_K_M.gguf')
+    if os.path.isfile(candidate):
+        return candidate
+    # Try any .gguf matching the model name
+    matches = glob.glob(os.path.join(GGUF_DIR, f'{model_name}*.gguf'))
+    if matches:
+        return sorted(matches)[0]
+    raise FileNotFoundError(f'No GGUF file found for {model_name} in {GGUF_DIR}')
 
 
 # ── Default experiment definitions ───────────────────────────────────────────
@@ -123,6 +153,13 @@ def add_quant_args(parser):
     parser.add_argument('--smq', type=int, default=0,
                         help='Softmax output quantization bits (0=disabled)')
 
+    # GGUF pre-quantized weights
+    parser.add_argument('--gguf', type=str, default=None, nargs='?', const='auto',
+                        help='Use GGUF pre-quantized weights. "auto" resolves from model name, '
+                             'or provide explicit path to .gguf file.')
+    parser.add_argument('--quant_warnings', action='store_true',
+                        help='Warn when quantization params mismatch GGUF tensor specs')
+
     # Weight stats
     parser.add_argument('--weights_stats', type=str, default=None,
                         help='Base path for weight sparsity stats (mode suffix added automatically)')
@@ -162,6 +199,10 @@ def build_quant_args(args):
             cmd.append('--acc_wrap')
     if getattr(args, 'smq', 0) > 0:
         cmd += ['--smq', str(args.smq)]
+    if getattr(args, 'gguf', None):
+        cmd += ['--gguf', args.gguf]
+    if getattr(args, 'quant_warnings', False):
+        cmd.append('--quant_warnings')
     if getattr(args, 'weights_stats', None):
         cmd += ['--weights_stats', args.weights_stats]
     return cmd

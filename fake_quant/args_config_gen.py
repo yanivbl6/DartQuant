@@ -173,6 +173,14 @@ def parser_gen():
     parser.add_argument('--k_clip_ratio', type=float, default=1.0,
                         help='Clip ratio for k-cache quantization. new_max = max * clip_ratio')
 
+    # GGUF Pre-quantized Weights
+    parser.add_argument('--gguf_path', type=str, default=None,
+                        help='Path to .gguf file with pre-quantized weights. '
+                             'Weights are dequantized and loaded before rotations/GPTQ.')
+    parser.add_argument('--quant_warnings', action='store_true', default=False,
+                        help='Warn when quantization params (w_bits, w_groupsize, w_sym) '
+                             'mismatch GGUF tensor quantization specs.')
+
     # Save/Load Quantized Model Arguments
     parser.add_argument('--load_qmodel_path', type=str, default=None,
                         help='Load the quantized model from the specified path!')
