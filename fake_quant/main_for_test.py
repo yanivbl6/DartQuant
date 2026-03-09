@@ -182,6 +182,53 @@ def main():
             # save_dict["model"] = model.state_dict()
             # torch.save(save_dict, args.save_qmodel_path)
 
+    # --- Weight sparsity stats ---
+    if args.weights_stats and args.w_bits < 16:
+        import json
+        qlayers_ws = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        stats_rows = []
+        for name, qlayer in qlayers_ws.items():
+            w = qlayer.module.weight.data
+            N, K = w.shape
+            total = w.numel()
+            n_zeros = (w == 0).sum().item()
+            pct_zero = n_zeros / total if total > 0 else 0.0
+            ops = 2 * N * K
+            stats_rows.append({
+                'layer': name,
+                'shape': [N, K],
+                'total': total,
+                'zeros': n_zeros,
+                'pct_zero': pct_zero,
+                'ops': ops,
+            })
+
+        total_ops = sum(r['ops'] for r in stats_rows)
+        effective_sparsity = (
+            sum(r['ops'] * r['pct_zero'] for r in stats_rows) / total_ops
+            if total_ops > 0 else 0.0
+        )
+
+        with open(args.weights_stats, 'w') as f:
+            f.write(f"{'Layer':<60} {'Shape':>14} {'Total':>10} {'Zeros':>10} {'%Zero':>8} {'OPs':>14}\n")
+            f.write('-' * 120 + '\n')
+            for r in stats_rows:
+                shape_str = f"{r['shape'][0]}x{r['shape'][1]}"
+                f.write(f"{r['layer']:<60} {shape_str:>14} {r['total']:>10} {r['zeros']:>10} {r['pct_zero']:>8.4f} {r['ops']:>14}\n")
+            f.write('-' * 120 + '\n')
+            f.write(f"Effective sparsity (ops-weighted): {effective_sparsity:.6f}\n")
+            f.write(f"Total OPs: {total_ops}\n")
+            f.write('\n--- JSON ---\n')
+            json.dump({
+                'layers': stats_rows,
+                'effective_sparsity': effective_sparsity,
+                'total_ops': total_ops,
+            }, f, indent=2)
+            f.write('\n')
+
+        logging.info("Weight stats written to %s (effective sparsity: %.6f)",
+                     args.weights_stats, effective_sparsity)
+
     # Add Input Quantization
     if args.a_bits < 16 or args.v_bits < 16:
         logging.info("Add v quantization: v_bits={}, v_groupsize={}, v_sym={}, v_clip_ratio={}".format(

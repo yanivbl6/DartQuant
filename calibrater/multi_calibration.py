@@ -70,6 +70,21 @@ def make_env(gpu_id):
     return env
 
 
+def _suffix_weights_stats(args_list, mode):
+    """Append _<mode> before the extension of --weights_stats path in an arg list."""
+    result = list(args_list)
+    for i, arg in enumerate(result):
+        if arg == '--weights_stats' and i + 1 < len(result):
+            path = result[i + 1]
+            base, sep, ext = path.rpartition('.')
+            if sep:
+                result[i + 1] = f"{base}_{mode}.{ext}"
+            else:
+                result[i + 1] = f"{path}_{mode}"
+            break
+    return result
+
+
 def build_calibrate_cmd(mode, model_short, quant_args, extra_args):
     """Build the calibrate_act_scales.py command for the given mode."""
     cmd = [
@@ -79,7 +94,7 @@ def build_calibrate_cmd(mode, model_short, quant_args, extra_args):
     ]
     if mode == 'dart':
         cmd += ['--r1', '--r2']
-    cmd += quant_args + extra_args
+    cmd += _suffix_weights_stats(quant_args, mode) + extra_args
     return cmd
 
 

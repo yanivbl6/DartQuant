@@ -53,6 +53,7 @@ Options:
   --sd_check T         Compare static vs dynamic quantization per-layer (threshold T, 0=off)
   --sd_check_norm N    Norm for sd_check: 1, 2, or inf                   (default: inf)
   --selective-dyn P    Comma-separated layer patterns to force dynamic    (e.g., "v_proj,o_proj")
+  --weights_stats F  Write weight sparsity stats to file F
   -F               Fast mode (skip lm_eval tasks)
   --very-fast      Very fast mode (skip lm_eval, PPL on wikitext2 only)
   -h               Show this help message
@@ -115,6 +116,7 @@ SMQ=0
 SD_CHECK=0
 SD_CHECK_NORM="inf"
 SELECTIVE_DYN=""
+WEIGHTS_STATS=""
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -145,6 +147,7 @@ while [[ $# -gt 0 ]]; do
         --sd_check)    SD_CHECK="$2";    shift 2 ;;
         --sd_check_norm) SD_CHECK_NORM="$2"; shift 2 ;;
         --selective-dyn) SELECTIVE_DYN="$2"; shift 2 ;;
+        --weights_stats) WEIGHTS_STATS="$2"; shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
         --very-fast) FAST=2;     shift   ;;
         -h|--help) usage ;;
@@ -326,6 +329,19 @@ if [ -n "$SELECTIVE_DYN" ]; then
     STATIC_TAG="seldyn_"
 fi
 
+# --- Weight stats flag (append _<MODE> before extension) ---
+WEIGHTS_STATS_FLAG=""
+if [ -n "$WEIGHTS_STATS" ]; then
+    WS_EXT="${WEIGHTS_STATS##*.}"
+    WS_BASE="${WEIGHTS_STATS%.*}"
+    if [ "$WS_EXT" != "$WEIGHTS_STATS" ]; then
+        WS_FILE="${WS_BASE}_${MODE}.${WS_EXT}"
+    else
+        WS_FILE="${WEIGHTS_STATS}_${MODE}"
+    fi
+    WEIGHTS_STATS_FLAG="--weights_stats ${WS_FILE}"
+fi
+
 # --- Static activation scales (after all tag components are finalized) ---
 STATIC_ACT_FLAG=""
 STATIC_TAG=""
@@ -395,6 +411,7 @@ python main_for_test.py \
     ${SMQ_FLAG} \
     ${SD_CHECK_FLAG} \
     ${SELECTIVE_DYN_FLAG} \
+    ${WEIGHTS_STATS_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     --percdamp 0.1 \

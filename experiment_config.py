@@ -123,6 +123,10 @@ def add_quant_args(parser):
     parser.add_argument('--smq', type=int, default=0,
                         help='Softmax output quantization bits (0=disabled)')
 
+    # Weight stats
+    parser.add_argument('--weights_stats', type=str, default=None,
+                        help='Base path for weight sparsity stats (mode suffix added automatically)')
+
 
 def resolve_v_bits(args):
     """Default v_bits to k_bits when not explicitly given."""
@@ -158,4 +162,6 @@ def build_quant_args(args):
             cmd.append('--acc_wrap')
     if getattr(args, 'smq', 0) > 0:
         cmd += ['--smq', str(args.smq)]
+    if getattr(args, 'weights_stats', None):
+        cmd += ['--weights_stats', args.weights_stats]
     return cmd

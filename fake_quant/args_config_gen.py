@@ -135,6 +135,9 @@ def parser_gen():
                         help='Percent of the average Hessian diagonal to use for dampening.')
     parser.add_argument('--act_order', action=argparse.BooleanOptionalAction, default=False,
                         help='act-order in GPTQ')
+    parser.add_argument('--weights_stats', type=str, default=None,
+                        help='Path to output file for weight sparsity stats. '
+                             'When set, reports per-layer zero counts and effective sparsity.')
 
     # General Quantization Arguments
     parser.add_argument('--w_bits_down_proj', type=int, default=None,
@@ -234,6 +237,14 @@ def parser_gen():
                         help='Percent of the average Hessian diagonal to use for dampening.')
 
     args = parser.parse_args()
+
+    if args.weights_stats:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.weights_stats)), exist_ok=True)
+            with open(args.weights_stats, 'a'):
+                pass
+        except IOError as e:
+            parser.error(f'Cannot write to --weights_stats path: {args.weights_stats} ({e})')
 
     if args.lm_eval:
         from lm_eval.tasks import TaskManager   # lm_eval==0.4.3

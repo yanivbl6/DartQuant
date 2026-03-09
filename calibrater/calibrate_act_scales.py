@@ -399,6 +399,10 @@ Examples:
     parser.add_argument('--smq', type=int, default=0,
                         help='Softmax output quantization bits (0=disabled)')
 
+    # Weight sparsity stats
+    parser.add_argument('--weights_stats', type=str, default=None,
+                        help='Path to output file for weight sparsity stats.')
+
     # Output paths (auto-deduced if not specified)
     parser.add_argument('--save_path', type=str, default=None,
                         help='Where to save scales .pt (auto-deduced if omitted)')
@@ -463,7 +467,7 @@ def main():
             n_segments=args.pwl_n_segments,
             input_bits=args.pwl_input_bits,
             output_bits=args.pwl_output_bits,
-            no_hw_sim=args.pwl_no_hw_sim,
+            no_hw_sim=args.pwl_no_hw_sim, 
         )
     if args.int_gemm:
         from int_acc_gemm import int_gemm_tag
@@ -496,7 +500,7 @@ def main():
     model = model_utils.get_model(args.model, args.hf_token)
     model.eval()
     model.model_name = model_name
-
+q
     # --- Set up rotations to match experiment pipeline ---
     if args.mode in ('quarot', 'dart'):
         rotation_utils.fuse_layer_norms(model)
@@ -636,6 +640,54 @@ def main():
                                       prefix=f'{model_name}_part')
 
         utils.cleanup_memory(verbos=True)
+
+    # --- Weight sparsity stats ---
+    if getattr(args, 'weights_stats', None) and args.w_bits < 16:
+        import json as _json
+        qlayers_ws = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        stats_rows = []
+        for name, qlayer in qlayers_ws.items():
+            w = qlayer.module.weight.data
+            N, K = w.shape
+            total = w.numel()
+            n_zeros = (w == 0).sum().item()
+            pct_zero = n_zeros / total if total > 0 else 0.0
+            ops = 2 * N * K
+            stats_rows.append({
+                'layer': name,
+                'shape': [N, K],
+                'total': total,
+                'zeros': n_zeros,
+                'pct_zero': pct_zero,
+                'ops': ops,
+            })
+
+        total_ops = sum(r['ops'] for r in stats_rows)
+        effective_sparsity = (
+            sum(r['ops'] * r['pct_zero'] for r in stats_rows) / total_ops
+            if total_ops > 0 else 0.0
+        )
+
+        ws_path = args.weights_stats
+        os.makedirs(os.path.dirname(os.path.abspath(ws_path)), exist_ok=True)
+        with open(ws_path, 'w') as f:
+            f.write(f"{'Layer':<60} {'Shape':>14} {'Total':>10} {'Zeros':>10} {'%Zero':>8} {'OPs':>14}\n")
+            f.write('-' * 120 + '\n')
+            for r in stats_rows:
+                shape_str = f"{r['shape'][0]}x{r['shape'][1]}"
+                f.write(f"{r['layer']:<60} {shape_str:>14} {r['total']:>10} {r['zeros']:>10} {r['pct_zero']:>8.4f} {r['ops']:>14}\n")
+            f.write('-' * 120 + '\n')
+            f.write(f"Effective sparsity (ops-weighted): {effective_sparsity:.6f}\n")
+            f.write(f"Total OPs: {total_ops}\n")
+            f.write('\n--- JSON ---\n')
+            _json.dump({
+                'layers': stats_rows,
+                'effective_sparsity': effective_sparsity,
+                'total_ops': total_ops,
+            }, f, indent=2)
+            f.write('\n')
+
+        print(f"Weight stats written to {ws_path} (effective sparsity: {effective_sparsity:.6f})")
 
     # Add K-cache quantization wrappers
     if args.k_bits < 16:
