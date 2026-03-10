@@ -1,9 +1,82 @@
 import math
+import re
 import transformers
 import torch
 import utils
 import hadamard_utils
 import fast_hadamard_transform
+
+
+# ── Mantissa+Shift group-scale quantization ──────────────────────────────────
+
+_GSCALER_RE = re.compile(r'^M(\d+)[SE](\d+)(?:([bl])(\d+))?$')
+
+
+def parse_gscaler(spec):
+    """Parse a gscaler spec string into a config dict.
+
+    Examples:
+        'M5S3'    -> {mantissa_bits: 5, shift_bits: 3, bias: 0}
+        'M6E4b2'  -> {mantissa_bits: 6, shift_bits: 4, bias: 2}
+        'M6S4l2'  -> {mantissa_bits: 6, shift_bits: 4, bias: -2}
+
+    Returns None if spec is None.
+    Raises ValueError on invalid format.
+    """
+    if spec is None:
+        return None
+    m = _GSCALER_RE.match(spec)
+    if not m:
+        raise ValueError(
+            f"Invalid --gscaler format: '{spec}'. "
+            f"Expected e.g. M5S3, M6E4b2, M6S4l2.")
+    mantissa_bits = int(m.group(1))
+    shift_bits = int(m.group(2))
+    bias_dir = m.group(3)  # 'b', 'l', or None
+    bias_val = int(m.group(4)) if m.group(4) else 0
+    if bias_dir == 'l':
+        bias_val = -bias_val
+    return {
+        'mantissa_bits': mantissa_bits,
+        'shift_bits': shift_bits,
+        'bias': bias_val,
+        'spec': spec,
+    }
+
+
+def snap_scale_to_gscaler(scale, gscaler):
+    """Snap FP32 scale tensor to nearest mantissa+shift representable value.
+
+    scale: tensor of positive FP32 values
+    gscaler: dict from parse_gscaler()
+
+    Returns: tensor of same shape with snapped values.
+    Format: value = mantissa * 2^(-shift)
+    """
+    M = gscaler['mantissa_bits']
+    S = gscaler['shift_bits']
+    bias = gscaler['bias']
+    max_mantissa = (1 << M) - 1  # 2^M - 1
+    s_min = bias
+    s_max = bias + (1 << S) - 1  # bias + 2^S - 1
+
+    orig_shape = scale.shape
+    s_flat = scale.flatten().float()
+
+    best_val = torch.full_like(s_flat, float('inf'))
+    best_err = torch.full_like(s_flat, float('inf'))
+
+    for shift in range(s_min, s_max + 1):
+        # mantissa = round(scale * 2^shift), clamped to [1, max_mantissa]
+        two_pow_shift = 2.0 ** shift
+        m = torch.clamp(torch.round(s_flat * two_pow_shift), 1, max_mantissa)
+        candidate = m * (2.0 ** (-shift))
+        err = (candidate - s_flat).abs()
+        better = err < best_err
+        best_err = torch.where(better, err, best_err)
+        best_val = torch.where(better, candidate, best_val)
+
+    return best_val.reshape(orig_shape).to(scale.dtype)
 
 
 def get_minq_maxq(bits, sym):
@@ -623,7 +696,8 @@ class WeightQuantizer(torch.nn.Module):
         self,
         bits, perchannel=False, sym=True,
         mse=False, norm=2.4, grid=100, maxshrink=.8,
-        groupsize=-1, static_groups=False
+        groupsize=-1, static_groups=False,
+        gscaler=None
     ):
         self.bits = bits
         self.perchannel = perchannel
@@ -632,6 +706,7 @@ class WeightQuantizer(torch.nn.Module):
         self.norm = norm
         self.grid = grid
         self.maxshrink = maxshrink
+        self.gscaler = gscaler
         if sym:
             self.maxq = torch.tensor(2**(bits - 1) - 1)
         else:
@@ -695,6 +770,9 @@ class WeightQuantizer(torch.nn.Module):
             tmp = shape[0]
             self.scale = self.scale.repeat(tmp)
             self.zero = self.zero.repeat(tmp)
+
+        if self.gscaler is not None:
+            self.scale = snap_scale_to_gscaler(self.scale, self.gscaler)
 
         shape = [-1] + [1] * (len(shape) - 1)
         self.scale = self.scale.reshape(shape)

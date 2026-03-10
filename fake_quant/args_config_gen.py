@@ -138,6 +138,9 @@ def parser_gen():
     parser.add_argument('--weights_stats', type=str, default=None,
                         help='Path to output file for weight sparsity stats. '
                              'When set, reports per-layer zero counts and effective sparsity.')
+    parser.add_argument('--gscaler', type=str, default=None,
+                        help='Group scale format: M5S3, M6E4b2, M6S4l2, etc. '
+                             '(default: None = FP32 scales)')
 
     # General Quantization Arguments
     parser.add_argument('--w_bits_down_proj', type=int, default=None,
@@ -253,6 +256,10 @@ def parser_gen():
                 pass
         except IOError as e:
             parser.error(f'Cannot write to --weights_stats path: {args.weights_stats} ({e})')
+
+    # Parse and validate --gscaler early so we fail fast on bad format
+    from quant_utils import parse_gscaler
+    args.gscaler_parsed = parse_gscaler(args.gscaler)
 
     if args.lm_eval:
         from lm_eval.tasks import TaskManager   # lm_eval==0.4.3

@@ -165,6 +165,11 @@ def add_quant_args(parser):
     parser.add_argument('--weights_stats', type=str, default=None,
                         help='Base path for weight sparsity stats (mode suffix added automatically)')
 
+    # Group scale quantization
+    parser.add_argument('--gscaler', type=str, default=None,
+                        help='Group scale format: M5S3, M6E4b2, M6S4l2, etc. '
+                             '(default: None = FP32 scales)')
+
 
 def resolve_v_bits(args):
     """Default v_bits to k_bits when not explicitly given."""
@@ -188,6 +193,8 @@ def build_quant_tag(args):
         parts = basename.split('-')
         qtype = '-'.join(p for p in parts if p.startswith('Q')) or 'gguf'
         tag += f"_gguf-{qtype.replace('_', '-')}"
+    if getattr(args, 'gscaler', None):
+        tag += f"_G-scaler-{args.gscaler}"
     return tag
 
 
@@ -244,4 +251,6 @@ def build_quant_args(args):
         cmd.append('--quant_warnings')
     if getattr(args, 'weights_stats', None):
         cmd += ['--weights_stats', args.weights_stats]
+    if getattr(args, 'gscaler', None):
+        cmd += ['--gscaler', args.gscaler]
     return cmd

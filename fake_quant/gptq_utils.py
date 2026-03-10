@@ -219,7 +219,8 @@ def gptq_fwrd(model, dataloader, dev, args):
                 gptq[name] = GPTQ(subset[name])
                 gptq[name].quantizer = quant_utils.WeightQuantizer()
                 gptq[name].quantizer.configure(
-                    layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip
+                    layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip,
+                    gscaler=getattr(args, 'gscaler_parsed', None)
                 )
 
             def add_batch(name):
@@ -332,7 +333,8 @@ def rtn_fwrd(model, dev, args):
 
             quantizer = quant_utils.WeightQuantizer()
             quantizer.configure(
-                layer_weight_bits, perchannel=True, sym=not (args.w_asym), mse=args.w_clip
+                layer_weight_bits, perchannel=True, sym=not (args.w_asym), mse=args.w_clip,
+                gscaler=getattr(args, 'gscaler_parsed', None)
             )
             W = subset[name].weight.data
 
@@ -344,7 +346,8 @@ def rtn_fwrd(model, dev, args):
                         group_quantizer = quant_utils.WeightQuantizer()
                         group_quantizer.configure(
                             layer_weight_bits, perchannel=True,
-                            sym=not (args.w_asym), mse=args.w_clip
+                            sym=not (args.w_asym), mse=args.w_clip,
+                            gscaler=getattr(args, 'gscaler_parsed', None)
                         )
                         group_quantizer.find_params(W[:, j:j + groupsize])
                         groups.append(group_quantizer)

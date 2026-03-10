@@ -682,6 +682,9 @@ def main():
             gptq_args.acc_block_k = getattr(args, 'acc_block_k', 32)
             gptq_args.acc_wrap = getattr(args, 'acc_wrap', False)
             gptq_args.int_gemm_use_triton = True
+            # Forward group-scale quantization config
+            gptq_args.gscaler_parsed = quant_utils.parse_gscaler(
+                getattr(args, 'gscaler', None))
 
             gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
 

@@ -122,6 +122,7 @@ SD_CHECK_NORM="inf"
 SELECTIVE_DYN=""
 WEIGHTS_STATS=""
 GGUF=""
+GSCALER=""
 QUANT_WARNINGS=0
 WAIT_GPU=0
 MAX_USED_MB=200
@@ -157,6 +158,7 @@ while [[ $# -gt 0 ]]; do
         --selective-dyn) SELECTIVE_DYN="$2"; shift 2 ;;
         --weights_stats) WEIGHTS_STATS="$2"; shift 2 ;;
         --gguf)        GGUF="$2";           shift 2 ;;
+        --gscaler)     GSCALER="$2";        shift 2 ;;
         --quant_warnings) QUANT_WARNINGS=1; shift   ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
@@ -336,6 +338,13 @@ if [ "$SMQ" != "0" ]; then
     QUANT_TAG="${QUANT_TAG}_smq${SMQ}"
 fi
 
+# --- Group scaler tag ---
+GSCALER_FLAG=""
+if [ -n "$GSCALER" ]; then
+    GSCALER_FLAG="--gscaler ${GSCALER}"
+    QUANT_TAG="${QUANT_TAG}_G-scaler-${GSCALER}"
+fi
+
 # --- GGUF tag ---
 GGUF_FLAG=""
 QUANT_WARN_FLAG=""
@@ -464,6 +473,7 @@ python main_for_test.py \
     ${WEIGHTS_STATS_FLAG} \
     ${GGUF_FLAG} \
     ${QUANT_WARN_FLAG} \
+    ${GSCALER_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     --percdamp 0.1 \
