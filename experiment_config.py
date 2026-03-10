@@ -172,6 +172,44 @@ def resolve_v_bits(args):
         args.v_bits = args.k_bits
 
 
+# ── Quant-tag and path helpers ───────────────────────────────────────────────
+
+def build_quant_tag(args):
+    """Build the quant-tag string from parsed args (mirrors shell script logic)."""
+    sym_tag = "wSym_kSym_vSym" if args.sym else "kAsym_vAsym"
+    tag = f"w{args.w_bits}a{args.a_bits}k{args.k_bits}v{args.v_bits}_g{args.groupsize}_aAsym_{sym_tag}"
+    if args.kv_ex != 0:
+        tag += f"_kvex{args.kv_ex}"
+    if args.proj_ex != 0:
+        tag += f"_projex{args.proj_ex}"
+    if getattr(args, 'gguf', None):
+        gguf_path = resolve_gguf_path(args.gguf, args.model)
+        basename = os.path.basename(gguf_path).replace('.gguf', '')
+        parts = basename.split('-')
+        qtype = '-'.join(p for p in parts if p.startswith('Q')) or 'gguf'
+        tag += f"_gguf-{qtype.replace('_', '-')}"
+    return tag
+
+
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+
+
+def resolve_act_scales_path(model_path, mode, quant_tag):
+    """Resolve calibration .pt file path."""
+    model_name = model_name_from_path(model_path)
+    return os.path.join(_DATA_DIR, 'act_scales', model_name, f'{mode}_{quant_tag}.pt')
+
+
+def resolve_gptq_checkpoint_dir(model_path, mode, quant_tag, w_bits):
+    """Resolve GPTQ checkpoint directory (containing .pth files)."""
+    model_name = model_name_from_path(model_path)
+    return os.path.join(
+        _DATA_DIR, 'gptq_checkpoints',
+        f'{mode}_{model_name}_{quant_tag}',
+        f'{model_name}_w{w_bits}',
+    )
+
+
 def build_quant_args(args):
     """Serialize parsed quant args back to a CLI arg list for forwarding."""
     cmd = ['-w', str(args.w_bits),
