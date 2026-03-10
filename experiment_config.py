@@ -180,19 +180,51 @@ def resolve_v_bits(args):
 # ── Quant-tag and path helpers ───────────────────────────────────────────────
 
 def build_quant_tag(args):
-    """Build the quant-tag string from parsed args (mirrors shell script logic)."""
+    """Build the canonical quant-tag string from parsed args.
+
+    This is the SINGLE SOURCE OF TRUTH for tag construction.
+    Called by: calibrate_act_scales.py, analyze_scales.py, run_experiments.py,
+    and dart_gptq_wxaykvz.sh (via ``python experiment_config.py``).
+    """
     sym_tag = "wSym_kSym_vSym" if args.sym else "kAsym_vAsym"
     tag = f"w{args.w_bits}a{args.a_bits}k{args.k_bits}v{args.v_bits}_g{args.groupsize}_aAsym_{sym_tag}"
     if args.kv_ex != 0:
         tag += f"_kvex{args.kv_ex}"
     if args.proj_ex != 0:
         tag += f"_projex{args.proj_ex}"
+    # PWL activation tag
+    if getattr(args, 'pwl_act', False):
+        parts = ["_pwl"]
+        if getattr(args, 'pwl_n_segments', 9) != 9:
+            parts.append(f"{args.pwl_n_segments}p")
+        if getattr(args, 'pwl_input_bits', 16) != 16:
+            parts.append(f"in{args.pwl_input_bits}")
+        if getattr(args, 'pwl_output_bits', 16) != 16:
+            parts.append(f"out{args.pwl_output_bits}")
+        if getattr(args, 'pwl_no_hw_sim', False):
+            parts.append("nohw")
+        tag += "_".join(parts)
+    # Integer GEMM tag
+    if getattr(args, 'int_gemm', False):
+        parts = ["_intgemm"]
+        if getattr(args, 'acc_bits', 32) != 32:
+            parts.append(f"acc{args.acc_bits}")
+        if getattr(args, 'acc_block_k', 32) != 32:
+            parts.append(f"bk{args.acc_block_k}")
+        if getattr(args, 'acc_wrap', False):
+            parts.append("wrap")
+        tag += "_".join(parts)
+    # SMQ tag
+    if getattr(args, 'smq', 0) > 0:
+        tag += f"_smq{args.smq}"
+    # GGUF tag
     if getattr(args, 'gguf', None):
         gguf_path = resolve_gguf_path(args.gguf, args.model)
         basename = os.path.basename(gguf_path).replace('.gguf', '')
         parts = basename.split('-')
         qtype = '-'.join(p for p in parts if p.startswith('Q')) or 'gguf'
         tag += f"_gguf-{qtype.replace('_', '-')}"
+    # Group scaler tag
     if getattr(args, 'gscaler', None):
         tag += f"_G-scaler-{args.gscaler}"
     return tag
@@ -254,3 +286,17 @@ def build_quant_args(args):
     if getattr(args, 'gscaler', None):
         cmd += ['--gscaler', args.gscaler]
     return cmd
+
+
+# ── CLI entry point — print quant tag from args ─────────────────────────────
+# Used by dart_gptq_wxaykvz.sh:  QUANT_TAG=$(python experiment_config.py ...)
+
+if __name__ == '__main__':
+    import argparse as _ap
+    _parser = _ap.ArgumentParser(description='Print the quant tag for the given args')
+    add_model_arg(_parser)
+    add_quant_args(_parser)
+    _args = _parser.parse_args()
+    resolve_v_bits(_args)
+    _args.model = resolve_model(_args.model)
+    print(build_quant_tag(_args))

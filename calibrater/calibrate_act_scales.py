@@ -485,42 +485,13 @@ def main():
     args.o_per_head = (args.mode in ('quarot', 'dart'))
     args.w_clip = True
 
-    # --- Build quant tag (matching experiment script convention) ---
-    quant_tag = f"w{args.w_bits}a{args.a_bits}k{args.k_bits}v{args.v_bits}_g{args.groupsize}_aAsym_{sym_tag}"
-    if args.kv_ex != 0:
-        quant_tag += f"_kvex{args.kv_ex}"
-    if args.proj_ex != 0:
-        quant_tag += f"_projex{args.proj_ex}"
-    if args.pwl_act:
-        import pwl_utils
-        quant_tag += pwl_utils.pwl_tag(
-            n_segments=args.pwl_n_segments,
-            input_bits=args.pwl_input_bits,
-            output_bits=args.pwl_output_bits,
-            no_hw_sim=args.pwl_no_hw_sim, 
-        )
-    if args.int_gemm:
-        from int_acc_gemm import int_gemm_tag
-        quant_tag += int_gemm_tag(
-            acc_bits=args.acc_bits,
-            acc_block_k=args.acc_block_k,
-            acc_wrap=args.acc_wrap,
-        )
-    if args.smq > 0:
-        from smq_utils import smq_tag
-        quant_tag += smq_tag(args.smq)
+    # --- Build quant tag (centralized in experiment_config) ---
+    quant_tag = cfg.build_quant_tag(args)
 
-    # Resolve GGUF path and add to tag
+    # Resolve GGUF path (needed for weight loading, separate from tag)
     gguf_path = None
     if args.gguf is not None:
         gguf_path = cfg.resolve_gguf_path(args.gguf, args.model)
-        gguf_basename = os.path.basename(gguf_path).replace('.gguf', '')
-        # Extract quant type (e.g., Q4_K_M from Llama-3.2-1B-Instruct-Q4_K_M)
-        parts = gguf_basename.split('-')
-        gguf_qtype = '-'.join(p for p in parts if p.startswith('Q')) or 'gguf'
-        # Use dashes in tag: gguf-Q4-K-M
-        gguf_tag = gguf_qtype.replace('_', '-')
-        quant_tag += f"_gguf-{gguf_tag}"
 
     save_prefix = args.mode
 

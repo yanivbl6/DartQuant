@@ -280,90 +280,65 @@ elif [ "$MODE" == "dart" ]; then
     SAVE_PREFIX="dart"
 fi
 
-# --- Descriptive tag encoding the quantization config ---
-QUANT_TAG="w${W_BITS}a${A_BITS}k${KV_BITS}v${V_BITS}_g${GROUPSIZE}_aAsym_${SYM_TAG}"
-if [ "$KV_EX" != "0" ]; then
-    QUANT_TAG="${QUANT_TAG}_kvex${KV_EX}"
-fi
-if [ "$PROJ_EX" != "0" ]; then
-    QUANT_TAG="${QUANT_TAG}_projex${PROJ_EX}"
-fi
-
 OVERWRITE_FLAG=""
 if [ "$OVERWRITE" == "1" ]; then
     OVERWRITE_FLAG="--overwrite"
 fi
 
-# --- PWL activation flags & tag (mirrors pwl_utils.pwl_tag()) ---
+# --- Build flags for forwarding to Python ---
 PWL_ACT_FLAG=""
 if [ "$PWL_ACT" == "1" ]; then
     PWL_ACT_FLAG="--pwl_act --pwl_n_segments ${PWL_N_SEGMENTS} --pwl_input_bits ${PWL_INPUT_BITS} --pwl_output_bits ${PWL_OUTPUT_BITS}"
-    PWL_TAG="_pwl"
-    if [ "$PWL_N_SEGMENTS" != "9" ]; then
-        PWL_TAG="${PWL_TAG}_${PWL_N_SEGMENTS}p"
-    fi
-    if [ "$PWL_INPUT_BITS" != "16" ]; then
-        PWL_TAG="${PWL_TAG}_in${PWL_INPUT_BITS}"
-    fi
-    if [ "$PWL_OUTPUT_BITS" != "16" ]; then
-        PWL_TAG="${PWL_TAG}_out${PWL_OUTPUT_BITS}"
-    fi
     if [ "$PWL_NO_HW_SIM" == "1" ]; then
         PWL_ACT_FLAG="${PWL_ACT_FLAG} --pwl_no_hw_sim"
-        PWL_TAG="${PWL_TAG}_nohw"
     fi
-    QUANT_TAG="${QUANT_TAG}${PWL_TAG}"
 fi
 
-# --- Integer GEMM flags & tag (mirrors int_acc_gemm.int_gemm_tag()) ---
 INT_GEMM_FLAG=""
 if [ "$INT_GEMM" == "1" ]; then
     INT_GEMM_FLAG="--int_gemm --acc_bits ${ACC_BITS} --acc_block_k ${ACC_BLOCK_K}"
-    INTGEMM_TAG="_intgemm"
-    if [ "$ACC_BITS" != "32" ]; then
-        INTGEMM_TAG="${INTGEMM_TAG}_acc${ACC_BITS}"
-    fi
-    if [ "$ACC_BLOCK_K" != "32" ]; then
-        INTGEMM_TAG="${INTGEMM_TAG}_bk${ACC_BLOCK_K}"
-    fi
     if [ "$ACC_WRAP" == "1" ]; then
         INT_GEMM_FLAG="${INT_GEMM_FLAG} --acc_wrap"
-        INTGEMM_TAG="${INTGEMM_TAG}_wrap"
     fi
-    QUANT_TAG="${QUANT_TAG}${INTGEMM_TAG}"
 fi
 
-# --- SMQ tag ---
+SMQ_FLAG=""
 if [ "$SMQ" != "0" ]; then
-    QUANT_TAG="${QUANT_TAG}_smq${SMQ}"
+    SMQ_FLAG="--smq ${SMQ}"
 fi
 
-# --- Group scaler tag ---
 GSCALER_FLAG=""
 if [ -n "$GSCALER" ]; then
     GSCALER_FLAG="--gscaler ${GSCALER}"
-    QUANT_TAG="${QUANT_TAG}_G-scaler-${GSCALER}"
 fi
 
-# --- GGUF tag ---
 GGUF_FLAG=""
+GGUF_TAG_FLAG=""
 QUANT_WARN_FLAG=""
 if [ -n "$GGUF" ]; then
-    GGUF_BASENAME=$(basename "$GGUF" .gguf)
-    GGUF_QTYPE=$(echo "$GGUF_BASENAME" | grep -oP '(?<=-)(Q[^.]+)$' || echo "gguf")
-    # Use dashes in tag: gguf-Q4-K-M
-    GGUF_TAG=$(echo "$GGUF_QTYPE" | tr '_' '-')
-    QUANT_TAG="${QUANT_TAG}_gguf-${GGUF_TAG}"
     GGUF_FLAG="--gguf_path ${GGUF}"
+    GGUF_TAG_FLAG="--gguf ${GGUF}"
 fi
 if [ "$QUANT_WARNINGS" == "1" ]; then
     QUANT_WARN_FLAG="--quant_warnings"
 fi
 
-# --- SMQ flags ---
-SMQ_FLAG=""
-if [ "$SMQ" != "0" ]; then
-    SMQ_FLAG="--smq ${SMQ}"
+# --- Build quant tag via centralized Python function ---
+TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -m ${MODEL}"
+[ "$SYM" == "1" ] && TAG_ARGS="${TAG_ARGS} --sym"
+[ "$KV_EX" != "0" ] && TAG_ARGS="${TAG_ARGS} --kv_ex ${KV_EX}"
+[ "$PROJ_EX" != "0" ] && TAG_ARGS="${TAG_ARGS} --proj_ex ${PROJ_EX}"
+[ -n "$PWL_ACT_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${PWL_ACT_FLAG}"
+[ -n "$INT_GEMM_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${INT_GEMM_FLAG}"
+[ -n "$SMQ_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${SMQ_FLAG}"
+[ -n "$GGUF_TAG_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GGUF_TAG_FLAG}"
+[ -n "$GSCALER_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GSCALER_FLAG}"
+
+SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
+QUANT_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS})
+if [ $? -ne 0 ] || [ -z "$QUANT_TAG" ]; then
+    echo "Error: failed to build quant tag"
+    exit 1
 fi
 
 # --- Static vs Dynamic check flags ---

@@ -117,6 +117,7 @@ class GPTQ:
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
         torch.cuda.synchronize()
+        mean_loss = Losses.mean().item()
 
         if actorder:
             Q = Q[:, invperm]
@@ -127,6 +128,8 @@ class GPTQ:
             import pprint
             pprint.pprint(self.quantizer.bits, self.quantizer.scale, self.quantizer.zero_point)
             raise ValueError('NaN in weights')
+
+        return mean_loss
 
     def free(self):
         self.H = None
@@ -199,10 +202,12 @@ def gptq_fwrd(model, dataloader, dev, args):
         ['mlp.up_proj.module', 'mlp.gate_proj.module'],
         ['mlp.down_proj.module']
     ]
-    for i in tqdm.tqdm(range(len(layers)), desc="(GPTQ Quant.) Layers"):
+    pbar = tqdm.tqdm(range(len(layers)), desc="(GPTQ Quant.) Layers")
+    for i in pbar:
         # print(f'\nLayer {i}:', flush=True, end=' ')
         layer = layers[i].to(dev)
         full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
+        layer_losses = []
         for names in sequential:
             subset = {n: full[n] for n in names}
 
@@ -238,10 +243,11 @@ def gptq_fwrd(model, dataloader, dev, args):
 
             for name in subset:
                 layer_w_groupsize = args.w_groupsize
-                gptq[name].fasterquant(
+                loss = gptq[name].fasterquant(
                     percdamp=args.percdamp, groupsize=layer_w_groupsize,
                     actorder=args.act_order, static_groups=args.w_static_groups
                 )
+                layer_losses.append(loss)
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
 
@@ -287,6 +293,9 @@ def gptq_fwrd(model, dataloader, dev, args):
                         use_triton=getattr(args, 'int_gemm_use_triton', True),
                         acc_wrap=getattr(args, 'acc_wrap', False),
                     )
+
+        avg_loss = sum(layer_losses) / len(layer_losses) if layer_losses else 0.0
+        pbar.set_postfix(loss=f"{avg_loss:.4g}")
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
