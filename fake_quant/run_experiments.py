@@ -13,6 +13,8 @@ Usage:
 
 import argparse
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -22,6 +24,64 @@ import experiment_config as cfg
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(SCRIPT_DIR, '..', 'data', 'cached_results')
+
+
+def _read_last_line(path):
+    """Read the last non-empty line from a log file (handles \\r from tqdm)."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)  # end
+            size = f.tell()
+            if size == 0:
+                return ""
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode('utf-8', errors='replace')
+        # tqdm uses \r for in-place updates; split on both \r and \n
+        lines = re.split(r'[\r\n]', tail)
+        for line in reversed(lines):
+            stripped = line.strip()
+            if stripped:
+                return stripped
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def _print_status(procs, first_call=False):
+    """Print or refresh the status block for all experiments."""
+    term_width = shutil.get_terminal_size((120, 24)).columns
+    n = len(procs)
+    if not first_call:
+        # Move cursor up to overwrite previous status block
+        sys.stdout.write(f"\033[{n}A")
+
+    for name, proc, log_path in procs:
+        rc = proc.poll()
+        if rc is None:
+            tail = _read_last_line(log_path)
+            if tail:
+                prefix = f"  [running] {name}: "
+                max_tail = term_width - len(prefix)
+                if len(tail) > max_tail:
+                    tail = "..." + tail[-(max_tail - 3):]
+                line = prefix + tail
+            else:
+                line = f"  [running] {name}: starting..."
+        elif rc == 0:
+            tail = _read_last_line(log_path)
+            if tail:
+                prefix = f"  [done]    {name}: "
+                max_tail = term_width - len(prefix)
+                if len(tail) > max_tail:
+                    tail = "..." + tail[-(max_tail - 3):]
+                line = prefix + tail
+            else:
+                line = f"  [done]    {name}"
+        else:
+            line = f"  [FAIL]    {name} (exit code {rc})"
+        # Clear rest of line in case previous line was longer
+        sys.stdout.write(f"\033[K{line}\n")
+    sys.stdout.flush()
 
 
 def parse_args():
@@ -170,7 +230,7 @@ def main():
     for name, _, skipped in cmds:
         if skipped:
             continue
-        for ext in ('out', 'err'):
+        for ext in ('log', 'out', 'err'):
             path = os.path.join(RESULTS_DIR, f'{name}_results.{ext}')
             if os.path.exists(path):
                 os.remove(path)
@@ -189,16 +249,15 @@ def main():
         failed = 0
         for i, (name, cmd) in enumerate(active_cmds):
             print(f"  [{i+1}/{num_run}] Launching {name} ...")
-            out_f = open(os.path.join(RESULTS_DIR, f'{name}_results.out'), 'w')
-            err_f = open(os.path.join(RESULTS_DIR, f'{name}_results.err'), 'w')
-            proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f)
+            log_path = os.path.join(RESULTS_DIR, f'{name}_results.log')
+            log_f = open(log_path, 'w')
+            proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
             proc.wait()
-            out_f.close()
-            err_f.close()
+            log_f.close()
             if proc.returncode == 0:
                 print(f"  [done] {name}")
             else:
-                print(f"  [FAIL] {name} (see {os.path.join(RESULTS_DIR, f'{name}_results.err')})")
+                print(f"  [FAIL] {name} (see {log_path})")
                 failed += 1
 
             # After each run (except the last), wait 30s then poll for a clear GPU
@@ -209,24 +268,32 @@ def main():
     else:
         # Launch all in parallel
         procs = []
+        log_files = []
         for name, cmd in active_cmds:
-            out_f = open(os.path.join(RESULTS_DIR, f'{name}_results.out'), 'w')
-            err_f = open(os.path.join(RESULTS_DIR, f'{name}_results.err'), 'w')
-            proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f)
-            procs.append((name, proc, out_f, err_f))
+            log_path = os.path.join(RESULTS_DIR, f'{name}_results.log')
+            log_f = open(log_path, 'w')
+            proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
+            procs.append((name, proc, log_path))
+            log_files.append(log_f)
 
-        print(f"=== Waiting for all experiments ===\n")
+        print(f"=== Waiting for all experiments (refreshing every 30s) ===\n")
 
-        failed = 0
-        for name, proc, out_f, err_f in procs:
-            proc.wait()
-            out_f.close()
-            err_f.close()
-            if proc.returncode == 0:
-                print(f"  [done] {name}")
-            else:
-                print(f"  [FAIL] {name} (see {os.path.join(RESULTS_DIR, f'{name}_results.err')})")
-                failed += 1
+        # Print initial status block
+        _print_status(procs, first_call=True)
+
+        # Poll until all done, refreshing every 30s
+        while any(proc.poll() is None for _, proc, _ in procs):
+            time.sleep(30)
+            _print_status(procs)
+
+        # Final refresh to show done/fail status for all
+        _print_status(procs)
+
+        # Close log files
+        for lf in log_files:
+            lf.close()
+
+        failed = sum(1 for _, proc, _ in procs if proc.returncode != 0)
 
     num_skipped = len(skip_set)
     print()
