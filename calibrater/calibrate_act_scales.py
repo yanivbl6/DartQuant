@@ -413,6 +413,11 @@ Examples:
     parser.add_argument('--weights_stats', type=str, default=None,
                         help='Path to output file for weight sparsity stats.')
 
+    # Group scale quantization
+    parser.add_argument('--gscaler', type=str, default=None,
+                        help='Group scale format: M5S3, M6E4b2, M6S4l2, etc. '
+                             '(default: None = FP32 scales)')
+
     # GPU waiting
     parser.add_argument('--wait', action='store_true',
                         help='Wait for a clear GPU (polls nvidia-smi, overrides CUDA_VISIBLE_DEVICES)')
