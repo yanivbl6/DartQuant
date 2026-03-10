@@ -55,7 +55,10 @@ EXPERIMENTS=(
   "dart_static|dart|7|--static-act"
 )
 
-rm -f /tmp/*_results.out /tmp/*_results.err 2>/dev/null
+SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
+RESULTS_DIR="${SCRIPT_DIR_BASE}/data/cached_results"
+
+rm -f ${RESULTS_DIR}/*_results.out ${RESULTS_DIR}/*_results.err 2>/dev/null
 
 echo "=== Launching 7 experiments ==="
 echo ""
@@ -73,7 +76,7 @@ for exp in "${EXPERIMENTS[@]}"; do
   fi
 
   echo "  [GPU $gpu] $name: ${CMD[*]}"
-  "${CMD[@]}" > "/tmp/${name}_results.out" 2> "/tmp/${name}_results.err" &
+  "${CMD[@]}" > "${RESULTS_DIR}/${name}_results.out" 2> "${RESULTS_DIR}/${name}_results.err" &
   PIDS+=("$!:$name")
 done
 
@@ -86,7 +89,7 @@ for entry in "${PIDS[@]}"; do
   if wait "$pid"; then
     echo "  [done] $name"
   else
-    echo "  [FAIL] $name (see /tmp/${name}_results.err)"
+    echo "  [FAIL] $name (see ${RESULTS_DIR}/${name}_results.err)"
     FAILED=$((FAILED + 1))
   fi
 done

@@ -2,7 +2,7 @@
 Persistent JSON-based result cache for evaluation runs.
 
 Each mode (baseline / quarot / dart) gets its own cache file at:
-    /tmp/<mode>_results.pb
+    data/cached_results/<mode>_results.pb
 
 The file stores a flat dict whose keys describe individual results:
     ppl/<dataset>          -> float   (perplexity value)
@@ -10,7 +10,7 @@ The file stores a flat dict whose keys describe individual results:
     lm_eval/acc_avg        -> float   (average accuracy)
 
 Usage:
-    cache = ResultCache("/tmp/quarot_results.pb")
+    cache = ResultCache("data/cached_results/quarot_results.pb")
     if not cache.has("ppl/wikitext2"):
         ppl = run_ppl_eval(...)
         cache.set("ppl/wikitext2", ppl)

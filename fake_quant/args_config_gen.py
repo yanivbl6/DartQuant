@@ -209,7 +209,7 @@ def parser_gen():
 
     # Result Caching Arguments
     parser.add_argument('--cache_path', type=str, default=None,
-                        help='Path to the JSON result cache file (e.g. /tmp/quarot_results.pb). '
+                        help='Path to the JSON result cache file (e.g. data/cached_results/quarot_results.pb). '
                              'When set, completed eval results are saved and reused across runs.')
     parser.add_argument('--overwrite', action='store_true', default=False,
                         help='Ignore existing cached results and re-run all evaluations.')

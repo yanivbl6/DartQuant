@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import experiment_config as cfg
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RESULTS_DIR = os.path.join(SCRIPT_DIR, '..', 'data', 'cached_results')
 
 
 def parse_args():
@@ -170,7 +171,7 @@ def main():
         if skipped:
             continue
         for ext in ('out', 'err'):
-            path = f'/tmp/{name}_results.{ext}'
+            path = os.path.join(RESULTS_DIR, f'{name}_results.{ext}')
             if os.path.exists(path):
                 os.remove(path)
 
@@ -188,8 +189,8 @@ def main():
         failed = 0
         for i, (name, cmd) in enumerate(active_cmds):
             print(f"  [{i+1}/{num_run}] Launching {name} ...")
-            out_f = open(f'/tmp/{name}_results.out', 'w')
-            err_f = open(f'/tmp/{name}_results.err', 'w')
+            out_f = open(os.path.join(RESULTS_DIR, f'{name}_results.out'), 'w')
+            err_f = open(os.path.join(RESULTS_DIR, f'{name}_results.err'), 'w')
             proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f)
             proc.wait()
             out_f.close()
@@ -197,7 +198,7 @@ def main():
             if proc.returncode == 0:
                 print(f"  [done] {name}")
             else:
-                print(f"  [FAIL] {name} (see /tmp/{name}_results.err)")
+                print(f"  [FAIL] {name} (see {os.path.join(RESULTS_DIR, f'{name}_results.err')})")
                 failed += 1
 
             # After each run (except the last), wait 30s then poll for a clear GPU
@@ -209,8 +210,8 @@ def main():
         # Launch all in parallel
         procs = []
         for name, cmd in active_cmds:
-            out_f = open(f'/tmp/{name}_results.out', 'w')
-            err_f = open(f'/tmp/{name}_results.err', 'w')
+            out_f = open(os.path.join(RESULTS_DIR, f'{name}_results.out'), 'w')
+            err_f = open(os.path.join(RESULTS_DIR, f'{name}_results.err'), 'w')
             proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f)
             procs.append((name, proc, out_f, err_f))
 
@@ -224,7 +225,7 @@ def main():
             if proc.returncode == 0:
                 print(f"  [done] {name}")
             else:
-                print(f"  [FAIL] {name} (see /tmp/{name}_results.err)")
+                print(f"  [FAIL] {name} (see {os.path.join(RESULTS_DIR, f'{name}_results.err')})")
                 failed += 1
 
     num_skipped = len(skip_set)

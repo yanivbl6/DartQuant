@@ -5,7 +5,7 @@ Visualize DartQuant experiment results from cached .pb files.
 Usage:
     python show_results.py -s                    # summary table (all runs, with FP16 baseline)
     python show_results.py -s --nbl              # summary table, no FP16 baseline
-    python show_results.py -s /tmp/quarot*.pb    # only matching files
+    python show_results.py -s data/cached_results/quarot*.pb  # only matching files
 """
 
 import argparse
@@ -14,6 +14,9 @@ import json
 import os
 import re
 import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RESULTS_DIR = os.path.join(SCRIPT_DIR, '..', 'data', 'cached_results')
 
 
 # ── Palette (ANSI 256-color) ────────────────────────────────────────────────
@@ -412,7 +415,7 @@ def _find_best_baseline(model_name, matched_paths):
     it shares with the matched files."""
     from collections import Counter
 
-    candidates = glob.glob(f"/tmp/full_{model_name}_*_results.pb")
+    candidates = glob.glob(os.path.join(RESULTS_DIR, f"full_{model_name}_*_results.pb"))
     if not candidates:
         return []
 
@@ -436,7 +439,7 @@ def _find_best_baseline(model_name, matched_paths):
     # Return the best-matching baseline; if there are ties (e.g. with/without
     # pwl), include all that share the top score
     best_score = scored[0][0]          
-    return [f"/tmp/full_{model_name}_w16a16k16v16_g128_aAsym_kAsym_vAsym_kvex8_projex15_results.pb"]
+    return [os.path.join(RESULTS_DIR, f"full_{model_name}_w16a16k16v16_g128_aAsym_kAsym_vAsym_kvex8_projex15_results.pb")]
     return [c for s, c in scored if s == best_score]
 
 
@@ -502,7 +505,7 @@ def main():
   python show_results.py -s "static,pwl|w8"        # AND+NOT: *static* AND *pwl* but NOT *w8*
   python show_results.py -s "static*pwl"           # glob: *static*pwl*
   python show_results.py -s --nbl                  # exclude FP16 baseline
-  python show_results.py -s /tmp/quarot*.pb        # literal paths (shell glob)""",
+  python show_results.py -s data/cached_results/quarot*.pb  # literal paths (shell glob)""",
     )
     parser.add_argument("-s", "--summary", action="store_true",
                         help="Show summary table of all results")
@@ -518,7 +521,7 @@ def main():
         return
 
     # ── Gather files ────────────────────────────────────────────────────
-    all_results = glob.glob("/tmp/*_results.pb")
+    all_results = glob.glob(os.path.join(RESULTS_DIR, "*_results.pb"))
 
     if not args.filters:
         paths = all_results
@@ -565,7 +568,7 @@ def main():
                 gguf_tags.add(tag)
         for model in models:
             for tag in sorted(gguf_tags):
-                for candidate in glob.glob(f"/tmp/full_{model}_*_{tag}_results.pb"):
+                for candidate in glob.glob(os.path.join(RESULTS_DIR, f"full_{model}_*_{tag}_results.pb")):
                     if candidate not in path_set:
                         paths.append(candidate)
                         path_set.add(candidate)

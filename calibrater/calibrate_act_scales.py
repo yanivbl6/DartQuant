@@ -14,7 +14,7 @@ Explicit paths (override auto-deduction):
     python calibrate_act_scales.py --mode dart -m 1b --sym \
         --r1_path /path/to/r1 --r2_path /path/to/r2 \
         --save_path /path/to/scales.pt \
-        --gptq_checkpoint_path /tmp/my_ckpt
+        --gptq_checkpoint_path data/gptq_checkpoints/my_ckpt
 """
 
 import torch
@@ -523,7 +523,7 @@ def main():
     if args.save_path is None:
         args.save_path = f"../data/act_scales/{model_name}/{save_prefix}_{quant_tag}.pt"
     if args.gptq_checkpoint_path is None:
-        args.gptq_checkpoint_path = f"/tmp/{save_prefix}_{model_name}_{quant_tag}"
+        args.gptq_checkpoint_path = f"../data/gptq_checkpoints/{save_prefix}_{model_name}_{quant_tag}"
 
     # --- Print resolved config ---
     print(f"Mode:       {args.mode}")

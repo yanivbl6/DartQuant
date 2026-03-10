@@ -204,13 +204,14 @@ else
 fi
 
 MODEL_NAME=$(basename "${MODEL%/}")
+SCRIPT_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
+DATA_DIR="${SCRIPT_BASE}/data"
 
 # --- Resolve GGUF path ---
 # GGUF can be a quant-type shorthand (Q4_K_M, Q4_K_S) or an explicit path.
 if [ -n "$GGUF" ] && [[ "$GGUF" != */* ]] && [[ "$GGUF" != *.gguf ]]; then
     # Shorthand like Q4_K_M -> look up in quantized_models/
-    SCRIPT_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
-    GGUF_DIR="${SCRIPT_BASE}/../quantized_models"
+    GGUF_DIR="${DATA_DIR}/quantized_models"
     GGUF_FILE="${GGUF_DIR}/${MODEL_NAME}-${GGUF}.gguf"
     if [ ! -f "$GGUF_FILE" ]; then
         echo "Error: GGUF file not found: ${GGUF_FILE}"
@@ -413,7 +414,7 @@ else
 fi
 
 if [ "$REDO_GPTQ" == "1" ]; then
-    GPTQ_DIR="/tmp/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG}"
+    GPTQ_DIR="${DATA_DIR}/gptq_checkpoints/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG}"
     if [ -z "$SAVE_PREFIX" ] || [ -z "$MODEL_NAME" ] || [ -z "$QUANT_TAG" ]; then
         echo "Error: refusing to rm -rf with empty path components"
         exit 1
@@ -439,8 +440,8 @@ TRANSFORMERS_OFFLINE=1 \
 python main_for_test.py \
     --model ${MODEL} \
     ${ROTATION_FLAGS} \
-    --gptq_checkpoint_path /tmp/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG} \
-    --cache_path /tmp/${STATIC_TAG}${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG}_results.pb \
+    --gptq_checkpoint_path ${DATA_DIR}/gptq_checkpoints/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG} \
+    --cache_path ${DATA_DIR}/cached_results/${STATIC_TAG}${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG}_results.pb \
     ${OVERWRITE_FLAG} \
     --w_groupsize ${GROUPSIZE} \
     --w_clip \

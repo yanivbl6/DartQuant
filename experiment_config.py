@@ -64,7 +64,7 @@ def model_name_from_path(model_path):
 
 # ── GGUF resolution ──────────────────────────────────────────────────────────
 
-GGUF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'quantized_models')
+GGUF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'quantized_models')
 
 
 def resolve_gguf_path(gguf_arg, model_path):
@@ -72,8 +72,8 @@ def resolve_gguf_path(gguf_arg, model_path):
 
     gguf_arg can be:
       - None      -> return None
-      - 'Q4_K_M'  -> lookup ../quantized_models/<ModelName>-Q4_K_M.gguf
-      - 'Q4_K_S'  -> lookup ../quantized_models/<ModelName>-Q4_K_S.gguf
+      - 'Q4_K_M'  -> lookup data/quantized_models/<ModelName>-Q4_K_M.gguf
+      - 'Q4_K_S'  -> lookup data/quantized_models/<ModelName>-Q4_K_S.gguf
       - '/path/to/file.gguf' -> return as-is
     """
     if gguf_arg is None:
