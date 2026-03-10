@@ -74,6 +74,13 @@ def _extract_model_name(path):
     return m.group(1) if m else ""
 
 
+def _extract_gguf_tag(path):
+    """Extract GGUF tag (e.g. 'gguf-Q4-K-M') from a result filename, or None."""
+    base = os.path.basename(path)
+    m = re.search(r'(gguf-[A-Za-z0-9-]+)', base)
+    return m.group(1) if m else None
+
+
 def parse_filename(path):
     """Extract mode and quant config from filename."""
     base = os.path.basename(path).replace("_results.pb", "")
@@ -162,8 +169,8 @@ def _factor_labels(labels):
 
 
 def load_results(paths):
-    """Load all .pb files, returns list of (label, data, mode) tuples.
-    Sorted so 'full' always comes first, then alphabetically by label."""
+    """Load all .pb files, returns list of (label, data, mode, path) tuples.
+    Sorted: FP full first, then GGUF full, then alphabetically by label."""
     runs = []
     for p in sorted(paths):
         if not os.path.isfile(p):
@@ -176,9 +183,17 @@ def load_results(paths):
         mode, tag = parse_filename(p)
         label = short_label(mode, tag)
 
-        runs.append((label, data, mode))
-    # Sort: full first, then alphabetically by label
-    runs.sort(key=lambda r: (0 if r[2] == "full" else 1, r[0]))
+        runs.append((label, data, mode, p))
+    # Sort: FP full (no gguf) first, then GGUF full, then the rest
+    def _sort_key(r):
+        _, _, mode, path = r
+        gguf_tag = _extract_gguf_tag(path)
+        if mode == "full" and not gguf_tag:
+            return (0, r[0])
+        if mode == "full" and gguf_tag:
+            return (1, gguf_tag)
+        return (2, r[0])
+    runs.sort(key=_sort_key)
     return runs
 
 
@@ -208,22 +223,27 @@ def print_summary(runs):
 
     # Build data matrix — factor out common prefix from labels
     # Exclude "full" runs from factoring so they don't dilute the common prefix
-    full_indices = {i for i, (_, _, m) in enumerate(runs) if m == "full"}
+    full_indices = {i for i, r in enumerate(runs) if r[2] == "full"}
     non_full_labels = [r[0] for i, r in enumerate(runs) if i not in full_indices]
     common_prefix, short_non_full = _factor_labels(non_full_labels)
     # Reconstruct labels list with full runs keeping their original label
     labels = []
     nf_idx = 0
-    for i, (raw_label, _, mode) in enumerate(runs):
+    for i, (raw_label, _, mode, path) in enumerate(runs):
         if i in full_indices:
-            labels.append("FP32 baseline")
+            gguf_tag = _extract_gguf_tag(path)
+            if gguf_tag:
+                # e.g. "gguf-Q4-K-M" -> "GGUF Q4-K-M baseline"
+                labels.append(f"GGUF {gguf_tag.replace('gguf-', '')} baseline")
+            else:
+                labels.append("FP16 baseline")
         else:
             labels.append(short_non_full[nf_idx])
             nf_idx += 1
     matrix = []  # matrix[run_idx][col_idx] = value or None
     is_ppl = []  # True for PPL columns
 
-    for label, data, mode in runs:
+    for label, data, mode, _path in runs:
         row = []
         for d in ppl_datasets:
             row.append(data.get(f"ppl/{d}"))
@@ -296,7 +316,6 @@ def print_summary(runs):
     for r in range(n_runs):
         label = labels[r]
         mode = runs[r][2]
- 
 
         # Color the label by mode
         mode_colors = {"full": CYAN, "baseline": YELLOW, "quarot": MAGENTA, "dart": GREEN}
@@ -311,9 +330,13 @@ def print_summary(runs):
 
         # Separator between runs (not after last)
         if r < n_runs - 1:
-            # Thick divider after the full-precision baseline
-            if mode == "full":
+            next_mode = runs[r + 1][2]
+            # Thick divider after the last full-precision baseline row
+            if mode == "full" and next_mode != "full":
                 print(hline(widths, char="━", left="┠", mid="╋", right="┨"))
+            elif mode == "full" and next_mode == "full":
+                # Thin divider between baselines (FP16 vs GGUF)
+                print(hline(widths, char="─", left="├", mid="┼", right="┤"))
             else:
                 print(hline(widths, char="┄", left="├", mid="┼", right="┤"))
 
@@ -322,8 +345,8 @@ def print_summary(runs):
 
     # ── Delta vs FP16 baseline ──────────────────────────────────────────
     full_idx = None
-    for i, (_, _, mode) in enumerate(runs):
-        if mode == "full":
+    for i, (_, _, mode, path) in enumerate(runs):
+        if mode == "full" and not _extract_gguf_tag(path):
             full_idx = i
             break
 
@@ -534,10 +557,23 @@ def main():
                     paths.append(bl)
                     path_set.add(bl)
 
+        # Auto-include GGUF full-precision baselines when GGUF runs are present
+        gguf_tags = set()
+        for p in list(paths):
+            tag = _extract_gguf_tag(p)
+            if tag and not os.path.basename(p).startswith("full_"):
+                gguf_tags.add(tag)
+        for model in models:
+            for tag in sorted(gguf_tags):
+                for candidate in glob.glob(f"/tmp/full_{model}_*_{tag}_results.pb"):
+                    if candidate not in path_set:
+                        paths.append(candidate)
+                        path_set.add(candidate)
+
     runs = load_results(paths)
 
     if args.no_baseline:
-        runs = [(l, d, m) for l, d, m in runs if m != "full"]
+        runs = [r for r in runs if r[2] != "full"]
 
     print_summary(runs)
 
