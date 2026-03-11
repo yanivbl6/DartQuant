@@ -1,0 +1,19 @@
+# BYOW (Bring Your Own Weights) experiment runs
+# Format: name: MODE [args for dart_gptq_wxaykvz.sh, without -g]
+# Completed runs are marked or [ERROR] automatically.
+#
+# Usage: python run_experiments.py --runfile runs_byow.txt -g 2,3,4
+
+# --- Baseline: GGUF weights with no GPTQ ---
+[DONE] baseline_nogptq: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --sym --kv_ex 8 --proj_ex 15 --gguf Q4_K_M --gptq_strength 0.0
+
+# --- GPTQ strength sweep ---
+[DONE] baseline_gptqs20: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --sym --kv_ex 8 --proj_ex 15 --gguf Q4_K_M --gptq_strength 0.2
+[DONE] baseline_gptqs40: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --sym --kv_ex 8 --proj_ex 15 --gguf Q4_K_M --gptq_strength 0.4
+[DONE] baseline_gptqs60: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --sym --kv_ex 8 --proj_ex 15 --gguf Q4_K_M --gptq_strength 0.6
+[DONE] baseline_gptqs80: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --sym --kv_ex 8 --proj_ex 15 --gguf Q4_K_M --gptq_strength 0.8
+
+# --- Dart mode comparisons ---
+# dart_nogptq: dart -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --sym --kv_ex 8 --proj_ex 15 --gguf Q4_K_M --gptq_strength 0.0 --very-fast
+# dart_gptqs50: dart -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --sym --kv_ex 8 --proj_ex 15 --gguf Q4_K_M --gptq_strength 0.5 --very-fast
+# dart_fullgptq: dart -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --sym --kv_ex 8 --proj_ex 15 --gguf Q4_K_M --very-fast

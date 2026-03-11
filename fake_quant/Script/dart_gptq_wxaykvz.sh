@@ -54,6 +54,7 @@ Options:
   --sd_check_norm N    Norm for sd_check: 1, 2, or inf                   (default: inf)
   --selective-dyn P    Comma-separated layer patterns to force dynamic    (e.g., "v_proj,o_proj")
   --weights_stats F  Write weight sparsity stats to file F
+  --gptq_strength F  GPTQ error-propagation strength (0.0–1.0, default: 1.0)
   --gguf TYPE      Use GGUF pre-quantized weights (e.g. Q4_K_M, Q4_K_S, or path)
   --quant_warnings Warn on GGUF vs config quantization mismatches
   --wait           Wait for a clear GPU (polls every 20s, overrides -g)
@@ -123,6 +124,7 @@ SELECTIVE_DYN=""
 WEIGHTS_STATS=""
 GGUF=""
 GSCALER=""
+GPTQ_STRENGTH=""
 QUANT_WARNINGS=0
 WAIT_GPU=0
 MAX_USED_MB=200
@@ -159,6 +161,7 @@ while [[ $# -gt 0 ]]; do
         --weights_stats) WEIGHTS_STATS="$2"; shift 2 ;;
         --gguf)        GGUF="$2";           shift 2 ;;
         --gscaler)     GSCALER="$2";        shift 2 ;;
+        --gptq_strength) GPTQ_STRENGTH="$2"; shift 2 ;;
         --quant_warnings) QUANT_WARNINGS=1; shift   ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
@@ -312,6 +315,11 @@ if [ -n "$GSCALER" ]; then
     GSCALER_FLAG="--gscaler ${GSCALER}"
 fi
 
+GPTQ_STRENGTH_FLAG=""
+if [ -n "$GPTQ_STRENGTH" ]; then
+    GPTQ_STRENGTH_FLAG="--gptq_strength ${GPTQ_STRENGTH}"
+fi
+
 GGUF_FLAG=""
 GGUF_TAG_FLAG=""
 QUANT_WARN_FLAG=""
@@ -332,6 +340,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ -n "$INT_GEMM_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${INT_GEMM_FLAG}"
 [ -n "$SMQ_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${SMQ_FLAG}"
 [ -n "$GGUF_TAG_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GGUF_TAG_FLAG}"
+[ -n "$GPTQ_STRENGTH_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GPTQ_STRENGTH_FLAG}"
 [ -n "$GSCALER_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GSCALER_FLAG}"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -339,6 +348,13 @@ QUANT_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS})
 if [ $? -ne 0 ] || [ -z "$QUANT_TAG" ]; then
     echo "Error: failed to build quant tag"
     exit 1
+fi
+
+# Build a separate cache tag for GPTQ checkpoints (excludes gptq_strength
+# so all strength values share a single cached GPTQ run).
+GPTQ_CACHE_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS} --for_gptq_cache)
+if [ $? -ne 0 ] || [ -z "$GPTQ_CACHE_TAG" ]; then
+    GPTQ_CACHE_TAG="$QUANT_TAG"  # fallback
 fi
 
 # --- Static vs Dynamic check flags ---
@@ -398,8 +414,8 @@ else
 fi
 
 if [ "$REDO_GPTQ" == "1" ]; then
-    GPTQ_DIR="${DATA_DIR}/gptq_checkpoints/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG}"
-    if [ -z "$SAVE_PREFIX" ] || [ -z "$MODEL_NAME" ] || [ -z "$QUANT_TAG" ]; then
+    GPTQ_DIR="${DATA_DIR}/gptq_checkpoints/${SAVE_PREFIX}_${MODEL_NAME}_${GPTQ_CACHE_TAG}"
+    if [ -z "$SAVE_PREFIX" ] || [ -z "$MODEL_NAME" ] || [ -z "$GPTQ_CACHE_TAG" ]; then
         echo "Error: refusing to rm -rf with empty path components"
         exit 1
     fi
@@ -424,7 +440,7 @@ TRANSFORMERS_OFFLINE=1 \
 python main_for_test.py \
     --model ${MODEL} \
     ${ROTATION_FLAGS} \
-    --gptq_checkpoint_path ${DATA_DIR}/gptq_checkpoints/${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG} \
+    --gptq_checkpoint_path ${DATA_DIR}/gptq_checkpoints/${SAVE_PREFIX}_${MODEL_NAME}_${GPTQ_CACHE_TAG} \
     --cache_path ${DATA_DIR}/cached_results/${STATIC_TAG}${SAVE_PREFIX}_${MODEL_NAME}_${QUANT_TAG}_results.pb \
     ${OVERWRITE_FLAG} \
     --w_groupsize ${GROUPSIZE} \
@@ -449,6 +465,7 @@ python main_for_test.py \
     ${GGUF_FLAG} \
     ${QUANT_WARN_FLAG} \
     ${GSCALER_FLAG} \
+    ${GPTQ_STRENGTH_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     --percdamp 0.1 \

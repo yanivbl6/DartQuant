@@ -90,10 +90,17 @@ def get_minq_maxq(bits, sym):
     return minq, maxq
 
 
-def asym_quant(x, scale, zero, maxq):
+def _stochastic_round(x):
+    """Round with probability proportional to fractional part (unbiased)."""
+    floor = x.floor()
+    return floor + (torch.rand_like(x) < (x - floor)).to(x.dtype)
+
+
+def asym_quant(x, scale, zero, maxq, stochastic=False):
     scale = scale.to(x.device)
     zero = zero.to(x.device)
-    q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
+    _round = _stochastic_round if stochastic else torch.round
+    q = torch.clamp(_round(x / scale) + zero, 0, maxq)
     return q, scale, zero
 
 
@@ -101,13 +108,14 @@ def asym_dequant(q, scale, zero):
     return scale * (q - zero)
 
 
-def asym_quant_dequant(x, scale, zero, maxq):
-    return asym_dequant(*asym_quant(x, scale, zero, maxq))
+def asym_quant_dequant(x, scale, zero, maxq, stochastic=False):
+    return asym_dequant(*asym_quant(x, scale, zero, maxq, stochastic=stochastic))
 
 
-def sym_quant(x, scale, maxq):
+def sym_quant(x, scale, maxq, stochastic=False):
     scale = scale.to(x.device)
-    q = torch.clamp(torch.round(x / scale), -(maxq + 1), maxq)
+    _round = _stochastic_round if stochastic else torch.round
+    q = torch.clamp(_round(x / scale), -(maxq + 1), maxq)
     return q, scale
 
 
@@ -115,8 +123,8 @@ def sym_dequant(q, scale):
     return scale * q
 
 
-def sym_quant_dequant(x, scale, maxq):
-    return sym_dequant(*sym_quant(x, scale, maxq))
+def sym_quant_dequant(x, scale, maxq, stochastic=False):
+    return sym_dequant(*sym_quant(x, scale, maxq, stochastic=stochastic))
 
 
 def two_compl(x, bits: int):
@@ -780,13 +788,14 @@ class WeightQuantizer(torch.nn.Module):
         return
 
     # TODO: This should be better refactored into `forward`, which applies quantize and dequantize. A new method `quantize` should be added (if needed) to return the quantized integers and scales, like in ActQuantizer.
-    def quantize(self, x):
+    def quantize(self, x, stochastic=False):
         x_dtype = x.dtype
         if self.ready() and self.bits < 16:
             if self.sym:
-                return sym_quant_dequant(x, self.scale, self.maxq).to(x_dtype)
+                return sym_quant_dequant(x, self.scale, self.maxq,
+                                         stochastic=stochastic).to(x_dtype)
             return asym_quant_dequant(x, self.scale, self.zero,
-                                      self.maxq).to(x_dtype)
+                                      self.maxq, stochastic=stochastic).to(x_dtype)
         return x
 
     def enabled(self):

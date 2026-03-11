@@ -165,6 +165,11 @@ def add_quant_args(parser):
     parser.add_argument('--weights_stats', type=str, default=None,
                         help='Base path for weight sparsity stats (mode suffix added automatically)')
 
+    # GPTQ strength
+    parser.add_argument('--gptq_strength', type=float, default=1.0,
+                        help='GPTQ error-propagation strength (0.0=no compensation, 1.0=full). '
+                             'Values < 1.0 weaken GPTQ for bring-your-own-weights flows.')
+
     # Group scale quantization
     parser.add_argument('--gscaler', type=str, default=None,
                         help='Group scale format: M5S3, M6E4b2, M6S4l2, etc. '
@@ -179,12 +184,15 @@ def resolve_v_bits(args):
 
 # ── Quant-tag and path helpers ───────────────────────────────────────────────
 
-def build_quant_tag(args):
+def build_quant_tag(args, for_gptq_cache=False):
     """Build the canonical quant-tag string from parsed args.
 
     This is the SINGLE SOURCE OF TRUTH for tag construction.
     Called by: calibrate_act_scales.py, analyze_scales.py, run_experiments.py,
     and dart_gptq_wxaykvz.sh (via ``python experiment_config.py``).
+
+    If *for_gptq_cache* is True, the gptq_strength suffix is omitted so that
+    all strength values share the same GPTQ checkpoint cache.
     """
     sym_tag = "wSym_kSym_vSym" if args.sym else "kAsym_vAsym"
     tag = f"w{args.w_bits}a{args.a_bits}k{args.k_bits}v{args.v_bits}_g{args.groupsize}_aAsym_{sym_tag}"
@@ -224,6 +232,13 @@ def build_quant_tag(args):
         parts = basename.split('-')
         qtype = '-'.join(p for p in parts if p.startswith('Q')) or 'gguf'
         tag += f"_gguf-{qtype.replace('_', '-')}"
+    # GPTQ strength tag (omitted for GPTQ cache so all strengths share one checkpoint)
+    if not for_gptq_cache:
+        _gs = getattr(args, 'gptq_strength', 1.0)
+        if _gs == 0.0:
+            tag += "_no-gptq"
+        elif _gs != 1.0:
+            tag += f"_gptqs{round(_gs * 100)}"
     # Group scaler tag
     if getattr(args, 'gscaler', None):
         tag += f"_G-scaler-{args.gscaler}"
@@ -283,6 +298,8 @@ def build_quant_args(args):
         cmd.append('--quant_warnings')
     if getattr(args, 'weights_stats', None):
         cmd += ['--weights_stats', args.weights_stats]
+    if getattr(args, 'gptq_strength', 1.0) != 1.0:
+        cmd += ['--gptq_strength', str(args.gptq_strength)]
     if getattr(args, 'gscaler', None):
         cmd += ['--gscaler', args.gscaler]
     return cmd
@@ -296,7 +313,9 @@ if __name__ == '__main__':
     _parser = _ap.ArgumentParser(description='Print the quant tag for the given args')
     add_model_arg(_parser)
     add_quant_args(_parser)
+    _parser.add_argument('--for_gptq_cache', action='store_true',
+                         help='Omit gptq_strength from tag (for shared GPTQ cache)')
     _args = _parser.parse_args()
     resolve_v_bits(_args)
     _args.model = resolve_model(_args.model)
-    print(build_quant_tag(_args))
+    print(build_quant_tag(_args, for_gptq_cache=_args.for_gptq_cache))

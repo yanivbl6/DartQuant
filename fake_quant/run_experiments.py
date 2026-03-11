@@ -9,11 +9,22 @@ Usage:
     python run_experiments.py -m 1b -w 4 -a 8 -k 8 -G 128 --sym --kv_ex 8 --proj_ex 15
     python run_experiments.py -m 1b --calibrate
     python run_experiments.py -m 3b -w 4 -a 8 -k 4 --sym --fast
+
+Runfile mode — run diverse experiments from an external file:
+    python run_experiments.py --runfile runs.txt -g 2,3,4
+
+  Runfile format (one run per line):
+    name: MODE [args for dart_gptq_wxaykvz.sh, WITHOUT -g]
+    # lines starting with # are comments
+    # completed runs are marked automatically:
+    [DONE] name: MODE args...
+    [ERROR] name: MODE args...
 """
 
 import argparse
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -98,7 +109,9 @@ Examples:
   python run_experiments.py -m 1b --calibrate
   python run_experiments.py -m 3b --fast
 """)
+    # -m is required for standard mode but not for --runfile
     cfg.add_model_arg(parser)
+    parser._option_string_actions['-m'].required = False
     cfg.add_quant_args(parser)
 
     parser.add_argument('-g', '--gpus', type=str, default='1',
@@ -124,8 +137,15 @@ Examples:
                         help='Run experiments one at a time, each with --wait for a clear GPU')
     parser.add_argument('--max_used_mb', type=int, default=200,
                         help='Max used memory (MiB) for --sequential GPU waiting (default: 200)')
+    parser.add_argument('--refresh', type=int, default=15,
+                        help='Status refresh interval in seconds (default: 15)')
     parser.add_argument('--dry', action='store_true',
                         help='Print commands without running them')
+
+    parser.add_argument('--runfile', type=str, default=None,
+                        help='Path to a runfile with custom per-run commands. '
+                             'When set, -m and quant args are ignored; runs are '
+                             'read from the file instead. See module docstring.')
 
     return parser.parse_args()
 
@@ -153,7 +173,7 @@ def build_experiment_cmd(mode, gpu, quant_args, extra_flags, args, use_wait=Fals
     if args.very_fast:
         cmd.append('--very-fast')
     elif args.fast:
-        cmd.append('-F')
+        cmd.append('--fast')
 
     return cmd
 
@@ -171,8 +191,176 @@ def run_calibration(model, gpu_id):
     print()
 
 
+def parse_runfile(path):
+    """Parse a runfile, returning unmarked entries.
+
+    Returns list of (name, cmd_args_string) for lines that
+    don't start with [DONE] or [ERROR].
+    """
+    entries = []
+    with open(path) as f:
+        for i, raw in enumerate(f):
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('[DONE]') or line.startswith('[ERROR]'):
+                continue
+            colon = line.find(':')
+            if colon == -1:
+                print(f"Warning: skipping malformed line {i+1}: {line}")
+                continue
+            name = line[:colon].strip()
+            cmd_args = line[colon+1:].strip()
+            entries.append((name, cmd_args))
+    return entries
+
+
+def mark_runfile(path, name, status):
+    """Mark a run in the runfile by matching its name prefix.
+
+    Safe to call even if the file was edited (lines added/removed)
+    while runs were in progress.
+    """
+    with open(path) as f:
+        lines = f.readlines()
+    prefix = '[DONE] ' if status == 'done' else '[ERROR] '
+    target = name + ':'
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(target):
+            lines[i] = prefix + stripped if stripped.endswith('\n') else prefix + stripped + '\n'
+            break
+    with open(path, 'w') as f:
+        f.writelines(lines)
+
+
+def run_from_file(args):
+    """Run experiments defined in a runfile."""
+    runfile = args.runfile
+    entries = parse_runfile(runfile)
+    if not entries:
+        print("No unmarked runs found in runfile.")
+        return
+
+    # Parse GPUs
+    gpu_str = args.gpus
+    parts = gpu_str.split(',')
+    if len(parts) == 1:
+        s = int(parts[0])
+        gpus = list(range(s, s + len(entries)))
+    else:
+        gpus = [int(p) for p in parts]
+
+    # Take first len(gpus) unmarked runs
+    batch = entries[:len(gpus)]
+
+    # Parse skip set (1-indexed within the batch)
+    skip_set = set()
+    if args.skip:
+        skip_set = {int(x) for x in args.skip.split(',')}
+
+    script = os.path.join(SCRIPT_DIR, 'Script', 'dart_gptq_wxaykvz.sh')
+
+    print(f"=== {len(batch)} runs from {runfile} ({len(entries)} total pending) ===\n")
+
+    cmds = []
+    for i, (name, cmd_args) in enumerate(batch):
+        idx = i + 1
+        gpu = gpus[i % len(gpus)]
+        cmd = [script] + shlex.split(cmd_args) + ['-g', str(gpu)]
+        if args.overwrite:
+            cmd.append('--overwrite')
+        if args.gptq:
+            cmd.append('--gptq')
+        if args.very_fast:
+            cmd.append('--very-fast')
+        elif args.fast:
+            cmd.append('-F')
+        if idx in skip_set:
+            cmds.append((name, cmd, True))
+            print(f"  [skipped] {name}: {' '.join(cmd)}")
+        else:
+            cmds.append((name, cmd, False))
+            print(f"  [GPU {gpu}] {name}: {' '.join(cmd)}")
+
+    if args.dry:
+        return
+
+    # Clean old log files
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    for name, cmd, skipped in cmds:
+        if skipped:
+            continue
+        log_path = os.path.join(RESULTS_DIR, f'{name}.log')
+        if os.path.exists(log_path):
+            os.remove(log_path)
+
+    # Launch — procs uses the same 3-tuple as _print_status expects
+    active = [(name, cmd) for name, cmd, skipped in cmds if not skipped]
+
+    procs = []
+    log_files = []
+    for name, cmd in active:
+        log_path = os.path.join(RESULTS_DIR, f'{name}.log')
+        log_f = open(log_path, 'w')
+        proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
+        procs.append((name, proc, log_path))
+        log_files.append(log_f)
+
+    print(f"\n=== Waiting for {len(procs)} runs (refreshing every {args.refresh}s) ===\n")
+
+    _print_status(procs, first_call=True)
+
+    # Track which runs we've already marked
+    marked = set()
+
+    while any(proc.poll() is None for _, proc, _ in procs):
+        time.sleep(args.refresh)
+        _print_status(procs)
+        # Mark completed runs as they finish
+        for name, proc, log_path in procs:
+            if name in marked:
+                continue
+            rc = proc.poll()
+            if rc is not None:
+                mark_runfile(runfile, name, 'done' if rc == 0 else 'error')
+                marked.add(name)
+
+    # Final status refresh
+    _print_status(procs)
+
+    # Mark any remaining
+    for name, proc, log_path in procs:
+        if name not in marked:
+            rc = proc.returncode
+            mark_runfile(runfile, name, 'done' if rc == 0 else 'error')
+
+    for lf in log_files:
+        lf.close()
+
+    failed = sum(1 for _, proc, _ in procs if proc.returncode != 0)
+    print()
+    if failed == 0:
+        print(f"=== All {len(procs)} runs completed successfully ===")
+    else:
+        print(f"=== {failed} run(s) failed ===")
+
+    remaining = len(entries) - len(batch)
+    if remaining > 0:
+        print(f"=== {remaining} runs still pending in {runfile} — re-run to continue ===")
+
+
 def main():
     args = parse_args()
+
+    if args.runfile:
+        run_from_file(args)
+        return
+
+    if not args.model:
+        print("Error: -m/--model is required (unless using --runfile)")
+        sys.exit(1)
+
     cfg.resolve_v_bits(args)
     quant_args = cfg.build_quant_args(args)
 
@@ -241,7 +429,7 @@ def main():
     num_run = len(active_cmds)
 
     if args.sequential:
-        # Run one at a time; between runs wait 30s then poll for a clear GPU
+        # Run one at a time; between runs wait then poll for a clear GPU
         sys.path.insert(0, os.path.join(SCRIPT_DIR, '..', 'utils'))
         from gpu_wait import wait_for_gpu
 
@@ -260,10 +448,10 @@ def main():
                 print(f"  [FAIL] {name} (see {log_path})")
                 failed += 1
 
-            # After each run (except the last), wait 30s then poll for a clear GPU
+            # After each run (except the last), wait then poll for a clear GPU
             if i < len(active_cmds) - 1:
-                print(f"  Cooling down 30s before next experiment ...")
-                time.sleep(30)
+                print(f"  Cooling down {args.refresh}s before next experiment ...")
+                time.sleep(args.refresh)
                 wait_for_gpu(max_used_mb=args.max_used_mb, poll_interval=30)
     else:
         # Launch all in parallel
@@ -276,14 +464,14 @@ def main():
             procs.append((name, proc, log_path))
             log_files.append(log_f)
 
-        print(f"=== Waiting for all experiments (refreshing every 30s) ===\n")
+        print(f"=== Waiting for all experiments (refreshing every {args.refresh}s) ===\n")
 
         # Print initial status block
         _print_status(procs, first_call=True)
 
-        # Poll until all done, refreshing every 30s
+        # Poll until all done, refreshing every {args.refresh}s
         while any(proc.poll() is None for _, proc, _ in procs):
-            time.sleep(30)
+            time.sleep(args.refresh)
             _print_status(procs)
 
         # Final refresh to show done/fail status for all

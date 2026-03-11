@@ -124,6 +124,14 @@ def main():
                 f'{model.model_name}_w{args.w_bits}'
             )
 
+        # Snapshot weights for GPTQ strength blending (strength 0→RTN, 1→full GPTQ)
+        gptq_strength = getattr(args, 'gptq_strength', 1.0)
+        orig_weights = {}
+        if 0.0 < gptq_strength < 1.0:
+            for pname, param in model.named_parameters():
+                if pname.startswith('model.layers.') and 'weight' in pname and param.dim() == 2:
+                    orig_weights[pname] = param.data.clone()
+
         if args.load_qmodel_path:  # Load Quantized Rotated Model
             # assert args.fuse_norm, "Model should be fused to load a quantized model!"
             assert not args.save_qmodel_path, "Cannot save a quantized model if it is already loaded!"
@@ -132,13 +140,13 @@ def main():
             # save_dict = torch.load(args.load_qmodel_path, map_location='cpu')
             # model.load_state_dict(save_dict["model"])
 
-        elif _gptq_ckpt and os.path.isdir(_gptq_ckpt) and any(
+        elif gptq_strength > 0.0 and _gptq_ckpt and os.path.isdir(_gptq_ckpt) and any(
                 f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
             logging.info("Loading GPTQ checkpoint from: {}".format(_gptq_ckpt))
             utils.load_model_in_parts(model, _gptq_ckpt)
             logging.info("GPTQ checkpoint loaded – skipping quantization.")
 
-        elif not args.w_rtn:  # GPTQ Weight Quantization
+        elif gptq_strength > 0.0 and not args.w_rtn:  # GPTQ Weight Quantization
             assert "llama" in args.model, "Only llama is supported for GPTQ!"
 
             trainloader = data_utils.get_loaders(
@@ -159,7 +167,7 @@ def main():
                 utils.save_model_in_parts(model, _gptq_ckpt,
                                           prefix=f'{model.model_name}_part')
 
-        else:  # RTN Weight Quantization
+        else:  # RTN Weight Quantization (also used when gptq_strength=0.0)
 
             if args.w_ft:  # 精度补偿：
                 trainloader = data_utils.get_loaders(
@@ -170,6 +178,18 @@ def main():
                 w_fine_tuning.w_ft(model, trainloader, utils.DEV, args)
             quantizers = gptq_utils.rtn_fwrd(model, utils.DEV, args)
             save_dict["w_quantizers"] = quantizers
+
+        # Apply GPTQ strength blending: interpolate original ↔ GPTQ, then RTN re-quantize
+        if orig_weights:
+            logging.info("Applying GPTQ strength %.2f (blending + stochastic re-quantize)", gptq_strength)
+            for pname, param in model.named_parameters():
+                if pname in orig_weights:
+                    w_orig = orig_weights[pname].float()
+                    w_gptq = param.data.float()
+                    param.data = (w_orig + gptq_strength * (w_gptq - w_orig)).to(param.data.dtype)
+            del orig_weights
+            # Snap blended weights back to the quantization grid (stochastic to avoid bias)
+            gptq_utils.rtn_fwrd(model, utils.DEV, args, stochastic=True)
 
         if args.save_qmodel_path:
             folder_name = f'{model.model_name}'

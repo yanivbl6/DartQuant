@@ -38,7 +38,7 @@ class GPTQ:
         self.H += inp.matmul(inp.t())
 
     def fasterquant(
-        self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False
+        self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False,
     ):
         W = self.layer.weight.data.clone()
         W = W.float()
@@ -245,7 +245,7 @@ def gptq_fwrd(model, dataloader, dev, args):
                 layer_w_groupsize = args.w_groupsize
                 loss = gptq[name].fasterquant(
                     percdamp=args.percdamp, groupsize=layer_w_groupsize,
-                    actorder=args.act_order, static_groups=args.w_static_groups
+                    actorder=args.act_order, static_groups=args.w_static_groups,
                 )
                 layer_losses.append(loss)
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
@@ -314,9 +314,9 @@ def gptq_fwrd(model, dataloader, dev, args):
 
 
 @torch.no_grad()
-def rtn_fwrd(model, dev, args):
+def rtn_fwrd(model, dev, args, stochastic=False):
     '''
-    From GPTQ repo 
+    From GPTQ repo
     TODO: Make this function general to support both OPT and LLaMA models
     '''
     layers = model.model.layers
@@ -326,7 +326,8 @@ def rtn_fwrd(model, dev, args):
     static_groups = args.w_static_groups
     groupsize = args.w_groupsize
 
-    for i in tqdm.tqdm(range(len(layers)), desc="(RtN Quant.) Layers"):
+    desc = "(Stochastic Quant.) Layers" if stochastic else "(RtN Quant.) Layers"
+    for i in tqdm.tqdm(range(len(layers)), desc=desc):
         layer = layers[i].to(dev)
 
         subset = quant_utils.find_qlayers(layer,
@@ -366,14 +367,16 @@ def rtn_fwrd(model, dev, args):
                 for j in range(0, W.shape[1], groupsize):
                     if not static_groups:
                         quantizer.find_params(W[:, j:j + groupsize])
-                        quantized_w = quantizer.quantize(W[:, j:j + groupsize])
+                        quantized_w = quantizer.quantize(W[:, j:j + groupsize],
+                                                         stochastic=stochastic)
                     else:
-                        quantized_w = groups[j // groupsize].quantize(W[:, j:j + groupsize])
+                        quantized_w = groups[j // groupsize].quantize(
+                            W[:, j:j + groupsize], stochastic=stochastic)
                     W[:, j:j + groupsize] = quantized_w
 
             else:
                 quantizer.find_params(W)
-                W = quantizer.quantize(W)
+                W = quantizer.quantize(W, stochastic=stochastic)
 
             subset[name].weight.data = W.to(next(iter(layer.parameters())).dtype)
             quantizers['model.layers.%d.%s' % (i, name)] = quantizer.cpu()
