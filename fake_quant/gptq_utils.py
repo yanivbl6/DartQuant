@@ -209,7 +209,14 @@ def gptq_fwrd(model, dataloader, dev, args):
         full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
         layer_losses = []
         for names in sequential:
-            subset = {n: full[n] for n in names}
+            # Some layers may not be wrapped (e.g. k/v_proj when -k 16 -v 16),
+            # so try both the .module name and the bare name.
+            subset = {}
+            for n in names:
+                if n in full:
+                    subset[n] = full[n]
+                elif n.endswith('.module') and n[:-len('.module')] in full:
+                    subset[n[:-len('.module')]] = full[n[:-len('.module')]]
 
             gptq = {}
             for name in subset:
