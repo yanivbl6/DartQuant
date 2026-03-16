@@ -33,6 +33,19 @@ def main():
     model.eval()
     model.model_name = args.model.split('/')[-1]
 
+    # --- Resolve imitate_gguf: build per-layer bit-width map ---
+    if getattr(args, 'imitate_gguf', None):
+        import gguf_utils
+        # imitate_gguf may be a resolved path (from shell script) or shorthand
+        gguf_imitate_path = args.imitate_gguf
+        if not os.path.isfile(gguf_imitate_path):
+            import sys; sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+            from experiment_config import resolve_gguf_path
+            gguf_imitate_path = resolve_gguf_path(args.imitate_gguf, args.model)
+        args.w_bits_map, _imit_label = gguf_utils.get_gguf_bits_map(gguf_imitate_path)
+        logging.info("imitate_gguf: loaded %d layer bit-widths from %s",
+                     len(args.w_bits_map), gguf_imitate_path)
+
     # --- Load GGUF pre-quantized weights (before rotations) ---
     if args.gguf_path:
         import gguf_utils
@@ -110,18 +123,20 @@ def main():
         logging.info("Replaced %d activations with PWL (%s, %d segments, hw_sim=%s)",
                      len(replaced), act_name, args.pwl_n_segments, hw_config is not None)
 
-    if args.w_bits < 16:
-        logging.info("Add weight quantization: w_rtn = {}, w_bits = {}, w_groupsize = {}, w_sym = {}, w_clip = {}".format(
-            args.w_rtn, args.w_bits, args.w_groupsize, not (args.w_asym), args.w_clip))
+    _has_w_bits_map = bool(getattr(args, 'w_bits_map', None))
+    if args.w_bits < 16 or _has_w_bits_map:
+        logging.info("Add weight quantization: w_rtn = {}, w_bits = {}, w_groupsize = {}, w_sym = {}, w_clip = {}, w_bits_map = {}".format(
+            args.w_rtn, args.w_bits, args.w_groupsize, not (args.w_asym), args.w_clip, _has_w_bits_map))
 
         save_dict = {}
 
         # Resolve GPTQ checkpoint path
         _gptq_ckpt = None
         if args.gptq_checkpoint_path:
+            w_suffix = 'w0' if _has_w_bits_map else f'w{args.w_bits}'
             _gptq_ckpt = os.path.join(
                 args.gptq_checkpoint_path,
-                f'{model.model_name}_w{args.w_bits}'
+                f'{model.model_name}_{w_suffix}'
             )
 
         # Snapshot weights for GPTQ strength blending (strength 0→RTN, 1→full GPTQ)

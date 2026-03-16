@@ -353,6 +353,8 @@ Examples:
                         help='Group size for W, K, V (default: 128)')
     parser.add_argument('--sym', action='store_true',
                         help='Symmetric K/V quantization (default: asymmetric)')
+    parser.add_argument('--w_asym', action='store_true',
+                        help='Asymmetric weight quantization (default: symmetric)')
 
     # Rarely changed tuning knobs
     parser.add_argument('--a_clip_ratio', type=float, default=0.9)
@@ -400,6 +402,11 @@ Examples:
     # Softmax Output Quantization
     parser.add_argument('--smq', type=int, default=0,
                         help='Softmax output quantization bits (0=disabled)')
+
+    # GGUF imitation (per-layer bit-width matching)
+    parser.add_argument('--imitate_gguf', type=str, default=None,
+                        help='Match per-layer weight bit-widths from a GGUF file. '
+                             'Pass a quant type (e.g. Q4_K_M) or explicit .gguf path.')
 
     # GGUF pre-quantized weights
     parser.add_argument('--gguf', type=str, default=None,
@@ -472,9 +479,7 @@ def main():
     args.a_asym = True
     args.k_asym = not args.sym
     args.v_asym = not args.sym
-    args.w_asym = False  # W is always symmetric
-
-    sym_tag = "wSym_kSym_vSym" if args.sym else "kAsym_vAsym"
+    args.w_asym = args.w_asym and not args.sym
 
     # --- Derive groupsizes from --groupsize ---
     args.w_groupsize = args.groupsize
@@ -527,6 +532,13 @@ def main():
             w_groupsize=args.w_groupsize,
             w_sym=not args.w_asym,
         )
+
+    # --- Resolve imitate_gguf: build per-layer bit-width map ---
+    if getattr(args, 'imitate_gguf', None):
+        import gguf_utils
+        gguf_imitate_path = cfg.resolve_gguf_path(args.imitate_gguf, args.model)
+        args.w_bits_map, _imit_label = gguf_utils.get_gguf_bits_map(gguf_imitate_path)
+        print(f"imitate_gguf: loaded {len(args.w_bits_map)} layer bit-widths from {gguf_imitate_path}")
 
     # --- Set up rotations to match experiment pipeline ---
     if args.mode in ('quarot', 'dart'):
@@ -620,8 +632,10 @@ def main():
     # --- GPTQ weight quantization ---
     # Must happen before activation calibration so we measure activations
     # flowing through quantized weights (matching actual inference).
-    if args.w_bits < 16:
-        _gptq_ckpt = os.path.join(args.gptq_checkpoint_path, f'{model_name}_w{args.w_bits}')
+    _has_w_bits_map = bool(getattr(args, 'w_bits_map', None))
+    if args.w_bits < 16 or _has_w_bits_map:
+        _w_suffix = 'w0' if _has_w_bits_map else f'w{args.w_bits}'
+        _gptq_ckpt = os.path.join(args.gptq_checkpoint_path, f'{model_name}_{_w_suffix}')
 
         if args.gptq and os.path.isdir(_gptq_ckpt):
             import shutil
@@ -633,7 +647,8 @@ def main():
             print(f"Loading existing GPTQ checkpoint from: {_gptq_ckpt}")
             utils.load_model_in_parts(model, _gptq_ckpt)
         else:
-            print(f"Running GPTQ (w{args.w_bits}, groupsize={args.w_groupsize}) ...")
+            _w_desc = f"w_bits_map({len(args.w_bits_map)} layers)" if _has_w_bits_map else f"w{args.w_bits}"
+            print(f"Running GPTQ ({_w_desc}, groupsize={args.w_groupsize}) ...")
             trainloader = data_utils.get_loaders(
                 args.calib_dataset, nsamples=args.nsamples,
                 seed=args.seed, model=args.model,
@@ -648,6 +663,7 @@ def main():
             gptq_args.w_groupsize = args.w_groupsize
             gptq_args.w_clip = args.w_clip
             gptq_args.w_bits_down_proj = None
+            gptq_args.w_bits_map = getattr(args, 'w_bits_map', None)
             gptq_args.percdamp = args.percdamp
             gptq_args.act_order = False
             gptq_args.w_static_groups = False
@@ -768,7 +784,7 @@ def main():
             dev = qlayer.module.weight.device
             print(f"  [{n_ig}] {name}: weight on {dev}, shape={list(qlayer.module.weight.shape)}, bits={qlayer.quantizer.bits}", flush=True)
             qlayer.prepare_int_gemm(
-                w_bits=args.w_bits, w_sym=True,
+                w_bits=args.w_bits, w_sym=not args.w_asym,
                 w_group_size=args.w_groupsize,
                 acc_bits=args.acc_bits, acc_block_k=args.acc_block_k,
                 acc_wrap=args.acc_wrap)

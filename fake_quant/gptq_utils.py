@@ -219,6 +219,7 @@ def gptq_fwrd(model, dataloader, dev, args):
                     subset[n[:-len('.module')]] = full[n[:-len('.module')]]
 
             gptq = {}
+            w_bits_map = getattr(args, 'w_bits_map', None)
             for name in subset:
                 # print(f'{name}', end='  ', flush=True)
                 layer_weight_bits = args.w_bits
@@ -226,6 +227,10 @@ def gptq_fwrd(model, dataloader, dev, args):
                 if 'lm_head' in name:
                     layer_weight_bits = 16
                     continue
+                if w_bits_map:
+                    bare_name = name.replace('.module', '')
+                    full_name = f'model.layers.{i}.{bare_name}'
+                    layer_weight_bits = w_bits_map.get(full_name, layer_weight_bits)
                 if args.w_bits_down_proj is not None and 'down_proj' in name:
                     layer_weight_bits = args.w_bits_down_proj
                 gptq[name] = GPTQ(subset[name])
@@ -340,11 +345,16 @@ def rtn_fwrd(model, dev, args, stochastic=False):
         subset = quant_utils.find_qlayers(layer,
                                           layers=[torch.nn.Linear])
 
+        w_bits_map = getattr(args, 'w_bits_map', None)
         for name in subset:
             layer_weight_bits = args.w_bits
             if 'lm_head' in name:
                 layer_weight_bits = 16
                 continue
+            if w_bits_map:
+                bare_name = name.replace('.module', '')
+                full_name = f'model.layers.{i}.{bare_name}'
+                layer_weight_bits = w_bits_map.get(full_name, layer_weight_bits)
             if args.w_bits_down_proj is not None and 'down_proj' in name:
                 layer_weight_bits = args.w_bits_down_proj
 

@@ -3,6 +3,7 @@ Load a GGUF file and optionally validate its weights against the HuggingFace mod
 
 Usage:
   python load_gguf_test.py <file.gguf>              # inspect metadata + tensors
+  python load_gguf_test.py <file.gguf> --bits        # show bits per weight tensor
   python load_gguf_test.py <file.gguf> --validate    # compare against HF model
 """
 import sys
@@ -77,6 +78,86 @@ def inspect_gguf(path: str):
 
     print(f"\nTotal tensor data: {total_bytes / 1e9:.3f} GB")
     print("Load OK!")
+
+
+# ── Bits-per-tensor mode ──
+
+def show_bits(gguf_path: str):
+    """Display the effective bits for each weight tensor, grouped by layer."""
+    from fake_quant.gguf_utils import GGUF_TYPE_SPECS
+
+    reader = GGUFReader(gguf_path)
+    print(f"=== Bits per tensor: {gguf_path} ===\n")
+
+    # Collect per-layer info
+    layer_tensors = {}   # layer_idx -> [(suffix, qtype, bits, shape)]
+    static_tensors = []  # [(name, qtype, bits, shape)]
+
+    for t in reader.tensors:
+        qtype = t.tensor_type.name
+        spec = GGUF_TYPE_SPECS.get(qtype)
+        bits = spec['bits'] if spec else f"?({qtype})"
+        sym = "sym" if spec and spec.get('sym') is True else "asym" if spec and spec.get('sym') is False else ""
+        shape = [int(s) for s in t.shape]
+        numel = int(np.prod(shape))
+
+        m = re.match(r"blk\.(\d+)\.(.+)", t.name)
+        if m:
+            layer_idx = int(m.group(1))
+            suffix = m.group(2)
+            layer_tensors.setdefault(layer_idx, []).append((suffix, qtype, bits, sym, shape, numel))
+        else:
+            static_tensors.append((t.name, qtype, bits, sym, shape, numel))
+
+    # Print static (non-layer) tensors
+    if static_tensors:
+        print("Non-layer tensors:")
+        for name, qtype, bits, sym, shape, numel in static_tensors:
+            print(f"  {name:<40s}  {qtype:<8s}  bits={bits:<4}  {sym:<5s}  shape={str(shape):<20s}  params={numel:>12,}")
+        print()
+
+    # Print per-layer summary
+    if not layer_tensors:
+        return
+
+    n_layers = max(layer_tensors.keys()) + 1
+
+    # Check if all layers have identical quant types — print compact summary
+    first_layer = layer_tensors.get(0, [])
+    first_sig = [(s, q) for s, q, b, sy, sh, n in first_layer]
+    all_same = all(
+        [(s, q) for s, q, b, sy, sh, n in layer_tensors.get(i, [])] == first_sig
+        for i in range(n_layers)
+    )
+
+    if all_same and n_layers > 4:
+        print(f"Layers 0-{n_layers-1} (all identical quantization):")
+        for suffix, qtype, bits, sym, shape, numel in first_layer:
+            print(f"  {suffix:<40s}  {qtype:<8s}  bits={bits:<4}  {sym:<5s}  shape={str(shape):<20s}  params={numel:>12,}")
+    else:
+        for layer_idx in sorted(layer_tensors.keys()):
+            tensors = layer_tensors[layer_idx]
+            print(f"Layer {layer_idx}:")
+            for suffix, qtype, bits, sym, shape, numel in tensors:
+                print(f"  {suffix:<40s}  {qtype:<8s}  bits={bits:<4}  {sym:<5s}  shape={str(shape):<20s}  params={numel:>12,}")
+
+    # Summary: total bits weighted average
+    print()
+    total_params = 0
+    total_bits_weighted = 0
+    for t in reader.tensors:
+        qtype = t.tensor_type.name
+        spec = GGUF_TYPE_SPECS.get(qtype)
+        if spec is None:
+            continue
+        numel = int(np.prod(list(t.shape)))
+        total_params += numel
+        total_bits_weighted += numel * spec['bits']
+
+    if total_params > 0:
+        avg_bits = total_bits_weighted / total_params
+        print(f"Total params: {total_params:,}")
+        print(f"Weighted average bits: {avg_bits:.2f}")
 
 
 # ── Validate mode ──
@@ -193,11 +274,16 @@ def validate_gguf(gguf_path: str, model_name: str, hf_token: str | None):
 def main():
     parser = argparse.ArgumentParser(description="Inspect or validate GGUF files")
     parser.add_argument("gguf_path", help="Path to .gguf file")
+    parser.add_argument("--bits", action="store_true", help="Show bits per weight tensor")
     parser.add_argument("--validate", action="store_true", help="Validate against HF model")
     parser.add_argument("--model", default=None,
                         help="HF model name or path (default: auto-detect from GGUF metadata)")
     parser.add_argument("--hf-token", default=None, help="HuggingFace API token")
     args = parser.parse_args()
+
+    if args.bits:
+        show_bits(args.gguf_path)
+        sys.exit(0)
 
     if args.validate:
         # Auto-detect model path if not given

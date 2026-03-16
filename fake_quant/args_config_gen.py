@@ -179,6 +179,11 @@ def parser_gen():
     parser.add_argument('--k_clip_ratio', type=float, default=1.0,
                         help='Clip ratio for k-cache quantization. new_max = max * clip_ratio')
 
+    # GGUF imitation (per-layer bit-width matching)
+    parser.add_argument('--imitate_gguf', type=str, default=None,
+                        help='Match per-layer weight bit-widths from a GGUF file. '
+                             'Pass a quant type (e.g. Q4_K_M) or explicit .gguf path.')
+
     # GGUF Pre-quantized Weights
     parser.add_argument('--gguf_path', type=str, default=None,
                         help='Path to .gguf file with pre-quantized weights. '

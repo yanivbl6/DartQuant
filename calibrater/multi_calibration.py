@@ -11,17 +11,23 @@ Usage:
     python multi_calibration.py -m 1b --sym --kv_ex 8 --proj_ex 15 -k 8 -v 8 -g 2
     python multi_calibration.py -m 3b --sym -g 3,6,8
 
-The first GPU is used for dart (and for R1/R2 training if needed), the second
-for quarot, the third for baseline.
+Runfile mode — calibrate from the same runfile used by run_experiments.py:
+    python multi_calibration.py --runfile ../fake_quant/runs.txt -g 2,3,4
+    python multi_calibration.py --runfile ../fake_quant/runs.txt -g 2 --gptq --dry
+
+Only lines with --static-act are calibrated; others are silently skipped.
+The runfile is NOT modified (no [DONE]/[ERROR] markers).
 """
 
 import argparse
+import shlex
 import subprocess
 import sys
 import os
 import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'fake_quant'))
 import experiment_config as cfg
 
 
@@ -131,33 +137,213 @@ Examples:
 """ + extra_help)
 
     cfg.add_model_arg(parser)
+    parser._option_string_actions['-m'].required = False
     parser.add_argument('-g', '--gpus', type=str, default='1',
                         help='GPU IDs: a single number S (expands to S,S+1,S+2) '
                              'or a comma-separated list like "3,6,8" (default: "1")')
     cfg.add_quant_args(parser)
     parser.add_argument('--dry', action='store_true',
                         help='Print commands without running them')
+    parser.add_argument('--runfile', type=str, default=None,
+                        help='Path to a runfile (same format as run_experiments.py). '
+                             'Only --static-act lines are calibrated. '
+                             'When set, -m and quant args are taken from each line.')
+    parser.add_argument('--gptq', action='store_true',
+                        help='Delete cached GPTQ checkpoint and re-quantize (forwarded to calibrate)')
 
     # Calibration-specific extras (--nsamples, --seqlen, etc.) remain in extra_args
     return parser.parse_known_args()
 
 
+def parse_gpus(gpu_str, n_needed=3):
+    """Parse GPU specification into a list of GPU IDs."""
+    parts = gpu_str.split(',')
+    if len(parts) == 1:
+        s = int(parts[0])
+        return list(range(s, s + n_needed))
+    return [int(p) for p in parts]
+
+
+def run_batch(jobs, gpus, dry=False):
+    """Run a list of (label, cmd) jobs in batches of len(gpus).
+
+    Each batch runs in parallel (one job per GPU), then waits for all to finish
+    before starting the next batch. Returns dict of label -> exit code.
+    """
+    all_results = {}
+
+    for batch_start in range(0, len(jobs), len(gpus)):
+        batch = jobs[batch_start:batch_start + len(gpus)]
+
+        if dry:
+            for i, (label, cmd) in enumerate(batch):
+                gpu = gpus[i % len(gpus)]
+                print(f"  [GPU {gpu}] {label}: CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}")
+            continue
+
+        threads = []
+        results = {}
+
+        def worker(label, cmd, gpu_id):
+            results[label] = run_job(cmd, make_env(gpu_id), label)
+
+        for i, (label, cmd) in enumerate(batch):
+            gpu = gpus[i % len(gpus)]
+            print(f"  [GPU {gpu}] {label}: CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}")
+            t = threading.Thread(target=worker, args=(label, cmd, gpu), daemon=True)
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        all_results.update(results)
+
+    return all_results
+
+
+def _parse_runfile_line_args(tokens):
+    """Parse runfile tokens through experiment_config's argparser.
+
+    Returns (parsed_args, extra_args) where parsed_args has model/quant fields
+    and extra_args are unknown flags forwarded to calibrate_act_scales.py.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    cfg.add_model_arg(parser)
+    cfg.add_quant_args(parser)
+    return parser.parse_known_args(tokens)
+
+
+# Flags from the shell script that are irrelevant to calibration
+_IGNORE_FLAGS = {'--static-act', '--fast', '-F', '--very-fast', '--overwrite'}
+
+
+def parse_runfile_for_calibration(path):
+    """Parse a runfile, returning only --static-act runs for calibration.
+
+    Returns list of (name, mode, model_short, quant_args, extra_args, quant_tag).
+    Deduplicates by (mode, quant_tag).
+    """
+    from run_experiments import parse_runfile
+
+    entries = parse_runfile(path)
+    seen = set()
+    runs = []
+
+    for name, cmd_args in entries:
+        tokens = shlex.split(cmd_args)
+
+        # Only calibrate static-act runs
+        if '--static-act' not in tokens:
+            continue
+
+        # Extract mode (first token: baseline/quarot/dart)
+        mode = tokens[0]
+        rest = tokens[1:]
+
+        # Filter out ignored flags
+        filtered = [t for t in rest if t not in _IGNORE_FLAGS]
+
+        # Parse through experiment_config to get structured args
+        line_args, extra = _parse_runfile_line_args(filtered)
+        cfg.resolve_v_bits(line_args)
+        # Resolve model shorthand so GGUF path lookup works
+        line_args.model = cfg.resolve_model(line_args.model)
+
+        quant_tag = cfg.build_quant_tag(line_args)
+        key = (mode, quant_tag)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        quant_args = cfg.build_quant_args(line_args)
+        runs.append((name, mode, line_args.model, quant_args, extra, quant_tag))
+
+    return runs
+
+
+def ensure_r1r2(model_names, gpus, dry=False):
+    """Train R1/R2 for any model that needs it."""
+    for model_name in model_names:
+        if cfg.r1r2_exist(model_name):
+            print(f"R1/R2 already exist for {model_name}. Skipping training.")
+            continue
+        model_full = cfg.resolve_model(model_name)
+        r1r2_cmd = ['bash', 'calibrate_model.sh', '-m', model_full, '-g', str(gpus[0])]
+        print(f"R1/R2 not found for {model_name}. Training on GPU {gpus[0]} first...")
+        if dry:
+            print(f"  CUDA_VISIBLE_DEVICES={gpus[0]} {' '.join(r1r2_cmd)}")
+        else:
+            ret = run_job(r1r2_cmd, make_env(gpus[0]), f'R1/R2 train ({model_name})')
+            if ret != 0:
+                print(f"R1/R2 training failed for {model_name}. Aborting.")
+                sys.exit(1)
+
+
+def run_from_runfile(args, extra_args):
+    """Run calibrations from a runfile."""
+    runs = parse_runfile_for_calibration(args.runfile)
+    if not runs:
+        print("No --static-act runs found in runfile.")
+        return
+
+    gpus = parse_gpus(args.gpus, n_needed=len(runs))
+
+    print(f"=== {len(runs)} calibration runs from {args.runfile} ===\n")
+
+    # Phase 1: Train R1/R2 if any dart runs need it
+    dart_models = set()
+    for name, mode, model_short, quant_args, line_extra, quant_tag in runs:
+        if mode == 'dart':
+            model_full = cfg.resolve_model(model_short)
+            dart_models.add(cfg.model_name_from_path(model_full))
+    if dart_models:
+        ensure_r1r2(dart_models, gpus, dry=args.dry)
+
+    # Phase 2: Build calibration commands
+    jobs = []
+    for name, mode, model_short, quant_args, line_extra, quant_tag in runs:
+        # Merge extra_args from CLI with line-specific extras
+        all_extra = line_extra + extra_args
+        if args.gptq:
+            all_extra.append('--gptq')
+        cmd = build_calibrate_cmd(mode, model_short, quant_args, all_extra)
+        label = f"{mode}:{quant_tag}"
+        jobs.append((label, cmd))
+
+    # Phase 3: Run in batches
+    results = run_batch(jobs, gpus, dry=args.dry)
+
+    if args.dry:
+        return
+
+    # Summary
+    print(f"\n{'='*60}")
+    print("Calibration summary:")
+    print(f"{'='*60}")
+    for label, _ in jobs:
+        status = "OK" if results.get(label) == 0 else f"FAILED (exit {results.get(label, '?')})"
+        print(f"  {label:40s} : {status}")
+
+
 def main():
     args, extra_args = parse_args()
+
+    if args.runfile:
+        run_from_runfile(args, extra_args)
+        return
+
+    if not args.model:
+        print("Error: -m/--model is required (unless using --runfile)")
+        sys.exit(1)
+
     cfg.resolve_v_bits(args)
     quant_args = cfg.build_quant_args(args)
 
-    # Parse GPU specification
-    gpu_str = args.gpus
-    parts = gpu_str.split(',')
-    if len(parts) == 1:
-        # Single number S -> S, S+1, S+2
-        s = int(parts[0])
-        gpus = [s, s + 1, s + 2]
-    elif len(parts) == 3:
-        gpus = [int(p) for p in parts]
-    else:
-        print(f"Error: --gpus expects a single number or exactly 3 comma-separated IDs, got '{gpu_str}'")
+    gpus = parse_gpus(args.gpus, n_needed=3)
+    if len(gpus) < 3:
+        print(f"Error: need at least 3 GPUs for standard mode, got {len(gpus)}")
         sys.exit(1)
 
     model_short = args.model
@@ -168,47 +354,21 @@ def main():
 
     modes = ['dart', 'quarot', 'baseline']
 
-    # --- Phase 1: Train R1/R2 if needed (blocks dart GPU) ---
-    r1r2_cmd = ['bash', 'calibrate_model.sh', '-m', model_full, '-g', str(gpus[0])]
-    if not cfg.r1r2_exist(model_name):
-        print(f"R1/R2 not found for {model_name}. Training on GPU {gpus[0]} first...")
-        if args.dry:
-            print(f"  CUDA_VISIBLE_DEVICES={gpus[0]} {' '.join(r1r2_cmd)}")
-        else:
-            ret = run_job(r1r2_cmd, make_env(gpus[0]), 'R1/R2 train')
-            if ret != 0:
-                print("R1/R2 training failed. Aborting.")
-                sys.exit(1)
-    else:
-        print(f"R1/R2 already exist for {model_name}. Skipping training.")
+    # --- Phase 1: Train R1/R2 if needed ---
+    ensure_r1r2({model_name}, gpus, dry=args.dry)
 
     # --- Phase 2: Run all three calibrations in parallel ---
-    # Assign GPUs round-robin: mode[i] -> gpus[i % len(gpus)]
+    gptq_extra = ['--gptq'] if args.gptq else []
+    jobs = []
+    for mode in modes:
+        cmd = build_calibrate_cmd(mode, model_short, quant_args, extra_args + gptq_extra)
+        jobs.append((mode, cmd))
+
     print()
-    for i, mode in enumerate(modes):
-        gpu = gpus[i % len(gpus)]
-        cmd = build_calibrate_cmd(mode, model_short, quant_args, extra_args)
-        print(f"  [GPU {gpu}] {mode}: CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}")
+    results = run_batch(jobs, gpus, dry=args.dry)
 
     if args.dry:
         return
-
-    threads = []
-    results = {}
-
-    def worker(mode, gpu_id):
-        cmd = build_calibrate_cmd(mode, model_short, quant_args, extra_args)
-        results[mode] = run_job(cmd, make_env(gpu_id), mode)
-
-    for i, mode in enumerate(modes):
-        gpu = gpus[i % len(gpus)]
-        t = threading.Thread(target=worker, args=(mode, gpu), daemon=True)
-        threads.append((mode, t))
-
-    for _, t in threads:
-        t.start()
-    for _, t in threads:
-        t.join()
 
     # --- Summary ---
     print(f"\n{'='*60}")

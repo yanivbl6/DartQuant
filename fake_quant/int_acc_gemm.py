@@ -222,6 +222,8 @@ def int_gemm_capped(
     use_triton: bool = True,
     acc_wrap: bool = False,
     w_zp_correction: Optional[torch.Tensor] = None,
+    w_zp: Optional[torch.Tensor] = None,
+    w_zp_cross: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Quantize activations → run integer GEMM with capped accumulator → float output.
@@ -240,6 +242,12 @@ def int_gemm_capped(
     acc_wrap : use two's-complement wrap-around instead of saturation
     w_zp_correction : optional [N] float — precomputed Σ_k s_w(j,k)·q_w(j,k),
         used with asymmetric activations to correct for the zero-point shift.
+    w_zp : optional [N] or [N, n_w_groups] float — weight zero points for
+        asymmetric weight quantization.  The correction w_zp * sum(a_int) is
+        applied in float outside the capped accumulator.
+    w_zp_cross : optional [N] float — precomputed cross-term
+        Σ_g(w_zp[j,g] * w_scale[j,g] * G) for dynamic activation + weight
+        asymmetry.  Combined with per-token a_zp_correction at runtime.
 
     Returns
     -------
@@ -283,10 +291,93 @@ def int_gemm_capped(
 
     # Zero-point correction for asymmetric activations (applied in float,
     # outside the capped accumulator).
+    # Term: a_zp * Σ_k(s_w * q_w_signed)  per output channel
     if a_zp_correction is not None and w_zp_correction is not None:
         output += a_zp_correction.unsqueeze(1) * w_zp_correction.unsqueeze(0)
 
+    # Zero-point correction for asymmetric weights (applied in float,
+    # outside the capped accumulator).
+    # Term: w_zp * Σ_k(a_int) * a_scale * w_scale  per output channel
+    if w_zp is not None:
+        _apply_weight_zp_correction(
+            output, a_int, a_token_scale, a_group_scale, a_group_size,
+            w_zp, w_scale, w_group_size, M, K, use_act_groups)
+
+    # Cross-term for combined activation + weight asymmetry (dynamic mode).
+    # Term: a_zp_correction[m] * Σ_g(w_zp[j,g] * w_scale[j,g] * G)
+    # For static mode this is folded into static_zp_bias instead.
+    if a_zp_correction is not None and w_zp_cross is not None:
+        output += a_zp_correction.unsqueeze(1) * w_zp_cross.unsqueeze(0)
+
     return output.reshape(*orig_shape[:-1], N)
+
+
+def _apply_weight_zp_correction(
+    output: torch.Tensor,       # [M, N] — modified in-place
+    a_int: torch.Tensor,        # [M, K] int8
+    a_token_scale: torch.Tensor,  # [M] or empty
+    a_group_scale: Optional[torch.Tensor],  # [n_act_groups] or None
+    a_group_size: int,
+    w_zp: torch.Tensor,         # [N] or [N, n_w_groups]
+    w_scale: torch.Tensor,      # [N] or [N, n_w_groups]
+    w_group_size: int,
+    M: int, K: int,
+    use_act_groups: bool,
+):
+    """Compute and add the weight zero-point correction to *output* in-place.
+
+    correction[m, j] = Σ over weight-groups g of:
+        w_zp[j,g] * ( Σ_{k in group g} a_scale(k) * a_int[m,k] ) * w_scale[j,g]
+
+    All arithmetic is in float, outside the capped accumulator.
+    """
+    a_f = a_int.float()
+
+    if w_group_size > 0 and w_zp.dim() == 2:
+        # --- Per-group weights ---
+        n_w_groups = w_zp.shape[1]
+        G = w_group_size
+        padded_K = n_w_groups * G
+        if padded_K > K:
+            a_padded = F.pad(a_f, (0, padded_K - K))
+        else:
+            a_padded = a_f
+        # [M, n_w_groups, G] -> sum over G -> [M, n_w_groups]
+        a_group_sums = a_padded.reshape(M, n_w_groups, G).sum(dim=2)
+
+        # w_zp_scaled[j, g] = w_zp[j,g] * w_scale[j,g]
+        w_zp_scaled = w_zp * w_scale  # [N, n_w_groups]
+
+        if use_act_groups:
+            # Each activation group has its own scale.  We need to weight
+            # each k-element's contribution by its activation group scale.
+            # a_group_size == acc_block_k by design.
+            n_act_groups = a_group_scale.shape[0]
+            # Scale each activation element by its group scale, then re-sum
+            # per weight group.
+            a_scaled = a_f * a_group_scale.repeat_interleave(a_group_size).unsqueeze(0)[:, :K]
+            if padded_K > K:
+                a_scaled = F.pad(a_scaled, (0, padded_K - K))
+            a_scaled_sums = a_scaled.reshape(M, n_w_groups, G).sum(dim=2)  # [M, n_w_groups]
+            correction = a_scaled_sums @ w_zp_scaled.T  # [M, N]
+        else:
+            # Per-token scale: factor out after the matmul
+            correction = (a_group_sums @ w_zp_scaled.T) * a_token_scale.unsqueeze(1)
+    else:
+        # --- Per-channel weights ---
+        a_sum = a_f.sum(dim=1)  # [M]
+        w_zp_scaled = w_zp * w_scale  # [N]
+
+        if use_act_groups:
+            # Weight each k by its activation group scale, then sum
+            n_act_groups = a_group_scale.shape[0]
+            a_scaled = a_f * a_group_scale.repeat_interleave(a_group_size).unsqueeze(0)[:, :K]
+            a_scaled_sum = a_scaled.sum(dim=1)  # [M]
+            correction = a_scaled_sum.unsqueeze(1) * w_zp_scaled.unsqueeze(0)
+        else:
+            correction = (a_token_scale * a_sum).unsqueeze(1) * w_zp_scaled.unsqueeze(0)
+
+    output += correction
 
 
 def _triton_int_gemm(
@@ -402,14 +493,57 @@ def _recover_int_and_scale(W_fq: torch.Tensor, maxq: int) -> Tuple[torch.Tensor,
     return q.to(torch.int8), scale
 
 
+def _recover_int_and_scale_asym(
+    W_fq: torch.Tensor, maxq: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Recover midpoint-centred integer, scale, and zp offset from asymmetric
+    fake-quantized weights.
+
+    Asymmetric quantization maps integers in ``[0, maxq]`` (e.g. ``[0, 15]``
+    for 4-bit).  The fake-quantized value is ``scale * (q_unsigned - zero)``.
+
+    We decompose this as::
+
+        w = scale * (q_centered + midpoint - zero)
+          = scale * q_centered  +  scale * zp_offset
+
+    where ``midpoint = (maxq + 1) // 2``, ``q_centered = q_unsigned - midpoint``
+    (always in ``[-midpoint, maxq - midpoint]`` — the standard signed int
+    range), and ``zp_offset = midpoint - zero``.
+
+    ``q_centered`` is stored as int8 for the kernel (same range as symmetric).
+    The ``zp_offset`` correction is applied in float outside the accumulator.
+
+    Parameters
+    ----------
+    W_fq : [N, G] fake-quantized weight slice (float)
+    maxq : full unsigned range (e.g. 15 for 4-bit, i.e. ``2**bits - 1``)
+
+    Returns
+    -------
+    q_centered : [N, G] int8 — midpoint-centred integer (same range as symmetric)
+    scale      : [N, 1] float32 per-row scale
+    zp_offset  : [N, 1] float32 per-row ``midpoint - zero`` (correction factor)
+    """
+    midpoint = (maxq + 1) // 2
+    w_min = W_fq.amin(dim=1, keepdim=True)
+    w_max = W_fq.amax(dim=1, keepdim=True)
+    scale = ((w_max - w_min) / maxq).clamp(min=1e-10)
+    zero = torch.round(-w_min / scale)
+    q_unsigned = torch.clamp(torch.round(W_fq / scale) + zero, 0, maxq)
+    q_centered = q_unsigned - midpoint  # always in [-midpoint, maxq - midpoint]
+    zp_offset = midpoint - zero         # correction factor
+    return q_centered.to(torch.int8), scale, zp_offset
+
+
 def prepare_int_weights(
     linear: torch.nn.Linear,
     w_bits: int,
     w_sym: bool = True,
     w_group_size: int = -1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
-    Re-quantize fake-quantized (post-GPTQ) float weights back to (w_int8, w_scale).
+    Re-quantize fake-quantized (post-GPTQ) float weights back to (w_int8, w_scale, w_zp).
 
     After GPTQ, weights are stored as float tensors whose values lie on the
     quantization grid.  We recover the integer representation by recomputing
@@ -417,15 +551,19 @@ def prepare_int_weights(
 
     Returns
     -------
-    w_int : [N, K] int8
+    w_int  : [N, K] int8
     w_scale : [N] or [N, K // w_group_size] float32
+    w_zp   : [N] or [N, K // w_group_size] float32, or None for symmetric
     """
-    assert w_sym, "Integer GEMM currently requires symmetric weight quantization"
-
     W = linear.weight.data.float()  # [N, K]
     N, K = W.shape
 
-    maxq = 2 ** (w_bits - 1) - 1
+    if w_sym:
+        maxq = 2 ** (w_bits - 1) - 1
+        recover_fn = _recover_int_and_scale
+    else:
+        maxq = 2 ** w_bits - 1
+        recover_fn = _recover_int_and_scale_asym
 
     if w_group_size > 0:
         n_groups = math.ceil(K / w_group_size)
@@ -437,16 +575,22 @@ def prepare_int_weights(
             W_padded = W
         # Reshape [N, K] -> [N * n_groups, group_size] so each row is one group
         W_grouped = W_padded.reshape(N * n_groups, w_group_size)
-        q_flat, scale_flat = _recover_int_and_scale(W_grouped, maxq)
+        result = recover_fn(W_grouped, maxq)
+        q_flat, scale_flat = result[0], result[1]
         # Reshape back and trim padding
         w_int = q_flat.reshape(N, padded_K)[:, :K].contiguous()
         w_scale = scale_flat.squeeze(1).reshape(N, n_groups)
+        if not w_sym:
+            w_zp = result[2].squeeze(1).reshape(N, n_groups)
+        else:
+            w_zp = None
     else:
-        q, scale = _recover_int_and_scale(W, maxq)
-        w_int = q
-        w_scale = scale.squeeze(1)                    # [N]
+        result = recover_fn(W, maxq)
+        w_int = result[0]
+        w_scale = result[1].squeeze(1)                # [N]
+        w_zp = result[2].squeeze(1) if not w_sym else None  # [N] or None
 
-    return w_int, w_scale
+    return w_int, w_scale, w_zp
 
 
 # ---------------------------------------------------------------------------

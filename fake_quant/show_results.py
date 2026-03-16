@@ -84,6 +84,14 @@ def _extract_gguf_tag(path):
     return m.group(1) if m else None
 
 
+def _extract_imitate_tag(path):
+    """Extract imitate tag (e.g. 'imitate-Q4-K-M') from a result filename,
+    and return the corresponding gguf tag (e.g. 'gguf-Q4-K-M'), or None."""
+    base = os.path.basename(path)
+    m = re.search(r'imitate-([A-Za-z0-9-]+)', base)
+    return f"gguf-{m.group(1)}" if m else None
+
+
 def parse_filename(path):
     """Extract mode and quant config from filename."""
     base = os.path.basename(path).replace("_results.pb", "")
@@ -166,7 +174,7 @@ def _factor_labels(labels):
                 remaining[t] -= 1
             else:
                 unique.append(t)
-        short.append(" ".join(unique) if unique else labels[i])
+        short.append(" ".join(unique) if unique else "")
 
     return " ".join(subtitle_parts), short
 
@@ -560,12 +568,15 @@ def main():
                     paths.append(bl)
                     path_set.add(bl)
 
-        # Auto-include GGUF full-precision baselines when GGUF runs are present
+        # Auto-include GGUF full-precision baselines when GGUF or imitate runs are present
         gguf_tags = set()
         for p in list(paths):
             tag = _extract_gguf_tag(p)
             if tag and not os.path.basename(p).startswith("full_"):
                 gguf_tags.add(tag)
+            imitate_tag = _extract_imitate_tag(p)
+            if imitate_tag:
+                gguf_tags.add(imitate_tag)
         for model in models:
             for tag in sorted(gguf_tags):
                 for candidate in glob.glob(os.path.join(RESULTS_DIR, f"full_{model}_*_{tag}_results.pb")):

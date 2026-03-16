@@ -507,6 +507,10 @@ class ActQuantWrapper(torch.nn.Module):
         self._buffers['w_scale'] = None
         self.register_buffer('w_zp_correction', None)
         self._buffers['w_zp_correction'] = None
+        self.register_buffer('w_zp', None)
+        self._buffers['w_zp'] = None
+        self.register_buffer('w_zp_cross', None)
+        self._buffers['w_zp_cross'] = None
         self.w_group_size = -1
         self.register_buffer('static_zp_bias', None)
         self._buffers['static_zp_bias'] = None
@@ -527,10 +531,11 @@ class ActQuantWrapper(torch.nn.Module):
         self.int_gemm_use_triton = use_triton
         self.w_group_size = w_group_size
 
-        w_int, w_scale = prepare_int_weights(self.module, w_bits, w_sym, w_group_size)
+        w_int, w_scale, w_zp = prepare_int_weights(self.module, w_bits, w_sym, w_group_size)
         dev = self.module.weight.device
         self.w_int = w_int.to(dev)
         self.w_scale = w_scale.to(dev)
+        self.w_zp = w_zp.to(dev) if w_zp is not None else None
 
         # Precompute per-output-channel zero-point correction for asymmetric
         # activations:  w_zp_correction[j] = Σ_k  s_w(j,k) · q_w(j,k)
@@ -547,6 +552,17 @@ class ActQuantWrapper(torch.nn.Module):
             self.w_zp_correction = (w_scale * group_sums).sum(dim=1)
         else:
             self.w_zp_correction = w_scale * w_int.float().sum(dim=1)
+
+        # Precompute cross-term for dynamic activation + weight asymmetry:
+        # w_zp_cross[j] = Σ_g w_zp[j,g] * w_scale[j,g] * G
+        # Used at runtime as: output += a_zp_correction[:, None] * w_zp_cross[None, :]
+        if w_zp is not None:
+            if w_group_size > 0 and w_zp.dim() == 2:
+                self.w_zp_cross = (w_zp * w_scale * w_group_size).sum(dim=1).to(dev)  # [N]
+            else:
+                self.w_zp_cross = (w_zp * w_scale * K).to(dev)  # [N]
+        else:
+            self.w_zp_cross = None
 
     def compute_static_zp_bias(self):
         """Precompute [N] zero-point correction for static asymmetric per-group mode.
@@ -590,6 +606,21 @@ class ActQuantWrapper(torch.nn.Module):
         # static_zp_bias[j] = Σ_g a_zp_corr[g] * w_scale[j,g] * w_int_group_sum[j,g]
         weighted = w_scale_per_ag * w_int_group_sum  # [N, n_act_groups]
         self.static_zp_bias = (a_zp_corr.unsqueeze(0) * weighted).sum(dim=1)  # [N]
+
+        # Cross-term for combined static activation + weight asymmetry:
+        # Σ_g a_zp_corr[act_g] * w_zp[j, w_g] * w_scale[j, w_g] * G
+        if self.w_zp is not None:
+            if self.w_group_size > 0 and self.w_zp.dim() == 2:
+                # Map each activation group to its weight group
+                w_zp_per_ag = self.w_zp[:, w_group_idx]    # [N, n_act_groups]
+                cross = w_zp_per_ag * w_scale_per_ag * G   # [N, n_act_groups]
+                self.static_zp_bias += (a_zp_corr.unsqueeze(0) * cross).sum(dim=1)
+            else:
+                # Per-channel: w_zp is [N], each act group contributes G elements
+                w_zp_dev = self.w_zp.to(dev)
+                w_scale_dev = self.w_scale.to(dev) if self.w_scale.dim() == 1 else self.w_scale[:, 0].to(dev)
+                cross_per_ag = w_zp_dev.unsqueeze(1) * w_scale_dev.unsqueeze(1) * G  # [N, 1]
+                self.static_zp_bias += (a_zp_corr.unsqueeze(0) * cross_per_ag).sum(dim=1)
 
     def extra_repr(self) -> str:
         str_ = f'Input Quantizer Bits: {self.quantizer.bits}'
@@ -647,6 +678,7 @@ class ActQuantWrapper(torch.nn.Module):
                 block_k=self.acc_block_k, w_group_size=self.w_group_size,
                 bias=self.bias, use_triton=self.int_gemm_use_triton,
                 acc_wrap=self.acc_wrap, w_zp_correction=self.w_zp_correction,
+                w_zp=self.w_zp, w_zp_cross=self.w_zp_cross,
             )
             x_pre = x  # save pre-quantization input for sd_check
             x = int_gemm_capped(x_float=x, **_ig_kwargs).to(x_dtype)

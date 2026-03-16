@@ -107,6 +107,69 @@ def _check_quant_mismatch(gguf_name, qtype_name, w_bits, w_groupsize, w_sym):
                         gguf_name, qtype_name, ", ".join(warnings))
 
 
+def get_gguf_bits_map(gguf_path):
+    """Read a GGUF file and return a per-layer weight bit-width mapping.
+
+    Returns:
+        bits_map: dict mapping HF layer key (without .weight suffix) to int bits.
+                  Only includes quantized weight tensors (not norms, embeddings).
+                  Example: {"model.layers.0.mlp.down_proj": 6, ...}
+        label:    short tag-friendly label like "Q4-K-M" extracted from the filename.
+    """
+    reader = GGUFReader(gguf_path)
+    bits_map = {}
+    sym_map = {}
+
+    # Only map weight tensors that go through GPTQ (layer projections)
+    _PROJ_SUFFIXES = {
+        "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_out.weight", "attn_output.weight",
+        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+    }
+
+    for t in reader.tensors:
+        qtype = t.tensor_type.name
+        spec = GGUF_TYPE_SPECS.get(qtype)
+        if spec is None:
+            logging.warning("Unknown GGUF type %s for tensor %s", qtype, t.name)
+            continue
+
+        m = re.match(r"blk\.(\d+)\.(.+)", t.name)
+        if not m:
+            continue
+        layer_idx, suffix = m.group(1), m.group(2)
+        if suffix not in _PROJ_SUFFIXES:
+            continue
+
+        hf_suffix = GGUF_TO_HF_LAYER.get(suffix)
+        if hf_suffix is None:
+            continue
+        # Strip .weight from HF suffix to get the layer module path
+        hf_key = f"model.layers.{layer_idx}.{hf_suffix}".removesuffix(".weight")
+        bits_map[hf_key] = spec['bits']
+        if spec['sym'] is not None:
+            sym_map[hf_key] = spec['sym']
+
+    # Build label from filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf" -> "Q4-K-M"
+    import os
+    basename = os.path.basename(gguf_path).replace('.gguf', '')
+    parts = basename.split('-')
+    qtype_parts = [p for p in parts if p.startswith('Q') or p in ('K', 'M', 'S', 'L')]
+    # Walk from first Q-part to end
+    first_q = next((i for i, p in enumerate(parts) if p.startswith('Q')), None)
+    if first_q is not None:
+        label = '-'.join(parts[first_q:])
+    else:
+        label = 'gguf'
+
+    # Summarize per-layer symmetry
+    n_sym = sum(1 for v in sym_map.values() if v)
+    n_asym = sum(1 for v in sym_map.values() if not v)
+    logging.info("GGUF bits map from %s: %d layers (sym=%d, asym=%d), label=%s",
+                 gguf_path, len(bits_map), n_sym, n_asym, label)
+    return bits_map, label
+
+
 def load_gguf_weights(model, gguf_path, quant_warnings=False,
                       w_bits=4, w_groupsize=128, w_sym=True):
     """Load dequantized GGUF weights into a HuggingFace model.

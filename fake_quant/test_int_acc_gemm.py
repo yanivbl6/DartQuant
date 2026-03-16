@@ -280,7 +280,7 @@ def test_prepare_int_weights():
     q = torch.clamp(torch.round(W / scale), -8, 7)
     linear.weight.data = (q * scale).to(linear.weight.dtype)
 
-    w_int, w_scale = prepare_int_weights(linear, w_bits=4, w_sym=True, w_group_size=-1)
+    w_int, w_scale, _ = prepare_int_weights(linear, w_bits=4, w_sym=True, w_group_size=-1)
 
     # Verify round-trip: w_int * w_scale ≈ linear.weight
     reconstructed = w_int.float() * w_scale[:, None]
@@ -320,7 +320,7 @@ def test_prepare_int_weights_with_w_clip():
     print(f"  number of -8 values: {n_neg8}")
     assert n_neg8 > 0, "FAIL: test setup did not produce -8 values"
 
-    w_int, w_scale = prepare_int_weights(linear, w_bits=4, w_sym=True, w_group_size=-1)
+    w_int, w_scale, _ = prepare_int_weights(linear, w_bits=4, w_sym=True, w_group_size=-1)
 
     # Verify round-trip: w_int * w_scale ≈ linear.weight
     reconstructed = w_int.float() * w_scale[:, None]
@@ -340,7 +340,7 @@ def test_prepare_int_weights_grouped():
     N, K = 64, 256
     linear = torch.nn.Linear(K, N, bias=False).to(DEV)
 
-    w_int, w_scale = prepare_int_weights(linear, w_bits=4, w_sym=True, w_group_size=64)
+    w_int, w_scale, _ = prepare_int_weights(linear, w_bits=4, w_sym=True, w_group_size=64)
 
     assert w_int.shape == (N, K), f"FAIL: w_int shape {w_int.shape}"
     assert w_scale.shape == (N, K // 64), f"FAIL: w_scale shape {w_scale.shape}"
@@ -369,7 +369,7 @@ def test_prepare_int_weights_grouped_w_clip():
         W[:, ks:ke] = q * scale
     linear.weight.data = W.to(linear.weight.dtype)
 
-    w_int, w_scale = prepare_int_weights(linear, w_bits=4, w_sym=True, w_group_size=GROUP)
+    w_int, w_scale, _ = prepare_int_weights(linear, w_bits=4, w_sym=True, w_group_size=GROUP)
 
     # Verify per-group round-trip
     for g in range(n_groups):
@@ -434,7 +434,7 @@ def test_int_gemm_capped_end_to_end():
     linear.weight.data = (q * scale).to(linear.weight.dtype)
 
     # Prepare int weights
-    w_int, w_scale = prepare_int_weights(linear, w_bits=4, w_sym=True, w_group_size=-1)
+    w_int, w_scale, _ = prepare_int_weights(linear, w_bits=4, w_sym=True, w_group_size=-1)
 
     # Configure activation quantizer
     quantizer_normal = ActQuantizer()

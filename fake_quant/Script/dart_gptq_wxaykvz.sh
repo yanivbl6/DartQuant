@@ -34,7 +34,8 @@ Options:
   -k KV_BITS       K-cache bit-width                    (default: 4)
   -v V_BITS        V-cache bit-width                    (default: same as -k)
   -G GROUPSIZE     Group size for W, K, V              (default: 128)
-  --sym            Use symmetric quantization for W/K/V (default: asymmetric)
+  --sym            Use symmetric quantization for W/K/V (default: asymmetric K/V)
+  --w_asym         Use asymmetric weight quantization  (default: symmetric W)
   --overwrite      Ignore cached results, re-run all
   --gptq           Delete cached GPTQ checkpoint and re-quantize
   --kv_ex N        K-cache quant without R3 rotation            (default: 0=off)
@@ -102,6 +103,7 @@ KV_BITS=4
 V_BITS=""
 GROUPSIZE=128
 SYM=0
+W_ASYM=0
 OVERWRITE=0
 FAST=0
 STATIC_ACT=0
@@ -123,6 +125,7 @@ SD_CHECK_NORM="inf"
 SELECTIVE_DYN=""
 WEIGHTS_STATS=""
 GGUF=""
+IMITATE_GGUF=""
 GSCALER=""
 GPTQ_STRENGTH=""
 QUANT_WARNINGS=0
@@ -140,6 +143,7 @@ while [[ $# -gt 0 ]]; do
         -v)       V_BITS="$2";    shift 2 ;;
         -G)       GROUPSIZE="$2"; shift 2 ;;
         --sym)    SYM=1;          shift   ;;
+        --w_asym) W_ASYM=1;       shift   ;;
         --overwrite) OVERWRITE=1; shift   ;;
         --static-act) STATIC_ACT=1; shift ;;
         --gptq)   REDO_GPTQ=1;   shift   ;;
@@ -160,6 +164,7 @@ while [[ $# -gt 0 ]]; do
         --selective-dyn) SELECTIVE_DYN="$2"; shift 2 ;;
         --weights_stats) WEIGHTS_STATS="$2"; shift 2 ;;
         --gguf)        GGUF="$2";           shift 2 ;;
+        --imitate_gguf) IMITATE_GGUF="$2"; shift 2 ;;
         --gscaler)     GSCALER="$2";        shift 2 ;;
         --gptq_strength) GPTQ_STRENGTH="$2"; shift 2 ;;
         --quant_warnings) QUANT_WARNINGS=1; shift   ;;
@@ -200,12 +205,15 @@ if [ "$SYM" == "1" ]; then
     W_ASYM_FLAG=""
     K_ASYM_FLAG=""
     V_ASYM_FLAG=""
-    SYM_TAG="wSym_kSym_vSym"
 else
-    W_ASYM_FLAG=""       # w is symmetric by default in the python code
+    W_ASYM_FLAG=""
     K_ASYM_FLAG="--k_asym"
     V_ASYM_FLAG="--v_asym"
-    SYM_TAG="kAsym_vAsym"
+fi
+
+# --w_asym can be set independently (or via --sym=0 doesn't imply it)
+if [ "$W_ASYM" == "1" ]; then
+    W_ASYM_FLAG="--w_asym"
 fi
 
 MODEL_NAME=$(basename "${MODEL%/}")
@@ -327,6 +335,23 @@ if [ -n "$GGUF" ]; then
     GGUF_FLAG="--gguf_path ${GGUF}"
     GGUF_TAG_FLAG="--gguf ${GGUF}"
 fi
+IMITATE_GGUF_FLAG=""
+IMITATE_GGUF_TAG_FLAG=""
+if [ -n "$IMITATE_GGUF" ]; then
+    # Resolve shorthand to path (same logic as GGUF)
+    if [[ "$IMITATE_GGUF" != */* ]] && [[ "$IMITATE_GGUF" != *.gguf ]]; then
+        IMITATE_GGUF_DIR="${DATA_DIR}/quantized_models"
+        IMITATE_GGUF_FILE="${IMITATE_GGUF_DIR}/${MODEL_NAME}-${IMITATE_GGUF}.gguf"
+        if [ ! -f "$IMITATE_GGUF_FILE" ]; then
+            echo "Error: imitate_gguf file not found: ${IMITATE_GGUF_FILE}"
+            exit 1
+        fi
+        IMITATE_GGUF="$IMITATE_GGUF_FILE"
+        echo "Resolved imitate_gguf: $IMITATE_GGUF"
+    fi
+    IMITATE_GGUF_FLAG="--imitate_gguf ${IMITATE_GGUF}"
+    IMITATE_GGUF_TAG_FLAG="--imitate_gguf ${IMITATE_GGUF}"
+fi
 if [ "$QUANT_WARNINGS" == "1" ]; then
     QUANT_WARN_FLAG="--quant_warnings"
 fi
@@ -334,12 +359,14 @@ fi
 # --- Build quant tag via centralized Python function ---
 TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -m ${MODEL}"
 [ "$SYM" == "1" ] && TAG_ARGS="${TAG_ARGS} --sym"
+[ "$W_ASYM" == "1" ] && TAG_ARGS="${TAG_ARGS} --w_asym"
 [ "$KV_EX" != "0" ] && TAG_ARGS="${TAG_ARGS} --kv_ex ${KV_EX}"
 [ "$PROJ_EX" != "0" ] && TAG_ARGS="${TAG_ARGS} --proj_ex ${PROJ_EX}"
 [ -n "$PWL_ACT_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${PWL_ACT_FLAG}"
 [ -n "$INT_GEMM_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${INT_GEMM_FLAG}"
 [ -n "$SMQ_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${SMQ_FLAG}"
 [ -n "$GGUF_TAG_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GGUF_TAG_FLAG}"
+[ -n "$IMITATE_GGUF_TAG_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${IMITATE_GGUF_TAG_FLAG}"
 [ -n "$GPTQ_STRENGTH_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GPTQ_STRENGTH_FLAG}"
 [ -n "$GSCALER_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GSCALER_FLAG}"
 
@@ -453,6 +480,7 @@ python main_for_test.py \
     --v_bits ${V_BITS} \
     --k_groupsize ${K_GROUPSIZE} \
     --v_groupsize ${GROUPSIZE} \
+    ${W_ASYM_FLAG} \
     ${K_ASYM_FLAG} \
     ${V_ASYM_FLAG} \
     ${STATIC_ACT_FLAG} \
@@ -463,6 +491,7 @@ python main_for_test.py \
     ${SELECTIVE_DYN_FLAG} \
     ${WEIGHTS_STATS_FLAG} \
     ${GGUF_FLAG} \
+    ${IMITATE_GGUF_FLAG} \
     ${QUANT_WARN_FLAG} \
     ${GSCALER_FLAG} \
     ${GPTQ_STRENGTH_FLAG} \

@@ -1,0 +1,23 @@
+# BYOW (Bring Your Own Weights) experiment runs
+# Format: name: MODE [args for dart_gptq_wxaykvz.sh, without -g]
+# Completed runs are marked or [ERROR] automatically.
+#
+# Usage: python run_experiments.py --runfile runs_byow.txt -g 2,3,4
+
+# --- Baseline: Quarot runs without activation quantization and different group size
+[DONE] Q4_K_M_bl_wasym: baseline -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --w_asym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_M
+[DONE] quarot_Q4_K_M_wasym: quarot -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --w_asym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_M
+[DONE] dart_Q4_K_M_wasym: dart -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --w_asym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_M
+[DONE] Q4_K_M_bl_sym: baseline -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --sym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_M
+[DONE] quarot_Q4_K_M_sym: quarot -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --sym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_M
+[DONE] dart_Q4_K_M_sym: dart -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --sym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_M
+
+
+# --- Baseline: Quarot runs without activation quantization and different group size
+[DONE] Q4_K_S: full -m 1b --gguf Q4_K_S
+[DONE] Q4_K_S_bl_wasym: baseline -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --w_asym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_S
+[DONE] quarot_Q4_K_S_wasym: quarot -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --w_asym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_S
+[DONE] dart_Q4_K_S_wasym: dart -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --w_asym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_S
+[DONE] Q4_K_S_bl_sym: baseline -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --sym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_S
+[DONE] quarot_Q4_K_S_sym: quarot -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --sym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_S
+[DONE] dart_Q4_K_S_sym: dart -m 1b -w 4 -a 16 -k 16 -v 16 -G 128 --sym --kv_ex 16 --proj_ex 16 --imitate_gguf Q4_K_S

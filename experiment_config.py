@@ -127,6 +127,8 @@ def add_quant_args(parser):
                         help='Group size for W, K, V (default: 128)')
     parser.add_argument('--sym', action='store_true',
                         help='Symmetric quantization for W/K/V')
+    parser.add_argument('--w_asym', action='store_true',
+                        help='Asymmetric weight quantization (default: symmetric)')
     parser.add_argument('--kv_ex', type=int, default=0,
                         help='K-cache quant without R3 rotation (0=off)')
     parser.add_argument('--proj_ex', type=int, default=0,
@@ -152,6 +154,12 @@ def add_quant_args(parser):
     # Softmax Output Quantization
     parser.add_argument('--smq', type=int, default=0,
                         help='Softmax output quantization bits (0=disabled)')
+
+    # GGUF imitation (per-layer bit-width matching)
+    parser.add_argument('--imitate_gguf', type=str, default=None,
+                        help='Match per-layer weight bit-widths from a GGUF file. '
+                             'Pass a quant type (e.g. Q4_K_M) or explicit .gguf path. '
+                             'Does NOT load actual GGUF weights (use --gguf for that).')
 
     # GGUF pre-quantized weights
     parser.add_argument('--gguf', type=str, default=None,
@@ -194,8 +202,15 @@ def build_quant_tag(args, for_gptq_cache=False):
     If *for_gptq_cache* is True, the gptq_strength suffix is omitted so that
     all strength values share the same GPTQ checkpoint cache.
     """
-    sym_tag = "wSym_kSym_vSym" if args.sym else "kAsym_vAsym"
-    tag = f"w{args.w_bits}a{args.a_bits}k{args.k_bits}v{args.v_bits}_g{args.groupsize}_aAsym_{sym_tag}"
+    w_asym = getattr(args, 'w_asym', False) and not args.sym
+    if args.sym:
+        sym_tag = "wSym_kSym_vSym"
+    elif w_asym:
+        sym_tag = "wAsym_kAsym_vAsym"
+    else:
+        sym_tag = "kAsym_vAsym"
+    w_tag = "w0" if getattr(args, 'imitate_gguf', None) else f"w{args.w_bits}"
+    tag = f"{w_tag}a{args.a_bits}k{args.k_bits}v{args.v_bits}_g{args.groupsize}_aAsym_{sym_tag}"
     if args.kv_ex != 0:
         tag += f"_kvex{args.kv_ex}"
     if args.proj_ex != 0:
@@ -232,6 +247,14 @@ def build_quant_tag(args, for_gptq_cache=False):
         parts = basename.split('-')
         qtype = '-'.join(p for p in parts if p.startswith('Q')) or 'gguf'
         tag += f"_gguf-{qtype.replace('_', '-')}"
+    # Imitate-GGUF tag
+    if getattr(args, 'imitate_gguf', None):
+        gguf_path = resolve_gguf_path(args.imitate_gguf, args.model)
+        basename = os.path.basename(gguf_path).replace('.gguf', '')
+        parts = basename.split('-')
+        first_q = next((i for i, p in enumerate(parts) if p.startswith('Q')), None)
+        imit_label = '-'.join(parts[first_q:]) if first_q is not None else 'gguf'
+        tag += f"_imitate-{imit_label.replace('_', '-')}"
     # GPTQ strength tag (omitted for GPTQ cache so all strengths share one checkpoint)
     if not for_gptq_cache:
         _gs = getattr(args, 'gptq_strength', 1.0)
@@ -254,13 +277,14 @@ def resolve_act_scales_path(model_path, mode, quant_tag):
     return os.path.join(_DATA_DIR, 'act_scales', model_name, f'{mode}_{quant_tag}.pt')
 
 
-def resolve_gptq_checkpoint_dir(model_path, mode, quant_tag, w_bits):
+def resolve_gptq_checkpoint_dir(model_path, mode, quant_tag, w_bits, imitate_gguf=False):
     """Resolve GPTQ checkpoint directory (containing .pth files)."""
     model_name = model_name_from_path(model_path)
+    w_suffix = 'w0' if imitate_gguf else f'w{w_bits}'
     return os.path.join(
         _DATA_DIR, 'gptq_checkpoints',
         f'{mode}_{model_name}_{quant_tag}',
-        f'{model_name}_w{w_bits}',
+        f'{model_name}_{w_suffix}',
     )
 
 
@@ -273,6 +297,8 @@ def build_quant_args(args):
            '-G', str(args.groupsize)]
     if args.sym:
         cmd.append('--sym')
+    if getattr(args, 'w_asym', False):
+        cmd.append('--w_asym')
     if args.kv_ex:
         cmd += ['--kv_ex', str(args.kv_ex)]
     if args.proj_ex:
@@ -292,6 +318,8 @@ def build_quant_args(args):
             cmd.append('--acc_wrap')
     if getattr(args, 'smq', 0) > 0:
         cmd += ['--smq', str(args.smq)]
+    if getattr(args, 'imitate_gguf', None):
+        cmd += ['--imitate_gguf', args.imitate_gguf]
     if getattr(args, 'gguf', None):
         cmd += ['--gguf', args.gguf]
     if getattr(args, 'quant_warnings', False):
