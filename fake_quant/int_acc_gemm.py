@@ -13,6 +13,7 @@ Usage (from ActQuantWrapper):
 
 import math
 import logging
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -536,6 +537,65 @@ def _recover_int_and_scale_asym(
     return q_centered.to(torch.int8), scale, zp_offset
 
 
+def _requantize_with_gptq_params(
+    W: torch.Tensor,
+    gptq_scale: torch.Tensor,
+    gptq_zero: torch.Tensor,
+    maxq: int,
+    w_group_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Re-quantize fake-quantized weights using GPTQ's original scale/zero.
+
+    Instead of re-deriving scale/zero from the fake-quantized values (which
+    fails when not all quantization levels [0, maxq] are used in a group),
+    this uses the exact scale/zero that GPTQ computed during quantization.
+
+    Parameters
+    ----------
+    W          : [N, K] fake-quantized weight (float)
+    gptq_scale : [N, n_groups] or [N, 1] GPTQ's per-group scale
+    gptq_zero  : [N, n_groups] or [N, 1] GPTQ's per-group zero
+    maxq       : full unsigned range (e.g. 15 for 4-bit)
+    w_group_size : group size (-1 for per-channel)
+
+    Returns
+    -------
+    w_int  : [N, K] int8 (midpoint-centred)
+    w_scale : [N, n_groups] or [N] float32
+    w_zp   : [N, n_groups] or [N] float32 (midpoint - zero)
+    """
+    midpoint = (maxq + 1) // 2
+    N, K = W.shape
+
+    if w_group_size > 0:
+        n_groups = gptq_scale.shape[1]
+        padded_K = n_groups * w_group_size
+        if padded_K > K:
+            W_padded = F.pad(W, (0, padded_K - K))
+        else:
+            W_padded = W
+        # Expand scale/zero to match weight columns: [N, n_groups] -> [N, K]
+        scale_expanded = gptq_scale.repeat_interleave(w_group_size, dim=1)[:, :padded_K]
+        zero_expanded = gptq_zero.repeat_interleave(w_group_size, dim=1)[:, :padded_K]
+        q_unsigned = torch.clamp(
+            torch.round(W_padded / scale_expanded.clamp(min=1e-10)) + zero_expanded,
+            0, maxq,
+        )
+        q_centered = (q_unsigned - midpoint).to(torch.int8)
+        w_int = q_centered[:, :K].contiguous()
+        zp_offset = midpoint - gptq_zero  # [N, n_groups]
+        return w_int, gptq_scale, zp_offset
+    else:
+        # Per-channel: gptq_scale/gptq_zero are [N, 1]
+        q_unsigned = torch.clamp(
+            torch.round(W / gptq_scale.clamp(min=1e-10)) + gptq_zero,
+            0, maxq,
+        )
+        q_centered = (q_unsigned - midpoint).to(torch.int8)
+        zp_offset = midpoint - gptq_zero  # [N, 1]
+        return q_centered, gptq_scale.squeeze(1), zp_offset.squeeze(1)
+
+
 def prepare_int_weights(
     linear: torch.nn.Linear,
     w_bits: int,
@@ -545,9 +605,9 @@ def prepare_int_weights(
     """
     Re-quantize fake-quantized (post-GPTQ) float weights back to (w_int8, w_scale, w_zp).
 
-    After GPTQ, weights are stored as float tensors whose values lie on the
-    quantization grid.  We recover the integer representation by recomputing
-    per-channel (or per-group) scales and rounding.
+    If the linear layer has ``_gptq_w_scale`` and ``_gptq_w_zero`` buffers
+    (stored by GPTQ's ``fasterquant``), those exact parameters are reused.
+    Otherwise, scale/zero are re-derived from the fake-quantized values.
 
     Returns
     -------
@@ -558,6 +618,31 @@ def prepare_int_weights(
     W = linear.weight.data.float()  # [N, K]
     N, K = W.shape
 
+    # --- Fast path: reuse GPTQ's original scale/zero (asymmetric only) ---
+    if (not w_sym
+            and hasattr(linear, '_gptq_w_scale')
+            and linear._gptq_w_scale is not None):
+        maxq = 2 ** w_bits - 1
+        dev = W.device
+        w_int, w_scale, w_zp = _requantize_with_gptq_params(
+            W, linear._gptq_w_scale.to(dev).float(),
+            linear._gptq_w_zero.to(dev).float(),
+            maxq, w_group_size,
+        )
+        # Diagnostic: measure reconstruction error
+        if w_group_size > 0 and w_scale.dim() == 2:
+            recon = w_scale.repeat_interleave(w_group_size, dim=1)[:, :K] * \
+                (w_int.float() + w_zp.repeat_interleave(w_group_size, dim=1)[:, :K])
+        else:
+            recon = w_scale.unsqueeze(1) * (w_int.float() + w_zp.unsqueeze(1))
+        recon_err = (recon - W).abs().max().item()
+        logging.info("  prepare_int_weights: STORED GPTQ params (w_bits=%d, maxq=%d, "
+                     "scale=%s, recon_err=%.3e)", w_bits, maxq,
+                     list(linear._gptq_w_scale.shape), recon_err)
+        return w_int, w_scale, w_zp
+
+    # --- Fallback: re-derive scale/zero from fake-quantized values ---
+    logging.info("  prepare_int_weights: RECOVERY path (w_sym=%s, w_bits=%d)", w_sym, w_bits)
     if w_sym:
         maxq = 2 ** (w_bits - 1) - 1
         recover_fn = _recover_int_and_scale
@@ -594,7 +679,53 @@ def prepare_int_weights(
 
 
 # ---------------------------------------------------------------------------
-# E. Tag helper — consistent filename-safe tag for int GEMM configuration
+# E. GPTQ weight params save/load — separate file to keep main checkpoint unchanged
+# ---------------------------------------------------------------------------
+
+_GPTQ_W_PARAMS_FILENAME = '_gptq_w_params.pt'
+
+
+def save_gptq_w_params(model, ckpt_dir):
+    """Save per-group GPTQ scale/zero from model layers to a separate file.
+
+    Only saves layers that have _gptq_w_scale/_gptq_w_zero attributes
+    (set by fasterquant for asymmetric weight quantization).
+    """
+    params = {}
+    for name, module in model.named_modules():
+        if hasattr(module, '_gptq_w_scale') and module._gptq_w_scale is not None:
+            params[name] = {
+                'scale': module._gptq_w_scale.cpu(),
+                'zero': module._gptq_w_zero.cpu(),
+            }
+    if params:
+        path = os.path.join(ckpt_dir, _GPTQ_W_PARAMS_FILENAME)
+        torch.save(params, path)
+        logging.info("Saved GPTQ weight params for %d layers to %s", len(params), path)
+
+
+def load_gptq_w_params(model, ckpt_dir):
+    """Load per-group GPTQ scale/zero from separate file and attach to model layers.
+
+    Sets _gptq_w_scale/_gptq_w_zero as plain attributes on matching nn.Linear layers.
+    No-op if the params file doesn't exist (backwards compatible with old checkpoints).
+    """
+    path = os.path.join(ckpt_dir, _GPTQ_W_PARAMS_FILENAME)
+    if not os.path.isfile(path):
+        return
+    params = torch.load(path, map_location='cpu')
+    modules = dict(model.named_modules())
+    n_loaded = 0
+    for name, p in params.items():
+        if name in modules:
+            modules[name]._gptq_w_scale = p['scale']
+            modules[name]._gptq_w_zero = p['zero']
+            n_loaded += 1
+    logging.info("Loaded GPTQ weight params for %d layers from %s", n_loaded, path)
+
+
+# ---------------------------------------------------------------------------
+# F. Tag helper — consistent filename-safe tag for int GEMM configuration
 # ---------------------------------------------------------------------------
 _INT_GEMM_DEFAULTS = dict(
     acc_bits=32,

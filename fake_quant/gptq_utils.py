@@ -54,6 +54,20 @@ class GPTQ:
         H[dead, dead] = 1
         W[:, dead] = 0
 
+        # Collect per-group scale/zero for asymmetric weights so that
+        # prepare_int_weights can reuse GPTQ's exact parameters instead of
+        # re-deriving them from fake-quantized values (which fails when not
+        # all quantization levels are used in a group).
+        # Skip when actorder=True + static_groups=False: columns are permuted
+        # so per-group params in permuted order don't map to final column groups.
+        _collect_gptq_params = (
+            groupsize != -1
+            and not self.quantizer.sym
+            and not (actorder and not static_groups)
+        )
+        _gptq_scales = []  # will be [n_groups] list of [N,1] tensors
+        _gptq_zeros = []
+
         if static_groups:
             import copy
             groups = []
@@ -61,6 +75,9 @@ class GPTQ:
                 quantizer = copy.deepcopy(self.quantizer)
                 quantizer.find_params(W[:, i:(i + groupsize)])
                 groups.append(quantizer)
+                if _collect_gptq_params:
+                    _gptq_scales.append(quantizer.scale.clone())
+                    _gptq_zeros.append(quantizer.zero.clone())
 
         if actorder:
             perm = torch.argsort(torch.diag(H), descending=True)
@@ -97,6 +114,9 @@ class GPTQ:
                     if not static_groups:
                         if (i1 + i) % groupsize == 0:
                             self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)])
+                            if _collect_gptq_params:
+                                _gptq_scales.append(self.quantizer.scale.clone())
+                                _gptq_zeros.append(self.quantizer.zero.clone())
                     else:
                         idx = i1 + i
                         if actorder:
@@ -128,6 +148,20 @@ class GPTQ:
             import pprint
             pprint.pprint(self.quantizer.bits, self.quantizer.scale, self.quantizer.zero_point)
             raise ValueError('NaN in weights')
+
+        # Store per-group GPTQ scale/zero on the layer as plain attributes
+        # (NOT register_buffer — keeps the main checkpoint format unchanged).
+        # prepare_int_weights checks for these and reuses them instead of
+        # re-deriving from fake-quantized values.
+        if _collect_gptq_params and _gptq_scales:
+            # Each entry is [N, 1]; stack to [N, n_groups]
+            self.layer._gptq_w_scale = torch.cat(_gptq_scales, dim=1)  # [N, n_groups]
+            self.layer._gptq_w_zero = torch.cat(_gptq_zeros, dim=1)    # [N, n_groups]
+
+        # For per-channel asymmetric (groupsize == -1), also save.
+        if groupsize == -1 and not self.quantizer.sym:
+            self.layer._gptq_w_scale = self.quantizer.scale.clone()
+            self.layer._gptq_w_zero = self.quantizer.zero.clone()
 
         return mean_loss
 
@@ -275,8 +309,15 @@ def gptq_fwrd(model, dataloader, dev, args):
                         ql.quantizer.configure(bits=_a_bits, groupsize=-1,
                                                sym=True, clip_ratio=1.0)
                     if ql.quantizer.bits < 16 and getattr(ql.quantizer, 'groupsize', -1) <= 0:
+                        # Resolve per-layer w_bits from bit-width map
+                        _ig_wb = args.w_bits
+                        if w_bits_map:
+                            bare = qname.replace('.module', '')
+                            _ig_wb = w_bits_map.get(f'model.layers.{i}.{bare}', _ig_wb)
+                        if getattr(args, 'w_bits_down_proj', None) is not None and 'down_proj' in qname:
+                            _ig_wb = args.w_bits_down_proj
                         ql.prepare_int_gemm(
-                            w_bits=args.w_bits,
+                            w_bits=_ig_wb,
                             w_sym=not args.w_asym,
                             w_group_size=args.w_groupsize,
                             acc_bits=args.acc_bits,
@@ -296,8 +337,15 @@ def gptq_fwrd(model, dataloader, dev, args):
                     ql.quantizer.configure(bits=_a_bits, groupsize=-1,
                                            sym=True, clip_ratio=1.0)
                 if ql.quantizer.bits < 16 and getattr(ql.quantizer, 'groupsize', -1) <= 0:
+                    # Resolve per-layer w_bits from bit-width map
+                    _ig_wb = args.w_bits
+                    if w_bits_map:
+                        bare = qname.replace('.module', '')
+                        _ig_wb = w_bits_map.get(f'model.layers.{i}.{bare}', _ig_wb)
+                    if getattr(args, 'w_bits_down_proj', None) is not None and 'down_proj' in qname:
+                        _ig_wb = args.w_bits_down_proj
                     ql.prepare_int_gemm(
-                        w_bits=args.w_bits,
+                        w_bits=_ig_wb,
                         w_sym=not args.w_asym,
                         w_group_size=args.w_groupsize,
                         acc_bits=args.acc_bits,

@@ -159,6 +159,10 @@ def main():
                 f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
             logging.info("Loading GPTQ checkpoint from: {}".format(_gptq_ckpt))
             utils.load_model_in_parts(model, _gptq_ckpt)
+            # Load per-group GPTQ scale/zero for w_asym + int_gemm
+            if args.w_asym and args.int_gemm:
+                from int_acc_gemm import load_gptq_w_params
+                load_gptq_w_params(model, _gptq_ckpt)
             logging.info("GPTQ checkpoint loaded – skipping quantization.")
 
         elif gptq_strength > 0.0 and not args.w_rtn:  # GPTQ Weight Quantization
@@ -181,6 +185,10 @@ def main():
                 logging.info("Saving GPTQ checkpoint to: {}".format(_gptq_ckpt))
                 utils.save_model_in_parts(model, _gptq_ckpt,
                                           prefix=f'{model.model_name}_part')
+                # Save per-group GPTQ scale/zero for w_asym + int_gemm
+                if args.w_asym and args.int_gemm:
+                    from int_acc_gemm import save_gptq_w_params
+                    save_gptq_w_params(model, _gptq_ckpt)
 
         else:  # RTN Weight Quantization (also used when gptq_strength=0.0)
 
@@ -324,6 +332,7 @@ def main():
         logging.info("Preparing integer GEMM: acc_bits=%d, acc_block_k=%d, use_triton=%s, acc_wrap=%s",
                      args.acc_bits, args.acc_block_k, args.int_gemm_use_triton, args.acc_wrap)
         qlayers_ig = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        _ig_w_bits_map = getattr(args, 'w_bits_map', None)
         n_int_gemm = 0
         for name, qlayer in qlayers_ig.items():
             if 'lm_head' in name:
@@ -343,8 +352,15 @@ def main():
                 logging.info("  skipping int_gemm for %s (act groupsize=%d, need per-token)",
                              name, qlayer.quantizer.groupsize)
                 continue
+            # Resolve per-layer w_bits (from --imitate_gguf bit-width map
+            # and --w_bits_down_proj), mirroring GPTQ's logic.
+            layer_w_bits = args.w_bits
+            if _ig_w_bits_map:
+                layer_w_bits = _ig_w_bits_map.get(name, layer_w_bits)
+            if getattr(args, 'w_bits_down_proj', None) is not None and 'down_proj' in name:
+                layer_w_bits = args.w_bits_down_proj
             qlayer.prepare_int_gemm(
-                w_bits=args.w_bits,
+                w_bits=layer_w_bits,
                 w_sym=not args.w_asym,
                 w_group_size=args.w_groupsize,
                 acc_bits=args.acc_bits,

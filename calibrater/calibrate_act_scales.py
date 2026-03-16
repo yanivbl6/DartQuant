@@ -646,6 +646,9 @@ def main():
                 f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
             print(f"Loading existing GPTQ checkpoint from: {_gptq_ckpt}")
             utils.load_model_in_parts(model, _gptq_ckpt)
+            if args.w_asym and getattr(args, 'int_gemm', False):
+                from int_acc_gemm import load_gptq_w_params
+                load_gptq_w_params(model, _gptq_ckpt)
         else:
             _w_desc = f"w_bits_map({len(args.w_bits_map)} layers)" if _has_w_bits_map else f"w{args.w_bits}"
             print(f"Running GPTQ ({_w_desc}, groupsize={args.w_groupsize}) ...")
@@ -684,6 +687,9 @@ def main():
             print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
             utils.save_model_in_parts(model, _gptq_ckpt,
                                       prefix=f'{model_name}_part')
+            if args.w_asym and getattr(args, 'int_gemm', False):
+                from int_acc_gemm import save_gptq_w_params
+                save_gptq_w_params(model, _gptq_ckpt)
 
         utils.cleanup_memory(verbos=True)
 
@@ -774,6 +780,7 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             print(f"  CUDA synced, proceeding with prepare_int_gemm...", flush=True)
+        _ig_w_bits_map = getattr(args, 'w_bits_map', None)
         n_ig = 0
         for name, qlayer in ig_qlayers.items():
             if 'lm_head' in name or qlayer.quantizer.bits >= 16:
@@ -781,10 +788,16 @@ def main():
             if getattr(qlayer.quantizer, 'groupsize', -1) > 0:
                 logging.info(f"  skipping int_gemm for {name} (act groupsize={qlayer.quantizer.groupsize})")
                 continue
+            # Resolve per-layer w_bits (from --imitate_gguf bit-width map)
+            layer_w_bits = args.w_bits
+            if _ig_w_bits_map:
+                layer_w_bits = _ig_w_bits_map.get(name, layer_w_bits)
+            if getattr(args, 'w_bits_down_proj', None) is not None and 'down_proj' in name:
+                layer_w_bits = args.w_bits_down_proj
             dev = qlayer.module.weight.device
-            print(f"  [{n_ig}] {name}: weight on {dev}, shape={list(qlayer.module.weight.shape)}, bits={qlayer.quantizer.bits}", flush=True)
+            print(f"  [{n_ig}] {name}: weight on {dev}, shape={list(qlayer.module.weight.shape)}, bits={qlayer.quantizer.bits}, w_bits={layer_w_bits}", flush=True)
             qlayer.prepare_int_gemm(
-                w_bits=args.w_bits, w_sym=not args.w_asym,
+                w_bits=layer_w_bits, w_sym=not args.w_asym,
                 w_group_size=args.w_groupsize,
                 acc_bits=args.acc_bits, acc_block_k=args.acc_block_k,
                 acc_wrap=args.acc_wrap)
