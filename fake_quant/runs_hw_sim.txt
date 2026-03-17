@@ -27,13 +27,13 @@
 
 # single features
 [DONE] hw_pwl_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --static-act --imitate_gguf Q4_K_S
-hw_intgemm_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --int_gemm --acc_block_k 128 --acc_bits 16 --static-act --imitate_gguf Q4_K_S
+hw_intgemm_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --int_gemm --acc_block_k 128 --acc_bits 16 --static-act --imitate_gguf Q4_K_S --acc_wrap
 [DONE] hw_smq_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --smq 8 --static-act --imitate_gguf Q4_K_S
 
 # all three
-hw_all_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --smq 8 --static-act --imitate_gguf Q4_K_S
+hw_all_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --smq 8 --static-act --imitate_gguf Q4_K_S  --acc_wrap
 
 # pairs
-hw_pwl_intgemm_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --static-act --imitate_gguf Q4_K_S
+hw_pwl_intgemm_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --static-act --imitate_gguf Q4_K_S  --acc_wrap
 [DONE] hw_pwl_smq_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --smq 8 --static-act --imitate_gguf Q4_K_S
-hw_intgemm_smq_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --int_gemm --acc_block_k 128 --acc_bits 16 --smq 8 --static-act --imitate_gguf Q4_K_S
+hw_intgemm_smq_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --int_gemm --acc_block_k 128 --acc_bits 16 --smq 8 --static-act --imitate_gguf Q4_K_S  --acc_wrap

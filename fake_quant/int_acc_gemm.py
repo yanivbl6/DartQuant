@@ -494,6 +494,14 @@ def _recover_int_and_scale(W_fq: torch.Tensor, maxq: int) -> Tuple[torch.Tensor,
     return q.to(torch.int8), scale
 
 
+def _compute_adaptive_midpoint(zero: torch.Tensor, maxq: int) -> int:
+    """Pick midpoint minimizing |midpoint - zero| while keeping w_int in int8."""
+    lo = max(0, maxq - 127)   # ensures maxq - midpoint <= 127
+    hi = min(maxq, 128)       # ensures 0 - midpoint >= -128
+    raw = round(zero.float().mean().item())
+    return max(lo, min(hi, raw))
+
+
 def _recover_int_and_scale_asym(
     W_fq: torch.Tensor, maxq: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -508,9 +516,8 @@ def _recover_int_and_scale_asym(
         w = scale * (q_centered + midpoint - zero)
           = scale * q_centered  +  scale * zp_offset
 
-    where ``midpoint = (maxq + 1) // 2``, ``q_centered = q_unsigned - midpoint``
-    (always in ``[-midpoint, maxq - midpoint]`` — the standard signed int
-    range), and ``zp_offset = midpoint - zero``.
+    where ``midpoint = round(mean(zero))`` (adaptive, minimises |zp_offset|),
+    ``q_centered = q_unsigned - midpoint``, and ``zp_offset = midpoint - zero``.
 
     ``q_centered`` is stored as int8 for the kernel (same range as symmetric).
     The ``zp_offset`` correction is applied in float outside the accumulator.
@@ -526,15 +533,16 @@ def _recover_int_and_scale_asym(
     scale      : [N, 1] float32 per-row scale
     zp_offset  : [N, 1] float32 per-row ``midpoint - zero`` (correction factor)
     """
-    midpoint = (maxq + 1) // 2
     w_min = W_fq.amin(dim=1, keepdim=True)
     w_max = W_fq.amax(dim=1, keepdim=True)
     scale = ((w_max - w_min) / maxq).clamp(min=1e-10)
     zero = torch.round(-w_min / scale)
+    midpoint = _compute_adaptive_midpoint(zero, maxq)
     q_unsigned = torch.clamp(torch.round(W_fq / scale) + zero, 0, maxq)
-    q_centered = q_unsigned - midpoint  # always in [-midpoint, maxq - midpoint]
-    zp_offset = midpoint - zero         # correction factor
-    return q_centered.to(torch.int8), scale, zp_offset
+    # Fold zp into w_int: w_centered = q_unsigned - gptq_zero (true centered)
+    # This eliminates the w_zp correction term entirely.
+    w_centered = (q_unsigned.long() - zero.long()).clamp(-128, 127).to(torch.int8)
+    return w_centered, scale, None  # w_zp = None (folded in)
 
 
 def _requantize_with_gptq_params(
@@ -564,8 +572,12 @@ def _requantize_with_gptq_params(
     w_scale : [N, n_groups] or [N] float32
     w_zp   : [N, n_groups] or [N] float32 (midpoint - zero)
     """
-    midpoint = (maxq + 1) // 2
     N, K = W.shape
+
+    # Verify gptq_zero is integer-valued (from torch.round in GPTQ)
+    zp_frac = (gptq_zero - gptq_zero.round()).abs().max().item()
+    assert zp_frac < 0.01, \
+        f"gptq_zero has fractional part {zp_frac:.4e} — cannot fold into int8"
 
     if w_group_size > 0:
         n_groups = gptq_scale.shape[1]
@@ -581,19 +593,18 @@ def _requantize_with_gptq_params(
             torch.round(W_padded / scale_expanded.clamp(min=1e-10)) + zero_expanded,
             0, maxq,
         )
-        q_centered = (q_unsigned - midpoint).to(torch.int8)
-        w_int = q_centered[:, :K].contiguous()
-        zp_offset = midpoint - gptq_zero  # [N, n_groups]
-        return w_int, gptq_scale, zp_offset
+        # Fold w_zp: w_centered = q_unsigned - gptq_zero (true centered)
+        w_centered = (q_unsigned.long() - zero_expanded.long()).clamp(-128, 127).to(torch.int8)
+        w_int = w_centered[:, :K].contiguous()
+        return w_int, gptq_scale, None  # w_zp = None (folded in)
     else:
         # Per-channel: gptq_scale/gptq_zero are [N, 1]
         q_unsigned = torch.clamp(
             torch.round(W / gptq_scale.clamp(min=1e-10)) + gptq_zero,
             0, maxq,
         )
-        q_centered = (q_unsigned - midpoint).to(torch.int8)
-        zp_offset = midpoint - gptq_zero  # [N, 1]
-        return q_centered, gptq_scale.squeeze(1), zp_offset.squeeze(1)
+        w_centered = (q_unsigned.long() - gptq_zero.long()).clamp(-128, 127).to(torch.int8)
+        return w_centered, gptq_scale.squeeze(1), None  # w_zp = None (folded in)
 
 
 def prepare_int_weights(
@@ -629,12 +640,11 @@ def prepare_int_weights(
             linear._gptq_w_zero.to(dev).float(),
             maxq, w_group_size,
         )
-        # Diagnostic: measure reconstruction error
+        # Diagnostic: measure reconstruction error (w_zp folded into w_int)
         if w_group_size > 0 and w_scale.dim() == 2:
-            recon = w_scale.repeat_interleave(w_group_size, dim=1)[:, :K] * \
-                (w_int.float() + w_zp.repeat_interleave(w_group_size, dim=1)[:, :K])
+            recon = w_scale.repeat_interleave(w_group_size, dim=1)[:, :K] * w_int.float()
         else:
-            recon = w_scale.unsqueeze(1) * (w_int.float() + w_zp.unsqueeze(1))
+            recon = w_scale.unsqueeze(1) * w_int.float()
         recon_err = (recon - W).abs().max().item()
         logging.info("  prepare_int_weights: STORED GPTQ params (w_bits=%d, maxq=%d, "
                      "scale=%s, recon_err=%.3e)", w_bits, maxq,
@@ -665,15 +675,12 @@ def prepare_int_weights(
         # Reshape back and trim padding
         w_int = q_flat.reshape(N, padded_K)[:, :K].contiguous()
         w_scale = scale_flat.squeeze(1).reshape(N, n_groups)
-        if not w_sym:
-            w_zp = result[2].squeeze(1).reshape(N, n_groups)
-        else:
-            w_zp = None
+        w_zp = None  # folded into w_int for asym, N/A for sym
     else:
         result = recover_fn(W, maxq)
         w_int = result[0]
         w_scale = result[1].squeeze(1)                # [N]
-        w_zp = result[2].squeeze(1) if not w_sym else None  # [N] or None
+        w_zp = None  # folded into w_int for asym, N/A for sym
 
     return w_int, w_scale, w_zp
 

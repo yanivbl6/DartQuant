@@ -105,6 +105,10 @@ def parser_gen():
                         help='Use Triton kernel for integer GEMM (default: True). '
                              'Set --no-int_gemm_use_triton for pure-PyTorch reference.')
 
+    parser.add_argument('--ig_compare', action=argparse.BooleanOptionalAction, default=False,
+                        help='Compare int_gemm output vs normal fake-quant GEMM per layer. '
+                             'Prints relative error and uses the float path for PPL.')
+
     # Static vs Dynamic comparison diagnostic
     parser.add_argument('--sd_check', type=float, default=0,
                         help='Compare static vs dynamic quantization per-layer. '

@@ -22,6 +22,7 @@ except ImportError:
 
 from int_acc_gemm import (
     _HAS_TRITON,
+    _compute_adaptive_midpoint,
     int_gemm_capped_reference,
     prepare_int_weights,
 )
@@ -522,11 +523,10 @@ def test_prepare_int_weights_asym(device=None):
 
     w_int, w_scale, w_zp = prepare_int_weights(linear, w_bits=4, w_sym=False, w_group_size=-1)
 
-    assert w_zp is not None, "FAIL: w_zp should not be None for asymmetric"
+    assert w_zp is None, "FAIL: w_zp should be None (folded into w_int)"
 
-    # Round-trip: w_scale * (w_int + zp_offset) ≈ original weight
-    # w_int is q_centered, w_zp is zp_offset
-    reconstructed = w_scale[:, None] * (w_int.float() + w_zp[:, None])
+    # Round-trip: w_scale * w_int ≈ original weight (w_zp folded in)
+    reconstructed = w_scale[:, None] * w_int.float()
     diff = (reconstructed - linear.weight.data.float()).abs().max().item()
     print(f"  round-trip max error: {diff:.2e}")
     assert diff < 1e-4, f"FAIL: round-trip error too large: {diff}"
@@ -545,15 +545,14 @@ def test_prepare_int_weights_asym_grouped():
     w_int, w_scale, w_zp = prepare_int_weights(linear, w_bits=4, w_sym=False,
                                                 w_group_size=GROUP)
 
-    assert w_zp is not None, "FAIL: w_zp should not be None"
+    assert w_zp is None, "FAIL: w_zp should be None (folded into w_int)"
     assert w_scale.shape == (N, K // GROUP), f"FAIL: w_scale shape {w_scale.shape}"
-    assert w_zp.shape == (N, K // GROUP), f"FAIL: w_zp shape {w_zp.shape}"
 
-    # Per-group round-trip
+    # Per-group round-trip (w_zp folded in)
     n_groups = K // GROUP
     for g in range(n_groups):
         ks, ke = g * GROUP, (g + 1) * GROUP
-        recon = w_scale[:, g:g+1] * (w_int[:, ks:ke].float() + w_zp[:, g:g+1])
+        recon = w_scale[:, g:g+1] * w_int[:, ks:ke].float()
         diff = (recon - linear.weight.data[:, ks:ke].float()).abs().max().item()
         assert diff < 1e-4, f"FAIL: group {g} round-trip error {diff}"
 
@@ -580,22 +579,17 @@ def test_int_gemm_capped_asym_weights_sym_act():
     linear.weight.data = _fake_quant_asym(linear.weight.data, w_bits=4,
                                            group_size=GROUP).to(linear.weight.dtype)
 
-    # Prepare int weights (asymmetric)
+    # Prepare int weights (asymmetric, w_zp folded into w_int)
     w_int, w_scale, w_zp = prepare_int_weights(linear, w_bits=4, w_sym=False,
                                                 w_group_size=GROUP)
+    assert w_zp is None, "w_zp should be None (folded)"
     w_int = w_int.to(DEV)
     w_scale = w_scale.to(DEV)
-    w_zp = w_zp.to(DEV)
 
-    # Precompute w_zp_correction (needed for asymmetric activations, but we set
-    # it up anyway to match ActQuantWrapper.prepare_int_gemm logic)
+    # Precompute w_zp_correction (for asymmetric activations)
     n_groups = w_scale.shape[1]
-    w_int_padded = w_int.float()
-    group_sums = w_int_padded.reshape(N, n_groups, GROUP).sum(dim=2)
+    group_sums = w_int.float().reshape(N, n_groups, GROUP).sum(dim=2)
     w_zp_correction = (w_scale * group_sums).sum(dim=1)
-
-    # Precompute w_zp_cross
-    w_zp_cross = (w_zp * w_scale * GROUP).sum(dim=1).to(DEV)
 
     # Symmetric activation quantizer
     quantizer = ActQuantizer()
@@ -609,7 +603,7 @@ def test_int_gemm_capped_asym_weights_sym_act():
     quantizer.free()
     out_normal = x_fq @ linear.weight.data.float().t()
 
-    # Int GEMM path
+    # Int GEMM path (no w_zp, no w_zp_cross — folded)
     quantizer2 = ActQuantizer()
     quantizer2.configure(bits=8, groupsize=-1, sym=True, clip_ratio=1.0)
     out_int = int_gemm_capped(
@@ -618,8 +612,6 @@ def test_int_gemm_capped_asym_weights_sym_act():
         acc_bits=32, block_k=32, w_group_size=GROUP,
         use_triton=(_HAS_TRITON and torch.cuda.is_available()),
         w_zp_correction=w_zp_correction,
-        w_zp=w_zp,
-        w_zp_cross=w_zp_cross,
     )
 
     diff = (out_normal - out_int).abs()
@@ -651,17 +643,16 @@ def test_int_gemm_capped_asym_weights_asym_act():
     linear.weight.data = _fake_quant_asym(linear.weight.data, w_bits=4,
                                            group_size=GROUP).to(linear.weight.dtype)
 
-    # Prepare int weights
+    # Prepare int weights (w_zp folded)
     w_int, w_scale, w_zp = prepare_int_weights(linear, w_bits=4, w_sym=False,
                                                 w_group_size=GROUP)
+    assert w_zp is None
     w_int = w_int.to(DEV)
     w_scale = w_scale.to(DEV)
-    w_zp = w_zp.to(DEV)
 
     n_groups = w_scale.shape[1]
     group_sums = w_int.float().reshape(N, n_groups, GROUP).sum(dim=2)
     w_zp_correction = (w_scale * group_sums).sum(dim=1)
-    w_zp_cross = (w_zp * w_scale * GROUP).sum(dim=1).to(DEV)
 
     # Asymmetric activation quantizer
     quantizer = ActQuantizer()
@@ -675,7 +666,7 @@ def test_int_gemm_capped_asym_weights_asym_act():
     quantizer.free()
     out_normal = x_fq @ linear.weight.data.float().t()
 
-    # Int GEMM path
+    # Int GEMM path (no w_zp, no w_zp_cross — folded)
     quantizer2 = ActQuantizer()
     quantizer2.configure(bits=8, groupsize=-1, sym=False, clip_ratio=1.0)
     out_int = int_gemm_capped(
@@ -684,8 +675,6 @@ def test_int_gemm_capped_asym_weights_asym_act():
         acc_bits=32, block_k=32, w_group_size=GROUP,
         use_triton=(_HAS_TRITON and torch.cuda.is_available()),
         w_zp_correction=w_zp_correction,
-        w_zp=w_zp,
-        w_zp_cross=w_zp_cross,
     )
 
     diff = (out_normal - out_int).abs()
@@ -715,14 +704,13 @@ def test_int_gemm_capped_asym_5bit():
 
     w_int, w_scale, w_zp = prepare_int_weights(linear, w_bits=5, w_sym=False,
                                                 w_group_size=GROUP)
+    assert w_zp is None
     w_int = w_int.to(DEV)
     w_scale = w_scale.to(DEV)
-    w_zp = w_zp.to(DEV)
 
     n_groups = w_scale.shape[1]
     group_sums = w_int.float().reshape(N, n_groups, GROUP).sum(dim=2)
     w_zp_correction = (w_scale * group_sums).sum(dim=1)
-    w_zp_cross = (w_zp * w_scale * GROUP).sum(dim=1).to(DEV)
 
     quantizer = ActQuantizer()
     quantizer.configure(bits=8, groupsize=-1, sym=True, clip_ratio=1.0)
@@ -744,8 +732,6 @@ def test_int_gemm_capped_asym_5bit():
         acc_bits=32, block_k=32, w_group_size=GROUP,
         use_triton=(_HAS_TRITON and torch.cuda.is_available()),
         w_zp_correction=w_zp_correction,
-        w_zp=w_zp,
-        w_zp_cross=w_zp_cross,
     )
 
     diff = (out_normal - out_int).abs()
@@ -775,14 +761,13 @@ def test_int_gemm_capped_asym_6bit():
 
     w_int, w_scale, w_zp = prepare_int_weights(linear, w_bits=6, w_sym=False,
                                                 w_group_size=GROUP)
+    assert w_zp is None
     w_int = w_int.to(DEV)
     w_scale = w_scale.to(DEV)
-    w_zp = w_zp.to(DEV)
 
     n_groups = w_scale.shape[1]
     group_sums = w_int.float().reshape(N, n_groups, GROUP).sum(dim=2)
     w_zp_correction = (w_scale * group_sums).sum(dim=1)
-    w_zp_cross = (w_zp * w_scale * GROUP).sum(dim=1).to(DEV)
 
     quantizer = ActQuantizer()
     quantizer.configure(bits=8, groupsize=-1, sym=True, clip_ratio=1.0)
@@ -802,8 +787,6 @@ def test_int_gemm_capped_asym_6bit():
         acc_bits=32, block_k=32, w_group_size=GROUP,
         use_triton=(_HAS_TRITON and torch.cuda.is_available()),
         w_zp_correction=w_zp_correction,
-        w_zp=w_zp,
-        w_zp_cross=w_zp_cross,
     )
 
     diff = (out_normal - out_int).abs()
@@ -847,11 +830,12 @@ def test_recovery_vs_weight_quantizer():
     # Also get the original integers from GPTQ's quantizer
     maxq = int(wq.maxq.item())
     q_orig, _, _ = asym_quant(W, wq.scale, wq.zero, wq.maxq)  # [N, K] in [0, maxq]
-    midpoint = (maxq + 1) // 2
-    q_centered_orig = (q_orig - midpoint).to(torch.int8)
+    # True centered: q_unsigned - gptq_zero (w_zp folded in)
+    q_centered_orig = (q_orig.long() - wq.zero.long()).clamp(-128, 127).to(torch.int8)
 
-    # Now recover using _recover_int_and_scale_asym
-    q_centered_rec, scale_rec, zp_offset_rec = _recover_int_and_scale_asym(W_fq, maxq)
+    # Now recover using _recover_int_and_scale_asym (returns w_zp=None, folded)
+    q_centered_rec, scale_rec, zp_rec = _recover_int_and_scale_asym(W_fq, maxq)
+    assert zp_rec is None, "Expected w_zp=None after folding"
 
     # Compare integers
     n_mismatch = (q_centered_rec != q_centered_orig).sum().item()
@@ -859,25 +843,16 @@ def test_recovery_vs_weight_quantizer():
     pct = 100.0 * n_mismatch / n_total
     print(f"  integer mismatches: {n_mismatch}/{n_total} ({pct:.2f}%)")
 
-    # Compare reconstructed values
+    # Compare reconstructed values (w_zp folded → w_int IS the centered integer)
     recon_orig = wq.scale * (q_orig - wq.zero)
-    recon_rec = scale_rec * (q_centered_rec.float() + zp_offset_rec)
+    recon_rec = scale_rec * q_centered_rec.float()
     val_diff = (recon_rec - recon_orig.float()).abs().max().item()
     print(f"  max value reconstruction diff: {val_diff:.2e}")
 
     if n_mismatch > 0:
-        # Show which rows diverge
         row_mismatches = (q_centered_rec != q_centered_orig).sum(dim=1)
         bad_rows = (row_mismatches > 0).nonzero(as_tuple=True)[0]
         print(f"  rows with mismatches: {bad_rows.tolist()[:10]}...")
-        for r in bad_rows[:3]:
-            orig_scale = wq.scale[r].item()
-            orig_zero = wq.zero[r].item()
-            rec_scale = scale_rec[r].item()
-            rec_zp = zp_offset_rec[r].item()
-            rec_zero = midpoint - rec_zp
-            print(f"    row {r}: GPTQ scale={orig_scale:.6f} zero={orig_zero:.0f}"
-                  f"  |  recovery scale={rec_scale:.6f} zero={rec_zero:.0f}")
 
     assert n_mismatch == 0, f"FAIL: {n_mismatch} integer mismatches"
     print("  PASS\n")
@@ -898,7 +873,7 @@ def test_recovery_vs_weight_quantizer_grouped():
 
     # Per-group fake-quantize using WeightQuantizer (mimicking GPTQ)
     W_fq = W.clone()
-    q_all = torch.zeros_like(W)
+    q_centered_orig = torch.zeros_like(W, dtype=torch.int8)
     for g in range(K // GROUP):
         ks, ke = g * GROUP, (g + 1) * GROUP
         wq = WeightQuantizer()
@@ -906,10 +881,8 @@ def test_recovery_vs_weight_quantizer_grouped():
         wq.find_params(W[:, ks:ke])
         W_fq[:, ks:ke] = wq.quantize(W[:, ks:ke])
         q_g, _, _ = asym_quant(W[:, ks:ke], wq.scale, wq.zero, wq.maxq)
-        q_all[:, ks:ke] = q_g
-
-    midpoint = (maxq_val + 1) // 2
-    q_centered_orig = (q_all - midpoint).to(torch.int8)
+        # True centered: q_unsigned - gptq_zero (w_zp folded)
+        q_centered_orig[:, ks:ke] = (q_g.long() - wq.zero.long()).clamp(-128, 127).to(torch.int8)
 
     # Recovery: reshape into groups (same as prepare_int_weights)
     n_groups = K // GROUP
@@ -957,7 +930,7 @@ def test_recovery_vs_weight_quantizer_5bit():
     W = torch.randn(N, K, device=DEV)
 
     W_fq = W.clone()
-    q_all = torch.zeros_like(W)
+    q_centered_orig = torch.zeros_like(W, dtype=torch.int8)
     for g in range(K // GROUP):
         ks, ke = g * GROUP, (g + 1) * GROUP
         wq = WeightQuantizer()
@@ -965,10 +938,7 @@ def test_recovery_vs_weight_quantizer_5bit():
         wq.find_params(W[:, ks:ke])
         W_fq[:, ks:ke] = wq.quantize(W[:, ks:ke])
         q_g, _, _ = asym_quant(W[:, ks:ke], wq.scale, wq.zero, wq.maxq)
-        q_all[:, ks:ke] = q_g
-
-    midpoint = (maxq_val + 1) // 2
-    q_centered_orig = (q_all - midpoint).to(torch.int8)
+        q_centered_orig[:, ks:ke] = (q_g.long() - wq.zero.long()).clamp(-128, 127).to(torch.int8)
 
     n_groups = K // GROUP
     W_grouped = W_fq.reshape(N * n_groups, GROUP)
@@ -1006,7 +976,7 @@ def test_recovery_vs_weight_quantizer_6bit():
     W = torch.randn(N, K, device=DEV)
 
     W_fq = W.clone()
-    q_all = torch.zeros_like(W)
+    q_centered_orig = torch.zeros_like(W, dtype=torch.int8)
     for g in range(K // GROUP):
         ks, ke = g * GROUP, (g + 1) * GROUP
         wq = WeightQuantizer()
@@ -1014,10 +984,7 @@ def test_recovery_vs_weight_quantizer_6bit():
         wq.find_params(W[:, ks:ke])
         W_fq[:, ks:ke] = wq.quantize(W[:, ks:ke])
         q_g, _, _ = asym_quant(W[:, ks:ke], wq.scale, wq.zero, wq.maxq)
-        q_all[:, ks:ke] = q_g
-
-    midpoint = (maxq_val + 1) // 2
-    q_centered_orig = (q_all - midpoint).to(torch.int8)
+        q_centered_orig[:, ks:ke] = (q_g.long() - wq.zero.long()).clamp(-128, 127).to(torch.int8)
 
     n_groups = K // GROUP
     W_grouped = W_fq.reshape(N * n_groups, GROUP)
@@ -1058,8 +1025,6 @@ def test_gptq_stored_params_with_error_compensation():
     GROUP = 128
     BITS = 4
     maxq = 2 ** BITS - 1
-    midpoint = (maxq + 1) // 2
-
     # Create a linear layer and run real GPTQ on it
     linear = torch.nn.Linear(K, N, bias=False).to(DEV)
 
@@ -1096,11 +1061,12 @@ def test_gptq_stored_params_with_error_compensation():
         linear_no_params, BITS, w_sym=False, w_group_size=GROUP)
 
     # Both should reconstruct the same fake-quantized values
+    # w_zp is folded into w_int, so reconstruction is just w_scale * w_int
+    assert w_zp_stored is None, "Expected w_zp=None (folded) for stored-params path"
+    assert w_zp_recov is None, "Expected w_zp=None (folded) for recovery path"
     W_fq = linear.weight.data.float()
-    recon_stored = w_scale_stored.repeat_interleave(GROUP, dim=1) * \
-        (w_int_stored.float() + w_zp_stored.repeat_interleave(GROUP, dim=1))
-    recon_recov = w_scale_recov.repeat_interleave(GROUP, dim=1) * \
-        (w_int_recov.float() + w_zp_recov.repeat_interleave(GROUP, dim=1))
+    recon_stored = w_scale_stored.repeat_interleave(GROUP, dim=1) * w_int_stored.float()
+    recon_recov = w_scale_recov.repeat_interleave(GROUP, dim=1) * w_int_recov.float()
 
     err_stored = (recon_stored - W_fq).abs().max().item()
     err_recov = (recon_recov - W_fq).abs().max().item()

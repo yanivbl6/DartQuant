@@ -371,6 +371,16 @@ def main():
             n_int_gemm += 1
         logging.info("Integer GEMM prepared for %d layers", n_int_gemm)
 
+        if getattr(args, 'ig_compare', False):
+            for name, qlayer in qlayers.items():
+                if qlayer.use_int_gemm:
+                    qlayer._ig_compare = True
+                    qlayer.quantizer._sd_name = name
+                    qlayer.quantizer._sd_norm = float('inf')
+                    qlayer.quantizer._sd_check = 0  # don't trigger sd_check, ig_compare handles it
+                    qlayer.quantizer._sd_logged_first = False
+            logging.info("ig_compare enabled: will compare int_gemm vs float GEMM per layer")
+
     if args.k_bits < 16:
         logging.info("Add k quantization: k_bits={}, k_groupsize={}, k_sym={}, k_clip_ratio={}".format(
             args.k_bits, args.k_groupsize, not (args.k_asym), args.k_clip_ratio))

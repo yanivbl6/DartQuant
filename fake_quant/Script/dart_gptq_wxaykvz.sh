@@ -122,6 +122,7 @@ ACC_WRAP=0
 SMQ=0
 SD_CHECK=0
 SD_CHECK_NORM="inf"
+IG_COMPARE=0
 SELECTIVE_DYN=""
 WEIGHTS_STATS=""
 GGUF=""
@@ -161,6 +162,7 @@ while [[ $# -gt 0 ]]; do
         --smq)         SMQ="$2";         shift 2 ;;
         --sd_check)    SD_CHECK="$2";    shift 2 ;;
         --sd_check_norm) SD_CHECK_NORM="$2"; shift 2 ;;
+        --ig_compare)  IG_COMPARE=1;  shift   ;;
         --selective-dyn) SELECTIVE_DYN="$2"; shift 2 ;;
         --weights_stats) WEIGHTS_STATS="$2"; shift 2 ;;
         --gguf)        GGUF="$2";           shift 2 ;;
@@ -389,6 +391,10 @@ SD_CHECK_FLAG=""
 if [ "$SD_CHECK" != "0" ]; then
     SD_CHECK_FLAG="--sd_check ${SD_CHECK} --sd_check_norm ${SD_CHECK_NORM}"
 fi
+IG_COMPARE_FLAG=""
+if [ "$IG_COMPARE" = "1" ]; then
+    IG_COMPARE_FLAG="--ig_compare"
+fi
 
 # --- Selective dynamic flags ---
 SELECTIVE_DYN_FLAG=""
@@ -488,6 +494,7 @@ python main_for_test.py \
     ${INT_GEMM_FLAG} \
     ${SMQ_FLAG} \
     ${SD_CHECK_FLAG} \
+    ${IG_COMPARE_FLAG} \
     ${SELECTIVE_DYN_FLAG} \
     ${WEIGHTS_STATS_FLAG} \
     ${GGUF_FLAG} \

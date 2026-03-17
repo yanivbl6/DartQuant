@@ -497,6 +497,7 @@ class ActQuantWrapper(torch.nn.Module):
         self.fp32_had = False
         # Integer GEMM with capped accumulator
         self.use_int_gemm = False
+        self._ig_compare = False  # compare int_gemm vs float GEMM
         self.acc_bits = 32
         self.acc_block_k = 32
         self.acc_wrap = False
@@ -703,6 +704,50 @@ class ActQuantWrapper(torch.nn.Module):
                 if saved[3] is not None:
                     q.zero = saved[3]
                 q._sd_report(x, x_dyn)
+
+            # ig_compare: compare int_gemm vs normal fake-quant GEMM
+            if self._ig_compare:
+                q = self.quantizer
+                # Switch to dynamic mode for fair comparison (static scales
+                # are shaped for int_gemm's per-group layout)
+                saved = (q.static, q.groupsize,
+                         q.scale.clone() if q.scale is not None else None,
+                         q.zero.clone() if q.zero is not None else None)
+                q.static = False
+                q.groupsize = -1
+                x_fq = x_pre.clone()
+                if q.bits < 16:
+                    x_fq = q(x_fq).to(x_dtype)
+                    q.free()
+                x_fq = self.module(x_fq).to(x_dtype)
+                # Restore quantizer state
+                q.static, q.groupsize = saved[0], saved[1]
+                q.scale = saved[2]
+                if saved[3] is not None:
+                    q.zero = saved[3]
+
+                # Check error and report midpoint for problematic layers
+                if not getattr(self, '_ig_logged', False):
+                    self._ig_logged = True
+                    ref_norm = x_fq.float().abs().max().item()
+                    full_err = (x.float() - x_fq.float()).abs().max().item() / ref_norm if ref_norm > 0 else 0
+
+                    if full_err > 0.1 and self.w_zp is not None and self.w_zp.numel() > 0:
+                        wzp = self.w_zp.float()
+                        # w_int is centered: range [-midpoint, maxq-midpoint]
+                        # w_zp = midpoint - gptq_zero, so gptq_zero = midpoint - w_zp
+                        midpoint = int(-self.w_int.min().item())  # e.g. 8 for 4-bit
+                        gptq_zero = midpoint - wzp
+                        print(f"[ig_cmp] {q._sd_name}: err={full_err:.2e}  "
+                              f"midpoint={midpoint}  "
+                              f"gptq_zero  mean={gptq_zero.mean().item():.2f}  "
+                              f"range=[{gptq_zero.min().item():.1f}, {gptq_zero.max().item():.1f}]  "
+                              f"w_zp  abs_mean={wzp.abs().mean().item():.2f}  "
+                              f"max={wzp.abs().max().item():.1f}", flush=True)
+                    elif full_err > 0.1:
+                        print(f"[ig_cmp] {q._sd_name}: err={full_err:.2e}  (no w_zp)", flush=True)
+
+                x = x_fq  # use float path for correct PPL
         else:
             # Original fake-quant path
             if self.quantizer.bits < 16:  # Quantize, if needed
