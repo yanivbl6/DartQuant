@@ -298,13 +298,151 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
     }
 
 
+def _wrap_label(s, max_chars=15):
+    """Wrap a label string into multiple lines at word boundaries."""
+    words = s.replace("_", " ").split()
+    lines, line = [], ""
+    for w in words:
+        if line and len(line) + 1 + len(w) > max_chars:
+            lines.append(line)
+            line = w
+        else:
+            line = f"{line} {w}" if line else w
+    if line:
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _collect_metric_values(configs, matrix, col_idx):
+    """Collect all non-None metric values across configs for y-limit computation."""
+    vals = []
+    for cfg in configs:
+        v = matrix[cfg["baseline_idx"]][col_idx]
+        if v is not None:
+            vals.append(v)
+        for pair in cfg["pairs"]:
+            v = matrix[pair["run_idx"]][col_idx]
+            if v is not None:
+                vals.append(v)
+    return vals
+
+
+def _set_focused_ylim(ax, vals, ppl_col):
+    """Set y-axis limits focused on the actual data range."""
+    if not vals:
+        return
+    vmin, vmax = min(vals), max(vals)
+    margin = max((vmax - vmin) * 0.3, 0.01)
+    if ppl_col:
+        ax.set_ylim(vmax + margin, vmin - margin)
+    else:
+        ax.set_ylim(vmin - margin, vmax + margin)
+
+
+def _make_title(col_header, baseline_value, common_sub):
+    """Build a chart title, appending common subtitle if present."""
+    title = f"{col_header}  (compare: {baseline_value})"
+    if common_sub:
+        title += f"\n{common_sub}"
+    return title
+
+
+def _save_fig(fig, fig_dir, metric_kw, baseline_value, chart_type):
+    """Save figure to disk and print path."""
+    fname = f"{metric_kw}_{baseline_value}_{chart_type}.png".replace("/", "_")
+    path = os.path.join(fig_dir, fname)
+    fig.savefig(path, dpi=150)
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+    print(f"  {DIM}Saved {path}{RESET}")
+
+
+def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
+                    baseline_value, key_colors, col_header, common_sub,
+                    short_labels, fig_dir, metric_kw):
+    """Draw and save a clustered bar chart for one metric."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(max(6, len(configs) * 1.5 + 2), 5))
+    n_keys = len(key_values)
+    bar_width = 0.8 / n_keys
+
+    for ci, cfg in enumerate(configs):
+        bl_val = matrix[cfg["baseline_idx"]][col_idx]
+        if bl_val is not None:
+            ax.bar(ci + key_values.index(baseline_value) * bar_width,
+                   bl_val, bar_width, color=key_colors[baseline_value],
+                   label=baseline_value if ci == 0 else "")
+        for pair in cfg["pairs"]:
+            kl = pair["key_label"]
+            val = matrix[pair["run_idx"]][col_idx]
+            if val is not None and kl in key_colors:
+                ki = key_values.index(kl)
+                ax.bar(ci + ki * bar_width, val, bar_width,
+                       color=key_colors[kl],
+                       label=kl if ci == 0 else "")
+
+    _set_focused_ylim(ax, _collect_metric_values(configs, matrix, col_idx),
+                      ppl_col)
+
+    wrapped = [_wrap_label(l) for l in short_labels]
+    ax.set_xticks([ci + bar_width * (n_keys - 1) / 2
+                   for ci in range(len(configs))])
+    ax.set_xticklabels(wrapped, rotation=0, ha="center", fontsize=7)
+    ax.set_ylabel(col_header)
+    ax.set_title(_make_title(col_header, baseline_value, common_sub),
+                 fontsize=10)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    _save_fig(fig, fig_dir, metric_kw, baseline_value, "bar")
+
+
+def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
+                     baseline_value, col_header, common_sub, short_labels,
+                     fig_dir, metric_kw):
+    """Draw and save a line chart for one metric (numeric compare, ≥3 values)."""
+    import matplotlib.pyplot as plt
+
+    x_nums = []
+    for kv in key_values:
+        m = re.search(r'(\d+)', kv)
+        x_nums.append(int(m.group(1)) if m else 0)
+
+    fig, ax = plt.subplots(figsize=(max(6, len(key_values) + 2), 5))
+    cmap = plt.cm.get_cmap("tab10", max(len(configs), 3))
+
+    for ci, cfg in enumerate(configs):
+        y_vals = [None] * len(key_values)
+        bl_ki = key_values.index(baseline_value)
+        y_vals[bl_ki] = matrix[cfg["baseline_idx"]][col_idx]
+        for pair in cfg["pairs"]:
+            if pair["key_label"] in key_values:
+                ki = key_values.index(pair["key_label"])
+                y_vals[ki] = matrix[pair["run_idx"]][col_idx]
+        xy = [(x, y) for x, y in zip(x_nums, y_vals) if y is not None]
+        if len(xy) >= 2:
+            xs, ys = zip(*xy)
+            lbl = short_labels[ci] if ci < len(short_labels) else cfg["baseline_label"]
+            ax.plot(xs, ys, marker='o', label=lbl, color=cmap(ci))
+
+    ax.set_xlabel(re.sub(r'\d+', '*', baseline_value))
+    ax.set_ylabel(col_header)
+    ax.set_title(_make_title(col_header, baseline_value, common_sub),
+                 fontsize=10)
+    ax.set_xticks(x_nums)
+    ax.set_xticklabels(key_values, fontsize=8)
+    if ppl_col:
+        ax.invert_yaxis()
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    _save_fig(fig, fig_dir, metric_kw, baseline_value, "line")
+
+
 def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
                   draw_metrics):
     """Generate bar charts (and line charts for numeric keys) from compare data."""
     import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
 
     fig_dir = os.path.join(SCRIPT_DIR, "..", "figures")
     os.makedirs(fig_dir, exist_ok=True)
@@ -333,137 +471,25 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
         return
 
     # Build a color map for key values
+    import matplotlib.pyplot as plt
     cmap = plt.cm.get_cmap("tab10", max(len(key_values), 3))
     key_colors = {kv: cmap(i) for i, kv in enumerate(key_values)}
+
+    # Factor out common tags from config labels
+    config_labels = [cfg["baseline_label"] for cfg in configs]
+    common_sub, short_labels = _factor_labels(config_labels)
 
     for metric_kw, col_header, col_idx in metric_indices:
         ppl_col = is_ppl[col_idx]
 
-        # ── Bar chart ────────────────────────────────────────────────
-        fig, ax = plt.subplots(figsize=(max(6, len(configs) * 1.5 + 2), 5))
+        _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
+                        baseline_value, key_colors, col_header, common_sub,
+                        short_labels, fig_dir, metric_kw)
 
-        n_keys = len(key_values)
-        bar_width = 0.8 / n_keys
-        config_labels = []
-
-        for ci, cfg in enumerate(configs):
-            config_labels.append(cfg["baseline_label"])
-            # Plot the baseline bar
-            bl_val = matrix[cfg["baseline_idx"]][col_idx]
-            if bl_val is not None:
-                ax.bar(ci + (key_values.index(baseline_value)) * bar_width,
-                       bl_val, bar_width, color=key_colors[baseline_value],
-                       label=baseline_value if ci == 0 else "")
-            # Plot non-baseline bars
-            for pair in cfg["pairs"]:
-                kl = pair["key_label"]
-                val = matrix[pair["run_idx"]][col_idx]
-                if val is not None and kl in key_colors:
-                    ki = key_values.index(kl)
-                    ax.bar(ci + ki * bar_width, val, bar_width,
-                           color=key_colors[kl],
-                           label=kl if ci == 0 else "")
-
-        # Collect all plotted values to set focused y-limits
-        all_vals = []
-        for cfg in configs:
-            v = matrix[cfg["baseline_idx"]][col_idx]
-            if v is not None:
-                all_vals.append(v)
-            for pair in cfg["pairs"]:
-                v = matrix[pair["run_idx"]][col_idx]
-                if v is not None:
-                    all_vals.append(v)
-
-        if all_vals:
-            vmin, vmax = min(all_vals), max(all_vals)
-            margin = max((vmax - vmin) * 0.3, 0.01)
-            if ppl_col:
-                ax.set_ylim(vmax + margin, vmin - margin)  # inverted for PPL
-            else:
-                ax.set_ylim(vmin - margin, vmax + margin)
-
-        # Wrap long labels into multiple lines
-        def _wrap_label(s, max_chars=15):
-            words = s.replace("_", " ").split()
-            lines, line = [], ""
-            for w in words:
-                if line and len(line) + 1 + len(w) > max_chars:
-                    lines.append(line)
-                    line = w
-                else:
-                    line = f"{line} {w}" if line else w
-            if line:
-                lines.append(line)
-            return "\n".join(lines)
-
-        # Factor out common tags from labels into the title
-        common_sub, short_labels = _factor_labels(config_labels)
-        wrapped_labels = [_wrap_label(l) for l in short_labels]
-
-        # Center x-ticks on each cluster
-        ax.set_xticks([ci + bar_width * (n_keys - 1) / 2
-                       for ci in range(len(configs))])
-        ax.set_xticklabels(wrapped_labels, rotation=0, ha="center", fontsize=7)
-        ax.set_ylabel(col_header)
-        title = f"{col_header}  (compare: {baseline_value})"
-        if common_sub:
-            title += f"\n{common_sub}"
-        ax.set_title(title, fontsize=10)
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        fname = f"{metric_kw}_{baseline_value}_bar.png".replace("/", "_")
-        path = os.path.join(fig_dir, fname)
-        fig.savefig(path, dpi=150)
-        plt.close(fig)
-        print(f"  {DIM}Saved {path}{RESET}")
-
-        # ── Line chart (numeric mode, ≥3 key values) ────────────────
         if cmp_mode == "numeric" and len(key_values) >= 3:
-            # Extract numeric x-values
-            x_nums = []
-            for kv in key_values:
-                m = re.search(r'(\d+)', kv)
-                x_nums.append(int(m.group(1)) if m else 0)
-
-            fig, ax = plt.subplots(figsize=(max(6, len(key_values) + 2), 5))
-            line_cmap = plt.cm.get_cmap("tab10", max(len(configs), 3))
-
-            for ci, cfg in enumerate(configs):
-                # Collect values for all key_values (baseline + pairs)
-                y_vals = [None] * len(key_values)
-                # Baseline
-                bl_ki = key_values.index(baseline_value)
-                y_vals[bl_ki] = matrix[cfg["baseline_idx"]][col_idx]
-                for pair in cfg["pairs"]:
-                    if pair["key_label"] in key_values:
-                        ki = key_values.index(pair["key_label"])
-                        y_vals[ki] = matrix[pair["run_idx"]][col_idx]
-
-                # Filter out None values
-                xy = [(x, y) for x, y in zip(x_nums, y_vals) if y is not None]
-                if len(xy) >= 2:
-                    xs, ys = zip(*xy)
-                    ax.plot(xs, ys, marker='o', label=short_labels[ci] if ci < len(short_labels) else cfg["baseline_label"],
-                            color=line_cmap(ci))
-
-            ax.set_xlabel(re.sub(r'\d+', '*', baseline_value))
-            ax.set_ylabel(col_header)
-            line_title = f"{col_header}  (compare: {baseline_value})"
-            if common_sub:
-                line_title += f"\n{common_sub}"
-            ax.set_title(line_title, fontsize=10)
-            ax.set_xticks(x_nums)
-            ax.set_xticklabels(key_values, fontsize=8)
-            if ppl_col:
-                ax.invert_yaxis()
-            ax.legend(fontsize=7)
-            fig.tight_layout()
-            fname = f"{metric_kw}_{baseline_value}_line.png".replace("/", "_")
-            path = os.path.join(fig_dir, fname)
-            fig.savefig(path, dpi=150)
-            plt.close(fig)
-            print(f"  {DIM}Saved {path}{RESET}")
+            _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
+                             baseline_value, col_header, common_sub,
+                             short_labels, fig_dir, metric_kw)
 
 
 def _extract_model_name(path):
