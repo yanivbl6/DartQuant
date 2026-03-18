@@ -83,6 +83,23 @@ def color_val(val, best, worst, fmt=".2f", is_ppl=False):
 
 _MODE_COLORS = {"full": CYAN, "baseline": YELLOW, "quarot": MAGENTA, "dart": GREEN}
 
+# Metric keyword aliases for --draw (lowercase key → column header)
+_METRIC_ALIASES = {
+    "wikitext": "PPL↓ wikitext2", "wikitext2": "PPL↓ wikitext2", "wiki": "PPL↓ wikitext2",
+    "ptb": "PPL↓ ptb",
+    "c4": "PPL↓ c4",
+    "piqa": "Piqa",
+    "hellaswag": "Hellaswag", "hs": "Hellaswag", "ws": "Hellaswag",
+    "arce": "Arc Easy", "arc_easy": "Arc Easy",
+    "arcc": "Arc Challenge", "arc_challenge": "Arc Challenge",
+    "winogrande": "Winogrande", "wino": "Winogrande",
+    "lambada": "Lambada Openai",
+    "siqa": "Social Iqa", "social_iqa": "Social Iqa",
+    "obqa": "Openbookqa", "openbookqa": "Openbookqa",
+    "mmlu": "MMLU",
+    "avg": "Avg↑",
+}
+
 
 def _print_delta_table(title, rows, matrix, labels, runs, cols, is_ppl, col_w,
                        label_w=None):
@@ -186,7 +203,7 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
         avail = [k for k in groups if k is not None]
         if avail:
             print(f"  {DIM}Available values: {', '.join(sorted(avail))}{RESET}")
-        return
+        return None
 
     # ── Build strip patterns for pairing key ───────────────────────────
     # Always strip the key token.  In binary mode, also strip tokens that
@@ -241,23 +258,212 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
                                     key=lambda x: (x[0] is None, x[0] or "")):
             gl = gval if gval is not None else f"no {compare_expr}"
             print(f"  {DIM}{gl}: {len(indices)} runs{RESET}")
-        return
+        return None
 
-    # ── Print one sub-table per base config ────────────────────────────
+    # ── Print one sub-table per base config & build return data ────────
     def _pad_key(kv):
         return re.sub(r'(\d+)', lambda m: m.group(1).zfill(4), kv)
 
     sorted_configs = sorted(config_groups.items(),
                             key=lambda item: labels[item[1][0][1]])
 
+    # Build key_values list with display names (convert None → "no <expr>")
+    no_label = f"no {compare_expr}"
+    all_key_values = sorted(groups.keys(), key=lambda v: (v is None, _pad_key(v or "")))
+    display_key_values = [no_label if v is None else v for v in all_key_values]
+    result_configs = []
+
     for pk, cfg_pairs in sorted_configs:
         cfg_pairs.sort(key=lambda x: _pad_key(x[2]))
         bl_label = labels[cfg_pairs[0][1]]
+        bl_idx = cfg_pairs[0][1]
         delta_rows = [(idx, bl_idx) for idx, bl_idx, _ in cfg_pairs]
         _print_delta_table(
             f"Δ vs {compare_expr}  {DIM}({bl_label})",
             delta_rows, matrix, labels, runs, cols, is_ppl, col_w,
             label_w=label_w)
+        result_configs.append({
+            "baseline_label": bl_label,
+            "baseline_idx": bl_idx,
+            "pair_key": pk,
+            "pairs": [{"key_label": kl, "run_idx": ri, "bl_idx": bi}
+                       for ri, bi, kl in cfg_pairs],
+        })
+
+    return {
+        "baseline_value": cmp_lower,
+        "key_values": display_key_values,
+        "configs": result_configs,
+        "mode": mode,
+    }
+
+
+def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
+                  draw_metrics):
+    """Generate bar charts (and line charts for numeric keys) from compare data."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    fig_dir = os.path.join(SCRIPT_DIR, "..", "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    baseline_value = compare_data["baseline_value"]
+    key_values = compare_data["key_values"]
+    configs = compare_data["configs"]
+    cmp_mode = compare_data["mode"]
+
+    # Resolve metric keywords to column indices
+    metric_indices = []
+    for kw in draw_metrics:
+        col_header = _METRIC_ALIASES.get(kw.lower())
+        if col_header is None:
+            print(f"  {YELLOW}--draw: unknown metric '{kw}'. "
+                  f"Available: {', '.join(sorted(_METRIC_ALIASES.keys()))}{RESET}")
+            continue
+        try:
+            col_idx = cols.index(col_header)
+        except ValueError:
+            print(f"  {YELLOW}--draw: column '{col_header}' not found in table{RESET}")
+            continue
+        metric_indices.append((kw, col_header, col_idx))
+
+    if not metric_indices:
+        return
+
+    # Build a color map for key values
+    cmap = plt.cm.get_cmap("tab10", max(len(key_values), 3))
+    key_colors = {kv: cmap(i) for i, kv in enumerate(key_values)}
+
+    for metric_kw, col_header, col_idx in metric_indices:
+        ppl_col = is_ppl[col_idx]
+
+        # ── Bar chart ────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(max(6, len(configs) * 1.5 + 2), 5))
+
+        n_keys = len(key_values)
+        bar_width = 0.8 / n_keys
+        config_labels = []
+
+        for ci, cfg in enumerate(configs):
+            config_labels.append(cfg["baseline_label"])
+            # Plot the baseline bar
+            bl_val = matrix[cfg["baseline_idx"]][col_idx]
+            if bl_val is not None:
+                ax.bar(ci + (key_values.index(baseline_value)) * bar_width,
+                       bl_val, bar_width, color=key_colors[baseline_value],
+                       label=baseline_value if ci == 0 else "")
+            # Plot non-baseline bars
+            for pair in cfg["pairs"]:
+                kl = pair["key_label"]
+                val = matrix[pair["run_idx"]][col_idx]
+                if val is not None and kl in key_colors:
+                    ki = key_values.index(kl)
+                    ax.bar(ci + ki * bar_width, val, bar_width,
+                           color=key_colors[kl],
+                           label=kl if ci == 0 else "")
+
+        # Collect all plotted values to set focused y-limits
+        all_vals = []
+        for cfg in configs:
+            v = matrix[cfg["baseline_idx"]][col_idx]
+            if v is not None:
+                all_vals.append(v)
+            for pair in cfg["pairs"]:
+                v = matrix[pair["run_idx"]][col_idx]
+                if v is not None:
+                    all_vals.append(v)
+
+        if all_vals:
+            vmin, vmax = min(all_vals), max(all_vals)
+            margin = max((vmax - vmin) * 0.3, 0.01)
+            if ppl_col:
+                ax.set_ylim(vmax + margin, vmin - margin)  # inverted for PPL
+            else:
+                ax.set_ylim(vmin - margin, vmax + margin)
+
+        # Wrap long labels into multiple lines
+        def _wrap_label(s, max_chars=15):
+            words = s.replace("_", " ").split()
+            lines, line = [], ""
+            for w in words:
+                if line and len(line) + 1 + len(w) > max_chars:
+                    lines.append(line)
+                    line = w
+                else:
+                    line = f"{line} {w}" if line else w
+            if line:
+                lines.append(line)
+            return "\n".join(lines)
+
+        # Factor out common tags from labels into the title
+        common_sub, short_labels = _factor_labels(config_labels)
+        wrapped_labels = [_wrap_label(l) for l in short_labels]
+
+        # Center x-ticks on each cluster
+        ax.set_xticks([ci + bar_width * (n_keys - 1) / 2
+                       for ci in range(len(configs))])
+        ax.set_xticklabels(wrapped_labels, rotation=0, ha="center", fontsize=7)
+        ax.set_ylabel(col_header)
+        title = f"{col_header}  (compare: {baseline_value})"
+        if common_sub:
+            title += f"\n{common_sub}"
+        ax.set_title(title, fontsize=10)
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fname = f"{metric_kw}_{baseline_value}_bar.png".replace("/", "_")
+        path = os.path.join(fig_dir, fname)
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"  {DIM}Saved {path}{RESET}")
+
+        # ── Line chart (numeric mode, ≥3 key values) ────────────────
+        if cmp_mode == "numeric" and len(key_values) >= 3:
+            # Extract numeric x-values
+            x_nums = []
+            for kv in key_values:
+                m = re.search(r'(\d+)', kv)
+                x_nums.append(int(m.group(1)) if m else 0)
+
+            fig, ax = plt.subplots(figsize=(max(6, len(key_values) + 2), 5))
+            line_cmap = plt.cm.get_cmap("tab10", max(len(configs), 3))
+
+            for ci, cfg in enumerate(configs):
+                # Collect values for all key_values (baseline + pairs)
+                y_vals = [None] * len(key_values)
+                # Baseline
+                bl_ki = key_values.index(baseline_value)
+                y_vals[bl_ki] = matrix[cfg["baseline_idx"]][col_idx]
+                for pair in cfg["pairs"]:
+                    if pair["key_label"] in key_values:
+                        ki = key_values.index(pair["key_label"])
+                        y_vals[ki] = matrix[pair["run_idx"]][col_idx]
+
+                # Filter out None values
+                xy = [(x, y) for x, y in zip(x_nums, y_vals) if y is not None]
+                if len(xy) >= 2:
+                    xs, ys = zip(*xy)
+                    ax.plot(xs, ys, marker='o', label=short_labels[ci] if ci < len(short_labels) else cfg["baseline_label"],
+                            color=line_cmap(ci))
+
+            ax.set_xlabel(re.sub(r'\d+', '*', baseline_value))
+            ax.set_ylabel(col_header)
+            line_title = f"{col_header}  (compare: {baseline_value})"
+            if common_sub:
+                line_title += f"\n{common_sub}"
+            ax.set_title(line_title, fontsize=10)
+            ax.set_xticks(x_nums)
+            ax.set_xticklabels(key_values, fontsize=8)
+            if ppl_col:
+                ax.invert_yaxis()
+            ax.legend(fontsize=7)
+            fig.tight_layout()
+            fname = f"{metric_kw}_{baseline_value}_line.png".replace("/", "_")
+            path = os.path.join(fig_dir, fname)
+            fig.savefig(path, dpi=150)
+            plt.close(fig)
+            print(f"  {DIM}Saved {path}{RESET}")
 
 
 def _extract_model_name(path):
@@ -438,7 +644,7 @@ def hline(widths, char="─", left="├", mid="┼", right="┤"):
     return left + mid.join(char * w for w in widths) + right
 
 
-def print_summary(runs, show_delta=False, compare_expr=None):
+def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None):
     """Print a pretty summary table."""
     if not runs:
         print("No result files found.")
@@ -591,8 +797,11 @@ def print_summary(runs, show_delta=False, compare_expr=None):
                            cols, is_ppl, col_w, label_w=label_w)
 
     if compare_expr:
-        _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
-                       label_w=label_w)
+        compare_data = _print_compare(runs, matrix, labels, cols, is_ppl, col_w,
+                                      compare_expr, label_w=label_w)
+        if draw_metrics and compare_data:
+            _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
+                          draw_metrics)
 
     # Legend
     print()
@@ -706,12 +915,20 @@ def main():
                         help="Show delta table vs FP16 baseline")
     parser.add_argument("-c", "--compare", type=str, default=None, metavar="EXPR",
                         help="Compare runs matching EXPR vs runs not matching it (delta table)")
+    parser.add_argument("--draw", type=str, default=None, metavar="METRICS",
+                        help="Comma-separated metrics to plot (requires -c). "
+                             "E.g.: C4,MMLU,avg")
     parser.add_argument("--nbl", "--no-baseline", action="store_true",
                         dest="no_baseline",
                         help="Exclude the FP16 full-precision baseline")
     parser.add_argument("filters", nargs="*", default=[],
                         help="Filter expressions or literal paths")
     args = parser.parse_args()
+
+    if args.draw and not args.compare:
+        parser.error("--draw requires --compare (-c)")
+
+    draw_metrics = [m.strip() for m in args.draw.split(",")] if args.draw else None
 
     # ── Gather files ────────────────────────────────────────────────────
     all_results = glob.glob(os.path.join(RESULTS_DIR, "*_results.pb"))
@@ -774,7 +991,8 @@ def main():
     if args.no_baseline:
         runs = [r for r in runs if r[2] != "full"]
 
-    print_summary(runs, show_delta=args.delta, compare_expr=args.compare)
+    print_summary(runs, show_delta=args.delta, compare_expr=args.compare,
+                  draw_metrics=draw_metrics)
 
 
 if __name__ == "__main__":

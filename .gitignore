@@ -8,3 +8,4 @@ calibrater/logs/r2_time_log.txt
 fake_quant/experiments/*
 data
 calibrater/figures/*.png
+figures/*.png
