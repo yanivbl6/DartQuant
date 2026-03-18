@@ -27,13 +27,35 @@
 
 # single features
 [DONE] hw_pwl_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --static-act --imitate_gguf Q4_K_S
-hw_intgemm_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --int_gemm --acc_block_k 128 --acc_bits 16 --static-act --imitate_gguf Q4_K_S --acc_wrap
+[DONE] hw_intgemm_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --int_gemm --acc_block_k 128 --acc_bits 16 --static-act --imitate_gguf Q4_K_S --acc_wrap
 [DONE] hw_smq_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --smq 8 --static-act --imitate_gguf Q4_K_S
 
 # all three
-hw_all_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --smq 8 --static-act --imitate_gguf Q4_K_S  --acc_wrap
+[DONE] hw_all_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --smq 8 --static-act --imitate_gguf Q4_K_S  --acc_wrap
 
 # pairs
-hw_pwl_intgemm_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --static-act --imitate_gguf Q4_K_S  --acc_wrap
+[DONE] hw_pwl_intgemm_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --static-act --imitate_gguf Q4_K_S  --acc_wrap
 [DONE] hw_pwl_smq_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --smq 8 --static-act --imitate_gguf Q4_K_S
-hw_intgemm_smq_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --int_gemm --acc_block_k 128 --acc_bits 16 --smq 8 --static-act --imitate_gguf Q4_K_S  --acc_wrap
+[DONE] hw_intgemm_smq_wasym: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --int_gemm --acc_block_k 128 --acc_bits 16 --smq 8 --static-act --imitate_gguf Q4_K_S  --acc_wrap
+
+
+# better? 
+[DONE] hw_all_wasym_smq16: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_S  --acc_wrap
+[DONE] hw_all_wasym_g64_smq16: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 64 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 64 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_S  --acc_wrap
+[DONE] hw_all_wasym_g64: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 64 --proj_ex 16 --kv_ex 8 --w_asym --pwl_act --int_gemm --acc_block_k 64 --acc_bits 16 --smq 8 --static-act --imitate_gguf Q4_K_S  --acc_wrap
+
+[DONE] hw_all_sym_smq16: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8 --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_S
+[DONE] hw_all_sym_g64_smq16: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 64 --proj_ex 16 --kv_ex 8  --pwl_act --int_gemm --acc_block_k 64 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_S
+[DONE] hw_all_sym_g64: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 64 --proj_ex 16 --kv_ex 8 --pwl_act --int_gemm --acc_block_k 64 --acc_bits 16 --smq 8 --static-act --imitate_gguf Q4_K_S
+
+[DONE] hw_all_sym_g32_smq16: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 32 --proj_ex 16 --kv_ex 8  --pwl_act --int_gemm --acc_block_k 32 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_S
+[DONE] hw_all_asym_g32_smq16: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 32 --proj_ex 16 --kv_ex 8  --pwl_act --int_gemm --acc_block_k 32 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_S --w_asym --acc_wrap
+
+[DONE] hw_all_sym_g64_smq16_q4-k-m: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 64 --proj_ex 16 --kv_ex 8  --pwl_act --int_gemm --acc_block_k 64 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_M
+[DONE] hw_all_asym_g64_smq16_q4-k-m: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 64 --proj_ex 16 --kv_ex 8  --pwl_act --int_gemm --acc_block_k 64 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_M  --w_asym --acc_wrap
+
+[DONE] hw_all_sym_g32_smq16_q4-k-m: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 32 --proj_ex 16 --kv_ex 8  --pwl_act --int_gemm --acc_block_k 32 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_M
+[DONE] hw_all_asym_g32_smq16_q4-k-m: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 32 --proj_ex 16 --kv_ex 8  --pwl_act --int_gemm --acc_block_k 32 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_M  --w_asym --acc_wrap
+
+[DONE] hw_all_sym_g128_smq16_q4-k-m: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8  --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_M
+[DONE] hw_all_asym_g128_smq16_q4-k-m: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --proj_ex 16 --kv_ex 8  --pwl_act --int_gemm --acc_block_k 128 --acc_bits 16 --smq 16 --static-act --imitate_gguf Q4_K_M  --w_asym --acc_wrap

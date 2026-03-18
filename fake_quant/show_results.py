@@ -3,9 +3,9 @@
 Visualize DartQuant experiment results from cached .pb files.
 
 Usage:
-    python show_results.py -s                    # summary table (all runs, with FP16 baseline)
-    python show_results.py -s --nbl              # summary table, no FP16 baseline
-    python show_results.py -s data/cached_results/quarot*.pb  # only matching files
+    python show_results.py                       # summary table (all runs, with FP16 baseline)
+    python show_results.py --nbl                 # summary table, no FP16 baseline
+    python show_results.py data/cached_results/quarot*.pb  # only matching files
 """
 
 import argparse
@@ -44,6 +44,25 @@ def _gradient_color(t):
     return _GRADIENT[min(round(idx), len(_GRADIENT) - 1)]
 
 
+def _color_delta(delta, is_ppl_col):
+    """Return a colored string for a delta value."""
+    sign = "+" if delta >= 0 else ""
+    s = f"{sign}{delta:.2f}"
+    if is_ppl_col:
+        t = max(0.0, min(1.0, delta / 2.0)) if delta >= 0 else 0.0
+        t_good = max(0.0, min(1.0, -delta / 2.0)) if delta < 0 else 0.0
+    else:
+        t = max(0.0, min(1.0, -delta / 0.05)) if delta <= 0 else 0.0
+        t_good = max(0.0, min(1.0, delta / 0.05)) if delta > 0 else 0.0
+    if abs(delta) < 1e-4:
+        clr = GRAY
+    elif t > 0:
+        clr = f"\033[38;5;{_gradient_color(t)}m"
+    else:
+        clr = f"\033[38;5;{_gradient_color(0.0)}m" if t_good > 0.5 else f"\033[38;5;{_GRADIENT[2]}m"
+    return f"{clr}{s:>8}{RESET}"
+
+
 def color_val(val, best, worst, fmt=".2f", is_ppl=False):
     """Color a numeric value on a smooth gradient from best (green) to worst (red)."""
     if val is None:
@@ -60,6 +79,185 @@ def color_val(val, best, worst, fmt=".2f", is_ppl=False):
     c = _gradient_color(t)
     bold = BOLD if t < 0.05 else ""
     return f"\033[38;5;{c}m{bold}{s:>8}{RESET}"
+
+
+_MODE_COLORS = {"full": CYAN, "baseline": YELLOW, "quarot": MAGENTA, "dart": GREEN}
+
+
+def _print_delta_table(title, rows, matrix, labels, runs, cols, is_ppl, col_w,
+                       label_w=None):
+    """Print a delta table.
+
+    *rows* is a list of (run_idx, baseline_idx) pairs.
+    """
+    if not rows:
+        return
+    if label_w is None:
+        label_w = max(len(labels[r]) for r, _ in rows) + 2
+    label_w = max(label_w, len("Run") + 2)
+    n_cols = len(cols)
+    widths = [label_w] + [col_w] * n_cols
+
+    print()
+    print(f"  {BOLD}{title}{RESET}")
+    print("┌" + "┬".join("─" * w for w in widths) + "┐")
+    hdr = f"│{BG_HDR}{BOLD}{WHITE}{'Run':<{label_w}}{RESET}│"
+    for c in cols:
+        hdr += f"{BG_HDR}{BOLD}{WHITE}{c[:col_w-2]:>{col_w-1}} {RESET}│"
+    print(hdr)
+    print(hline(widths))
+
+    for run_idx, bl_idx in rows:
+        mode = runs[run_idx][2]
+        lbl_color = _MODE_COLORS.get(mode, WHITE)
+        row_str = f"│{lbl_color}{BOLD}{labels[run_idx]:<{label_w}}{RESET}│"
+        for c in range(n_cols):
+            val, bl_val = matrix[run_idx][c], matrix[bl_idx][c]
+            if val is not None and bl_val is not None:
+                row_str += f"{_color_delta(val - bl_val, is_ppl[c])}  │"
+            else:
+                row_str += f"{GRAY}{'—':>8}{RESET}  │"
+        print(row_str)
+
+    print("└" + "┴".join("─" * w for w in widths) + "┘")
+
+
+def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
+                   label_w=None):
+    """Print comparison tables grouping runs by a key token.
+
+    Three modes, inferred from the compare value:
+
+    * **Numeric suffix** (``g128``, ``smq16``): key = alpha prefix, groups by
+      all tokens sharing that prefix (``g32``, ``g64``, ``g128``).
+    * **Hyphenated variant** (``imitate-Q4-K-S``): key = everything up to the
+      last ``-``, groups by the suffix (``S``, ``M``, ...).
+    * **Binary** (``wAsym``, ``pwl``): presence vs absence. Tokens that
+      exclusively co-occur with the compare token are auto-stripped for pairing.
+    """
+    from collections import defaultdict
+
+    cmp_lower = compare_expr.lower()
+
+    # ── Parse compare value ────────────────────────────────────────────
+    m_numeric = re.match(r'^([a-zA-Z_-]+?)(\d+)$', compare_expr)
+    if m_numeric:
+        # Numeric suffix: g128 → key prefix "g", pattern g\d+
+        key_prefix = m_numeric.group(1).lower()
+        key_pattern = re.compile(f'^{re.escape(key_prefix)}\\d+$', re.IGNORECASE)
+        mode = "numeric"
+    elif '-' in compare_expr:
+        # Hyphenated variant: imitate-Q4-K-S → prefix "imitate-Q4-K-"
+        last_dash = compare_expr.rfind('-')
+        key_prefix = compare_expr[:last_dash + 1].lower()
+        key_pattern = re.compile(f'^{re.escape(key_prefix)}.+$', re.IGNORECASE)
+        mode = "variant"
+    else:
+        # Binary: wAsym, pwl → presence vs absence
+        key_pattern = re.compile(f'^{re.escape(compare_expr)}$', re.IGNORECASE)
+        mode = "binary"
+
+    # ── Helpers ────────────────────────────────────────────────────────
+    def _norm_base(path):
+        return _normalize_bk(
+            os.path.basename(path).replace("_results.pb", "").lower())
+
+    def _get_key_token(path):
+        for t in _norm_base(path).split('_'):
+            if key_pattern.match(t):
+                return t
+        return None
+
+    # ── Group non-full runs by key value ───────────────────────────────
+    groups = defaultdict(list)  # {key_value_or_None: [run_idx]}
+    for i, (label, data, rmode, path) in enumerate(runs):
+        if rmode == "full":
+            continue
+        token = _get_key_token(path)
+        if mode == "binary":
+            groups[cmp_lower if token else None].append(i)
+        else:
+            if token is not None:
+                groups[token].append(i)
+
+    if cmp_lower not in groups:
+        print(f"\n  {YELLOW}Compare: no runs found with baseline value "
+              f"'{compare_expr}'{RESET}")
+        avail = [k for k in groups if k is not None]
+        if avail:
+            print(f"  {DIM}Available values: {', '.join(sorted(avail))}{RESET}")
+        return
+
+    # ── Build strip patterns for pairing key ───────────────────────────
+    # Always strip the key token.  In binary mode, also strip tokens that
+    # exclusively co-occur with the baseline group (e.g. "wrap" always
+    # accompanies "wAsym").
+    strip_patterns = [key_pattern]
+
+    if mode == "binary":
+        baseline_indices = groups[cmp_lower]
+        other_indices = [idx for g, idxs in groups.items()
+                         if g != cmp_lower for idx in idxs]
+        if baseline_indices and other_indices:
+            # Tokens present in ALL baseline runs but NONE of the other runs
+            bl_token_sets = [set(_norm_base(runs[i][3]).split('_'))
+                             for i in baseline_indices]
+            ot_token_sets = [set(_norm_base(runs[i][3]).split('_'))
+                             for i in other_indices]
+            bl_common = bl_token_sets[0]
+            for ts in bl_token_sets[1:]:
+                bl_common &= ts
+            ot_all = set()
+            for ts in ot_token_sets:
+                ot_all |= ts
+            exclusive = bl_common - ot_all
+            for tok in exclusive:
+                strip_patterns.append(
+                    re.compile(f'^{re.escape(tok)}$', re.IGNORECASE))
+
+    def _pair_key(path):
+        tokens = _norm_base(path).split('_')
+        return '_'.join(t for t in tokens
+                        if not any(p.match(t) for p in strip_patterns))
+
+    baseline_by_key = {_pair_key(runs[idx][3]): idx
+                       for idx in groups[cmp_lower]}
+
+    # ── Collect pairs grouped by base config ───────────────────────────
+    config_groups = defaultdict(list)
+    for gval in sorted(groups, key=lambda v: (v is None, v or "")):
+        if gval == cmp_lower:
+            continue
+        key_label = gval if gval is not None else f"no {compare_expr}"
+        for idx in groups[gval]:
+            pk = _pair_key(runs[idx][3])
+            if pk in baseline_by_key:
+                config_groups[pk].append((idx, baseline_by_key[pk], key_label))
+
+    if not config_groups:
+        print(f"\n  {YELLOW}Compare: no matching pairs found for "
+              f"'{compare_expr}'{RESET}")
+        for gval, indices in sorted(groups.items(),
+                                    key=lambda x: (x[0] is None, x[0] or "")):
+            gl = gval if gval is not None else f"no {compare_expr}"
+            print(f"  {DIM}{gl}: {len(indices)} runs{RESET}")
+        return
+
+    # ── Print one sub-table per base config ────────────────────────────
+    def _pad_key(kv):
+        return re.sub(r'(\d+)', lambda m: m.group(1).zfill(4), kv)
+
+    sorted_configs = sorted(config_groups.items(),
+                            key=lambda item: labels[item[1][0][1]])
+
+    for pk, cfg_pairs in sorted_configs:
+        cfg_pairs.sort(key=lambda x: _pad_key(x[2]))
+        bl_label = labels[cfg_pairs[0][1]]
+        delta_rows = [(idx, bl_idx) for idx, bl_idx, _ in cfg_pairs]
+        _print_delta_table(
+            f"Δ vs {compare_expr}  {DIM}({bl_label})",
+            delta_rows, matrix, labels, runs, cols, is_ppl, col_w,
+            label_w=label_w)
 
 
 def _extract_model_name(path):
@@ -92,6 +290,29 @@ def _extract_imitate_tag(path):
     return f"gguf-{m.group(1)}" if m else None
 
 
+def _normalize_bk(tag):
+    """Normalize the block-size (bk) token relative to group-size (g).
+
+    - If bk equals g, omit it (redundant).
+    - If bk is absent but g is present, insert bk32 (the hardware default).
+    """
+    g_match = re.search(r'(?:^|_)(g(\d+))(?:_|$)', tag)
+    if not g_match:
+        return tag
+    g_val = g_match.group(2)
+    bk_match = re.search(r'(?:^|_)(bk(\d+))(?:_|$)', tag)
+    if bk_match:
+        if bk_match.group(2) == g_val:
+            # bk == g -> redundant, remove it
+            tag = tag.replace(bk_match.group(1), '').replace('__', '_').strip('_')
+        # else bk != g -> keep it (interesting case)
+    else:
+        # No bk token -> insert default bk32 after the g token
+        if g_val != "32":
+            tag = tag.replace(g_match.group(1), f'{g_match.group(1)}_bk32')
+    return tag
+
+
 def parse_filename(path):
     """Extract mode and quant config from filename."""
     base = os.path.basename(path).replace("_results.pb", "")
@@ -105,6 +326,7 @@ def parse_filename(path):
 
     mode = parts[0]
     tag = parts[1] if len(parts) > 1 else ""
+    tag = _normalize_bk(tag)
 
     if is_static:
         tag += ", static"
@@ -196,14 +418,18 @@ def load_results(paths):
 
         runs.append((label, data, mode, p))
     # Sort: FP full (no gguf) first, then GGUF full, then the rest
+    def _pad_g(s):
+        """Zero-pad gXX -> g0XX so g32 sorts before g128."""
+        return re.sub(r'g(\d+)', lambda m: f'g{int(m.group(1)):04d}', s)
+
     def _sort_key(r):
         _, _, mode, path = r
         gguf_tag = _extract_gguf_tag(path)
         if mode == "full" and not gguf_tag:
-            return (0, r[0])
+            return (0, _pad_g(r[0]))
         if mode == "full" and gguf_tag:
-            return (1, gguf_tag)
-        return (2, r[0])
+            return (1, _pad_g(gguf_tag))
+        return (2, _pad_g(r[0]))
     runs.sort(key=_sort_key)
     return runs
 
@@ -212,7 +438,7 @@ def hline(widths, char="─", left="├", mid="┼", right="┤"):
     return left + mid.join(char * w for w in widths) + right
 
 
-def print_summary(runs):
+def print_summary(runs, show_delta=False, compare_expr=None):
     """Print a pretty summary table."""
     if not runs:
         print("No result files found.")
@@ -328,9 +554,7 @@ def print_summary(runs):
         label = labels[r]
         mode = runs[r][2]
 
-        # Color the label by mode
-        mode_colors = {"full": CYAN, "baseline": YELLOW, "quarot": MAGENTA, "dart": GREEN}
-        lbl_color = mode_colors.get(mode, WHITE)
+        lbl_color = _MODE_COLORS.get(mode, WHITE)
         row_str = f"│{lbl_color}{BOLD}{label:<{label_w}}{RESET}│"
 
         for c in range(n_cols):
@@ -361,53 +585,14 @@ def print_summary(runs):
             full_idx = i
             break
 
-    if full_idx is not None and n_runs > 1:
-        print()
-        print(f"  {BOLD}Delta vs FP16 baseline:{RESET}")
-        print("┌" + "┬".join("─" * w for w in widths) + "┐")
-        hdr = f"│{BG_HDR}{BOLD}{WHITE}{'Δ vs FP16':<{label_w}}{RESET}│"
-        for i, c in enumerate(cols):
-            short = c[:col_w-2]
-            hdr += f"{BG_HDR}{BOLD}{WHITE}{short:>{col_w-1}} {RESET}│"
-        print(hdr)
-        print(hline(widths))
+    if show_delta and full_idx is not None and n_runs > 1:
+        delta_rows = [(r, full_idx) for r in range(n_runs) if r != full_idx]
+        _print_delta_table("Δ vs FP16", delta_rows, matrix, labels, runs,
+                           cols, is_ppl, col_w, label_w=label_w)
 
-        for r in range(n_runs):
-            if r == full_idx:
-                continue
-            label = labels[r]
-            mode = runs[r][2]
-            lbl_color = {"full": CYAN, "baseline": YELLOW, "quarot": MAGENTA, "dart": GREEN}.get(mode, WHITE)
-            row_str = f"│{lbl_color}{BOLD}{label:<{label_w}}{RESET}│"
-
-            for c in range(n_cols):
-                val = matrix[r][c]
-                base_val = matrix[full_idx][c]
-                if val is not None and base_val is not None:
-                    delta = val - base_val
-                    sign = "+" if delta >= 0 else ""
-                    s = f"{sign}{delta:.2f}"
-                    # Map delta to gradient: 0 = neutral (gray), large bad = red, large good = green
-                    if is_ppl[c]:
-                        # PPL: positive delta = worse, negative = better
-                        t = max(0.0, min(1.0, delta / 2.0)) if delta >= 0 else 0.0
-                        t_good = max(0.0, min(1.0, -delta / 2.0)) if delta < 0 else 0.0
-                    else:
-                        # Acc: negative delta = worse, positive = better
-                        t = max(0.0, min(1.0, -delta / 0.05)) if delta <= 0 else 0.0
-                        t_good = max(0.0, min(1.0, delta / 0.05)) if delta > 0 else 0.0
-                    if abs(delta) < 1e-4:
-                        clr = GRAY
-                    elif t > 0:
-                        clr = f"\033[38;5;{_gradient_color(t)}m"
-                    else:
-                        clr = f"\033[38;5;{_gradient_color(0.0)}m" if t_good > 0.5 else f"\033[38;5;{_GRADIENT[2]}m"
-                    row_str += f"{clr}{s:>8}{RESET}  │"
-                else:
-                    row_str += f"{GRAY}{'—':>8}{RESET}  │"
-            print(row_str)
-
-        print("└" + "┴".join("─" * w for w in widths) + "┘")
+    if compare_expr:
+        _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
+                       label_w=label_w)
 
     # Legend
     print()
@@ -505,28 +690,28 @@ def main():
         description="Visualize DartQuant experiment results",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  python show_results.py -s                       # all runs + FP16 baseline
-  python show_results.py -s dart                   # substring: *dart*
-  python show_results.py -s dart pwl               # AND: *dart* AND *pwl*
-  python show_results.py -s "static,pwl"           # AND: *static* AND *pwl*
-  python show_results.py -s "dart|static"          # NOT: *dart* but NOT *static*
-  python show_results.py -s "static,pwl|w8"        # AND+NOT: *static* AND *pwl* but NOT *w8*
-  python show_results.py -s "static*pwl"           # glob: *static*pwl*
-  python show_results.py -s --nbl                  # exclude FP16 baseline
-  python show_results.py -s data/cached_results/quarot*.pb  # literal paths (shell glob)""",
+  python show_results.py                           # all runs + FP16 baseline
+  python show_results.py dart                      # substring: *dart*
+  python show_results.py dart pwl                  # AND: *dart* AND *pwl*
+  python show_results.py "static,pwl"              # AND: *static* AND *pwl*
+  python show_results.py "dart|static"             # NOT: *dart* but NOT *static*
+  python show_results.py "static,pwl|w8"           # AND+NOT: *static* AND *pwl* but NOT *w8*
+  python show_results.py "static*pwl"              # glob: *static*pwl*
+  python show_results.py --nbl                     # exclude FP16 baseline
+  python show_results.py -d                        # show delta vs FP16 baseline
+  python show_results.py -c pwl                    # compare runs with/without 'pwl'
+  python show_results.py data/cached_results/quarot*.pb  # literal paths (shell glob)""",
     )
-    parser.add_argument("-s", "--summary", action="store_true",
-                        help="Show summary table of all results")
+    parser.add_argument("-d", "--delta", action="store_true",
+                        help="Show delta table vs FP16 baseline")
+    parser.add_argument("-c", "--compare", type=str, default=None, metavar="EXPR",
+                        help="Compare runs matching EXPR vs runs not matching it (delta table)")
     parser.add_argument("--nbl", "--no-baseline", action="store_true",
                         dest="no_baseline",
                         help="Exclude the FP16 full-precision baseline")
     parser.add_argument("filters", nargs="*", default=[],
                         help="Filter expressions or literal paths")
     args = parser.parse_args()
-
-    if not args.summary:
-        parser.print_help()
-        return
 
     # ── Gather files ────────────────────────────────────────────────────
     all_results = glob.glob(os.path.join(RESULTS_DIR, "*_results.pb"))
@@ -589,7 +774,7 @@ def main():
     if args.no_baseline:
         runs = [r for r in runs if r[2] != "full"]
 
-    print_summary(runs)
+    print_summary(runs, show_delta=args.delta, compare_expr=args.compare)
 
 
 if __name__ == "__main__":
