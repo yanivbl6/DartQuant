@@ -46,6 +46,8 @@ def _gradient_color(t):
 
 def _color_delta(delta, is_ppl_col):
     """Return a colored string for a delta value."""
+    if is_ppl_col and abs(delta) > 999:
+        return f"{RED}{BOLD}{'INVALID':>8}{RESET}"
     sign = "+" if delta >= 0 else ""
     s = f"{sign}{delta:.2f}"
     if is_ppl_col:
@@ -67,6 +69,8 @@ def color_val(val, best, worst, fmt=".2f", is_ppl=False):
     """Color a numeric value on a smooth gradient from best (green) to worst (red)."""
     if val is None:
         return f"{GRAY}{'—':>8}{RESET}"
+    if is_ppl and val > 999:
+        return f"{RED}{BOLD}{'INVALID':>8}{RESET}"
     s = f"{val:{fmt}}"
     span = abs(worst - best) if (best is not None and worst is not None) else 0
     if span < 1e-9:
@@ -739,17 +743,38 @@ def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None):
     n_cols = len(cols)
     n_runs = len(runs)
 
-    # Find best/worst per column
+    # Find best/worst per column (for PPL columns, exclude values with
+    # delta > 10 from the FP16 baseline so outliers don't squash the scale)
+    full_idx = None
+    for i, (_, _, mode, path) in enumerate(runs):
+        if mode == "full" and not _extract_gguf_tag(path):
+            full_idx = i
+            break
+
     bests = []
     worsts = []
     for c in range(n_cols):
         vals = [matrix[r][c] for r in range(n_runs) if matrix[r][c] is not None]
+        if is_ppl[c] and full_idx is not None and matrix[full_idx][c] is not None:
+            bl_val = matrix[full_idx][c]
+            vals = [v for v in vals if abs(v - bl_val) <= 10]
         if not vals:
             bests.append(None)
             worsts.append(None)
         elif is_ppl[c]:
-            bests.append(min(vals))
-            worsts.append(max(vals))
+            b, w = min(vals), max(vals)
+            # Clamp PPL color span: 0.2–1.0 points per gradient color
+            n_colors = len(_GRADIENT)
+            min_span = 0.2 * n_colors
+            max_span = 1.0 * n_colors
+            span = w - b
+            mid = (b + w) / 2
+            if span < min_span:
+                b, w = mid - min_span / 2, mid + min_span / 2
+            elif span > max_span:
+                b, w = mid - max_span / 2, mid + max_span / 2
+            bests.append(b)
+            worsts.append(w)
         else:
             bests.append(max(vals))
             worsts.append(min(vals))
@@ -811,12 +836,6 @@ def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None):
     print("└" + "┴".join("─" * w for w in widths) + "┘")
 
     # ── Delta vs FP16 baseline ──────────────────────────────────────────
-    full_idx = None
-    for i, (_, _, mode, path) in enumerate(runs):
-        if mode == "full" and not _extract_gguf_tag(path):
-            full_idx = i
-            break
-
     if show_delta and full_idx is not None and n_runs > 1:
         delta_rows = [(r, full_idx) for r in range(n_runs) if r != full_idx]
         _print_delta_table("Δ vs FP16", delta_rows, matrix, labels, runs,

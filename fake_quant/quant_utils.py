@@ -522,13 +522,15 @@ class ActQuantWrapper(torch.nn.Module):
 
     def prepare_int_gemm(self, w_bits, w_sym=True, w_group_size=-1,
                          acc_bits=32, acc_block_k=32, use_triton=True,
-                         acc_wrap=False):
+                         acc_wrap=False, acc_dtype='float',
+                         gscaler_parsed=None):
         """Pre-compute integer weight representation for capped-accumulator GEMM."""
         from int_acc_gemm import prepare_int_weights
         self.use_int_gemm = True
         self.acc_bits = acc_bits
         self.acc_block_k = acc_block_k
         self.acc_wrap = acc_wrap
+        self.acc_dtype = acc_dtype
         self.int_gemm_use_triton = use_triton
         self.w_group_size = w_group_size
 
@@ -565,6 +567,16 @@ class ActQuantWrapper(torch.nn.Module):
         else:
             self.w_zp_cross = None
 
+        # Factor out gscaler shift bias: prescale w_scale by 2^bias so the
+        # kernel accumulates larger values in tier-2.  The bias is applied
+        # back (as 2^-bias) after the K-loop.  Corrections above use the
+        # original w_scale, so this must come last.
+        if gscaler_parsed is not None and gscaler_parsed['bias'] >= 1:
+            self.w_shift_bias = gscaler_parsed['bias']
+            self.w_scale = self.w_scale * (2.0 ** self.w_shift_bias)
+        else:
+            self.w_shift_bias = 0
+
     def compute_static_zp_bias(self):
         """Precompute [N] zero-point correction for static asymmetric per-group mode.
 
@@ -596,13 +608,19 @@ class ActQuantWrapper(torch.nn.Module):
         w_int_grouped = self.w_int.float().reshape(N, n_act_groups, G)
         w_int_group_sum = w_int_grouped.sum(dim=2)
 
-        # Map each activation group to its weight group scale
+        # Map each activation group to its weight group scale.
+        # Use un-prescaled w_scale (undo gscaler shift bias) because this
+        # correction is applied in float outside the kernel.
+        w_scale_orig = self.w_scale
+        w_shift = getattr(self, 'w_shift_bias', 0)
+        if w_shift > 0:
+            w_scale_orig = w_scale_orig * (2.0 ** (-w_shift))
         if self.w_group_size > 0:
             act_group_starts = torch.arange(n_act_groups, device=dev) * G
             w_group_idx = act_group_starts // self.w_group_size  # [n_act_groups]
-            w_scale_per_ag = self.w_scale[:, w_group_idx]  # [N, n_act_groups]
+            w_scale_per_ag = w_scale_orig[:, w_group_idx]  # [N, n_act_groups]
         else:
-            w_scale_per_ag = self.w_scale.unsqueeze(1).expand(N, n_act_groups)
+            w_scale_per_ag = w_scale_orig.unsqueeze(1).expand(N, n_act_groups)
 
         # static_zp_bias[j] = Σ_g a_zp_corr[g] * w_scale[j,g] * w_int_group_sum[j,g]
         weighted = w_scale_per_ag * w_int_group_sum  # [N, n_act_groups]
@@ -619,7 +637,7 @@ class ActQuantWrapper(torch.nn.Module):
             else:
                 # Per-channel: w_zp is [N], each act group contributes G elements
                 w_zp_dev = self.w_zp.to(dev)
-                w_scale_dev = self.w_scale.to(dev) if self.w_scale.dim() == 1 else self.w_scale[:, 0].to(dev)
+                w_scale_dev = w_scale_orig.to(dev) if w_scale_orig.dim() == 1 else w_scale_orig[:, 0].to(dev)
                 cross_per_ag = w_zp_dev.unsqueeze(1) * w_scale_dev.unsqueeze(1) * G  # [N, 1]
                 self.static_zp_bias += (a_zp_corr.unsqueeze(0) * cross_per_ag).sum(dim=1)
 
@@ -680,6 +698,8 @@ class ActQuantWrapper(torch.nn.Module):
                 bias=self.bias, use_triton=self.int_gemm_use_triton,
                 acc_wrap=self.acc_wrap, w_zp_correction=self.w_zp_correction,
                 w_zp=self.w_zp, w_zp_cross=self.w_zp_cross,
+                acc_dtype=getattr(self, 'acc_dtype', 'float'),
+                w_shift_bias=getattr(self, 'w_shift_bias', 0),
             )
             x_pre = x  # save pre-quantization input for sd_check
             x = int_gemm_capped(x_float=x, **_ig_kwargs).to(x_dtype)

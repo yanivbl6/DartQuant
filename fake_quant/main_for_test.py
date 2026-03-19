@@ -155,6 +155,54 @@ def main():
             # save_dict = torch.load(args.load_qmodel_path, map_location='cpu')
             # model.load_state_dict(save_dict["model"])
 
+        elif getattr(args, 'adaquant', None) is not None:  # AdaQuant Weight Quantization
+            import adaquant_utils
+            _adaquant_ckpt = None
+            if args.gptq_checkpoint_path:
+                # Use parallel directory for AdaQuant caches
+                w_suffix = 'w0' if _has_w_bits_map else f'w{args.w_bits}'
+                _adaquant_ckpt = os.path.join(
+                    args.gptq_checkpoint_path.replace('gptq_checkpoints', 'adaquant_checkpoints'),
+                    f'{model.model_name}_{w_suffix}'
+                )
+
+            if _adaquant_ckpt and os.path.isdir(_adaquant_ckpt) and any(
+                    f.endswith('.pth') for f in os.listdir(_adaquant_ckpt)):
+                logging.info("Loading AdaQuant checkpoint from: {}".format(_adaquant_ckpt))
+                utils.load_model_in_parts(model, _adaquant_ckpt)
+                if args.w_asym and args.int_gemm:
+                    from int_acc_gemm import load_gptq_w_params
+                    load_gptq_w_params(model, _adaquant_ckpt)
+                # Load optimised activation scales if present
+                _xscales_path = os.path.join(_adaquant_ckpt, '_adaquant_x_scales.pt')
+                if os.path.isfile(_xscales_path):
+                    logging.info("Loading AdaQuant x_scales from: %s", _xscales_path)
+                logging.info("AdaQuant checkpoint loaded – skipping quantization.")
+            else:
+                assert "llama" in args.model, "Only llama is supported for AdaQuant!"
+                aq_params = adaquant_utils.AdaQuantParams.from_string(args.adaquant)
+                aq_nsamples = aq_params.nsamples if aq_params.nsamples is not None else args.nsamples
+                trainloader = data_utils.get_loaders(
+                    args.cal_dataset, nsamples=aq_nsamples,
+                    seed=args.seed, model=args.model,
+                    seqlen=model.seqlen, eval_mode=False
+                )
+                quantizers, x_scales = adaquant_utils.adaquant_fwrd(
+                    model, trainloader, utils.DEV, args, aq_params)
+                save_dict["w_quantizers"] = quantizers
+
+                # Auto-save AdaQuant checkpoint
+                if _adaquant_ckpt:
+                    os.makedirs(_adaquant_ckpt, exist_ok=True)
+                    logging.info("Saving AdaQuant checkpoint to: {}".format(_adaquant_ckpt))
+                    utils.save_model_in_parts(model, _adaquant_ckpt,
+                                              prefix=f'{model.model_name}_part')
+                    if x_scales:
+                        torch.save(x_scales, os.path.join(_adaquant_ckpt, '_adaquant_x_scales.pt'))
+                    if args.w_asym and args.int_gemm:
+                        from int_acc_gemm import save_gptq_w_params
+                        save_gptq_w_params(model, _adaquant_ckpt)
+
         elif gptq_strength > 0.0 and _gptq_ckpt and os.path.isdir(_gptq_ckpt) and any(
                 f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
             logging.info("Loading GPTQ checkpoint from: {}".format(_gptq_ckpt))
@@ -367,6 +415,8 @@ def main():
                 acc_block_k=args.acc_block_k,
                 use_triton=args.int_gemm_use_triton,
                 acc_wrap=args.acc_wrap,
+                acc_dtype=getattr(args, 'acc_dtype', 'float'),
+                gscaler_parsed=getattr(args, 'gscaler_parsed', None),
             )
             n_int_gemm += 1
         logging.info("Integer GEMM prepared for %d layers", n_int_gemm)
@@ -454,7 +504,12 @@ def main():
     # Convert per-column static scales to per-group for int_gemm layers.
     # Per-column scales can't factor out of a dot product.  Per-group scales
     # (one per acc_block_k columns) can — each K-block gets its own scale.
-    if args.int_gemm and args.act_scales_path:
+    # Skip when acc_dtype is non-float32: we need per-token scales so the
+    # activation scale is applied after the tier-2 accumulator, not inside it.
+    from int_acc_gemm import parse_acc_dtype
+    _acc_kind, _acc_type_bits = parse_acc_dtype(getattr(args, 'acc_dtype', 'float'))
+    _acc_dtype_is_fp32 = (_acc_kind == 'float' and _acc_type_bits == 32)
+    if args.int_gemm and args.act_scales_path and _acc_dtype_is_fp32:
         G = args.acc_block_k
         qlayers_pg = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
         n_converted = 0

@@ -398,6 +398,8 @@ Examples:
                         help='K-block size for accumulator capping (default: 32)')
     parser.add_argument('--acc_wrap', action='store_true',
                         help='Use wrap-around instead of saturation on accumulator overflow')
+    parser.add_argument('--acc_dtype', type=str, default='float',
+                        help='Tier-2 accumulator dtype (e.g. fp16, int24). Default: float')
 
     # Softmax Output Quantization
     parser.add_argument('--smq', type=int, default=0,
@@ -426,6 +428,12 @@ Examples:
     parser.add_argument('--gscaler', type=str, default=None,
                         help='Group scale format: M5S3, M6E4b2, M6S4l2, etc. '
                              '(default: None = FP32 scales)')
+
+    # AdaQuant (alternative to GPTQ)
+    parser.add_argument('--adaquant', type=str, nargs='?', const='default', default=None,
+                        help='Use AdaQuant instead of GPTQ. No value = defaults. '
+                             'Inline params string to customise '
+                             '(e.g., "lr.0.001_ep.20_optWSX_adam_cos")')
 
     # GPU waiting
     parser.add_argument('--wait', action='store_true',
@@ -494,6 +502,7 @@ def main():
 
     # --- Build quant tag (centralized in experiment_config) ---
     quant_tag = cfg.build_quant_tag(args)
+    gptq_cache_tag = cfg.build_quant_tag(args, for_gptq_cache=True)
 
     # Resolve GGUF path (needed for weight loading, separate from tag)
     gguf_path = None
@@ -506,7 +515,7 @@ def main():
     if args.save_path is None:
         args.save_path = f"../data/act_scales/{model_name}/{save_prefix}_{quant_tag}.pt"
     if args.gptq_checkpoint_path is None:
-        args.gptq_checkpoint_path = f"../data/gptq_checkpoints/{save_prefix}_{model_name}_{quant_tag}"
+        args.gptq_checkpoint_path = f"../data/gptq_checkpoints/{save_prefix}_{model_name}_{gptq_cache_tag}"
 
     # --- Print resolved config ---
     print(f"Mode:       {args.mode}")
@@ -631,67 +640,134 @@ def main():
             bits=layer_input_bits, groupsize=layer_groupsize,
             sym=layer_a_sym, clip_ratio=layer_a_clip, residual=residual)
 
-    # --- GPTQ weight quantization ---
+    # --- Weight quantization (GPTQ or AdaQuant) ---
     # Must happen before activation calibration so we measure activations
     # flowing through quantized weights (matching actual inference).
     _has_w_bits_map = bool(getattr(args, 'w_bits_map', None))
+    _use_adaquant = getattr(args, 'adaquant', None) is not None
     if args.w_bits < 16 or _has_w_bits_map:
         _w_suffix = 'w0' if _has_w_bits_map else f'w{args.w_bits}'
-        _gptq_ckpt = os.path.join(args.gptq_checkpoint_path, f'{model_name}_{_w_suffix}')
 
-        if args.gptq and os.path.isdir(_gptq_ckpt):
-            import shutil
-            print(f"--gptq: removing cached GPTQ checkpoint: {_gptq_ckpt}")
-            shutil.rmtree(_gptq_ckpt)
+        if _use_adaquant:
+            # --- AdaQuant path ---
+            import sys, os as _os
+            sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..', 'fake_quant'))
+            import adaquant_utils
 
-        if os.path.isdir(_gptq_ckpt) and any(
-                f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
-            print(f"Loading existing GPTQ checkpoint from: {_gptq_ckpt}")
-            utils.load_model_in_parts(model, _gptq_ckpt)
-            if args.w_asym and getattr(args, 'int_gemm', False):
-                from int_acc_gemm import load_gptq_w_params
-                load_gptq_w_params(model, _gptq_ckpt)
+            _aq_base = args.gptq_checkpoint_path.replace('gptq_checkpoints', 'adaquant_checkpoints')
+            _aq_ckpt = _os.path.join(_aq_base, f'{model_name}_{_w_suffix}')
+
+            if args.gptq and os.path.isdir(_aq_ckpt):
+                import shutil
+                print(f"--gptq: removing cached AdaQuant checkpoint: {_aq_ckpt}")
+                shutil.rmtree(_aq_ckpt)
+
+            if os.path.isdir(_aq_ckpt) and any(
+                    f.endswith('.pth') for f in os.listdir(_aq_ckpt)):
+                print(f"Loading existing AdaQuant checkpoint from: {_aq_ckpt}")
+                utils.load_model_in_parts(model, _aq_ckpt)
+                if args.w_asym and getattr(args, 'int_gemm', False):
+                    from int_acc_gemm import load_gptq_w_params
+                    load_gptq_w_params(model, _aq_ckpt)
+            else:
+                _w_desc = f"w_bits_map({len(args.w_bits_map)} layers)" if _has_w_bits_map else f"w{args.w_bits}"
+                print(f"Running AdaQuant ({_w_desc}, groupsize={args.w_groupsize}) ...")
+                aq_params = adaquant_utils.AdaQuantParams.from_string(args.adaquant)
+                aq_nsamples = aq_params.nsamples if aq_params.nsamples is not None else args.nsamples
+                trainloader = data_utils.get_loaders(
+                    args.calib_dataset, nsamples=aq_nsamples,
+                    seed=args.seed, model=args.model,
+                    seqlen=model.seqlen, eval_mode=False)
+
+                class AqArgs:
+                    pass
+                aq_args = AqArgs()
+                aq_args.nsamples = aq_nsamples
+                aq_args.w_bits = args.w_bits
+                aq_args.w_asym = args.w_asym
+                aq_args.w_groupsize = args.w_groupsize
+                aq_args.w_clip = args.w_clip
+                aq_args.w_bits_down_proj = None
+                aq_args.w_bits_map = getattr(args, 'w_bits_map', None)
+                aq_args.int_gemm = getattr(args, 'int_gemm', False)
+                aq_args.a_bits = getattr(args, 'a_bits', 16)
+                aq_args.acc_bits = getattr(args, 'acc_bits', 32)
+                aq_args.acc_block_k = getattr(args, 'acc_block_k', 32)
+                aq_args.acc_wrap = getattr(args, 'acc_wrap', False)
+                aq_args.int_gemm_use_triton = True
+                aq_args.gscaler_parsed = quant_utils.parse_gscaler(
+                    getattr(args, 'gscaler', None))
+
+                _quantizers, _x_scales = adaquant_utils.adaquant_fwrd(
+                    model, trainloader, 'cuda', aq_args, aq_params)
+
+                os.makedirs(_aq_ckpt, exist_ok=True)
+                print(f"Saving AdaQuant checkpoint to: {_aq_ckpt}")
+                utils.save_model_in_parts(model, _aq_ckpt,
+                                          prefix=f'{model_name}_part')
+                if _x_scales:
+                    torch.save(_x_scales, os.path.join(_aq_ckpt, '_adaquant_x_scales.pt'))
+                if args.w_asym and getattr(args, 'int_gemm', False):
+                    from int_acc_gemm import save_gptq_w_params
+                    save_gptq_w_params(model, _aq_ckpt)
+
         else:
-            _w_desc = f"w_bits_map({len(args.w_bits_map)} layers)" if _has_w_bits_map else f"w{args.w_bits}"
-            print(f"Running GPTQ ({_w_desc}, groupsize={args.w_groupsize}) ...")
-            trainloader = data_utils.get_loaders(
-                args.calib_dataset, nsamples=args.nsamples,
-                seed=args.seed, model=args.model,
-                seqlen=model.seqlen, eval_mode=False)
+            # --- GPTQ path ---
+            _gptq_ckpt = os.path.join(args.gptq_checkpoint_path, f'{model_name}_{_w_suffix}')
 
-            class GptqArgs:
-                pass
-            gptq_args = GptqArgs()
-            gptq_args.nsamples = args.nsamples
-            gptq_args.w_bits = args.w_bits
-            gptq_args.w_asym = args.w_asym
-            gptq_args.w_groupsize = args.w_groupsize
-            gptq_args.w_clip = args.w_clip
-            gptq_args.w_bits_down_proj = None
-            gptq_args.w_bits_map = getattr(args, 'w_bits_map', None)
-            gptq_args.percdamp = args.percdamp
-            gptq_args.act_order = False
-            gptq_args.w_static_groups = False
-            # Forward int_gemm args so GPTQ enables capped accumulator between groups
-            gptq_args.int_gemm = getattr(args, 'int_gemm', False)
-            gptq_args.a_bits = getattr(args, 'a_bits', 16)
-            gptq_args.acc_bits = getattr(args, 'acc_bits', 32)
-            gptq_args.acc_block_k = getattr(args, 'acc_block_k', 32)
-            gptq_args.acc_wrap = getattr(args, 'acc_wrap', False)
-            gptq_args.int_gemm_use_triton = True
-            # Forward group-scale quantization config
-            gptq_args.gscaler_parsed = quant_utils.parse_gscaler(
-                getattr(args, 'gscaler', None))
+            if args.gptq and os.path.isdir(_gptq_ckpt):
+                import shutil
+                print(f"--gptq: removing cached GPTQ checkpoint: {_gptq_ckpt}")
+                shutil.rmtree(_gptq_ckpt)
 
-            gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
+            if os.path.isdir(_gptq_ckpt) and any(
+                    f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
+                print(f"Loading existing GPTQ checkpoint from: {_gptq_ckpt}")
+                utils.load_model_in_parts(model, _gptq_ckpt)
+                if args.w_asym and getattr(args, 'int_gemm', False):
+                    from int_acc_gemm import load_gptq_w_params
+                    load_gptq_w_params(model, _gptq_ckpt)
+            else:
+                _w_desc = f"w_bits_map({len(args.w_bits_map)} layers)" if _has_w_bits_map else f"w{args.w_bits}"
+                print(f"Running GPTQ ({_w_desc}, groupsize={args.w_groupsize}) ...")
+                trainloader = data_utils.get_loaders(
+                    args.calib_dataset, nsamples=args.nsamples,
+                    seed=args.seed, model=args.model,
+                    seqlen=model.seqlen, eval_mode=False)
 
-            os.makedirs(_gptq_ckpt, exist_ok=True)
-            print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
-            utils.save_model_in_parts(model, _gptq_ckpt,
-                                      prefix=f'{model_name}_part')
-            if args.w_asym and getattr(args, 'int_gemm', False):
-                from int_acc_gemm import save_gptq_w_params
-                save_gptq_w_params(model, _gptq_ckpt)
+                class GptqArgs:
+                    pass
+                gptq_args = GptqArgs()
+                gptq_args.nsamples = args.nsamples
+                gptq_args.w_bits = args.w_bits
+                gptq_args.w_asym = args.w_asym
+                gptq_args.w_groupsize = args.w_groupsize
+                gptq_args.w_clip = args.w_clip
+                gptq_args.w_bits_down_proj = None
+                gptq_args.w_bits_map = getattr(args, 'w_bits_map', None)
+                gptq_args.percdamp = args.percdamp
+                gptq_args.act_order = False
+                gptq_args.w_static_groups = False
+                # Forward int_gemm args so GPTQ enables capped accumulator between groups
+                gptq_args.int_gemm = getattr(args, 'int_gemm', False)
+                gptq_args.a_bits = getattr(args, 'a_bits', 16)
+                gptq_args.acc_bits = getattr(args, 'acc_bits', 32)
+                gptq_args.acc_block_k = getattr(args, 'acc_block_k', 32)
+                gptq_args.acc_wrap = getattr(args, 'acc_wrap', False)
+                gptq_args.int_gemm_use_triton = True
+                # Forward group-scale quantization config
+                gptq_args.gscaler_parsed = quant_utils.parse_gscaler(
+                    getattr(args, 'gscaler', None))
+
+                gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
+
+                os.makedirs(_gptq_ckpt, exist_ok=True)
+                print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
+                utils.save_model_in_parts(model, _gptq_ckpt,
+                                          prefix=f'{model_name}_part')
+                if args.w_asym and getattr(args, 'int_gemm', False):
+                    from int_acc_gemm import save_gptq_w_params
+                    save_gptq_w_params(model, _gptq_ckpt)
 
         utils.cleanup_memory(verbos=True)
 
@@ -802,7 +878,9 @@ def main():
                 w_bits=layer_w_bits, w_sym=not args.w_asym,
                 w_group_size=args.w_groupsize,
                 acc_bits=args.acc_bits, acc_block_k=args.acc_block_k,
-                acc_wrap=args.acc_wrap)
+                acc_wrap=args.acc_wrap,
+                acc_dtype=getattr(args, 'acc_dtype', 'float'),
+                gscaler_parsed=getattr(args, 'gscaler_parsed', None))
             n_ig += 1
             print(f"    done.", flush=True)
         print(f"Integer GEMM prepared for {n_ig} layers", flush=True)

@@ -150,6 +150,8 @@ def add_quant_args(parser):
     parser.add_argument('--acc_block_k', type=int, default=32)
     parser.add_argument('--acc_wrap', action='store_true',
                         help='Wrap-around instead of saturation')
+    parser.add_argument('--acc_dtype', type=str, default='float',
+                        help='Tier-2 accumulator dtype (e.g. fp16, int24)')
 
     # Softmax Output Quantization
     parser.add_argument('--smq', type=int, default=0,
@@ -184,6 +186,12 @@ def add_quant_args(parser):
     parser.add_argument('--gscaler', type=str, default=None,
                         help='Group scale format: M5S3, M6E4b2, M6S4l2, etc. '
                              '(default: None = FP32 scales)')
+
+    # AdaQuant (alternative to GPTQ)
+    parser.add_argument('--adaquant', type=str, nargs='?', const='default', default=None,
+                        help='Use AdaQuant instead of GPTQ. No value = defaults. '
+                             'Inline params string to customise '
+                             '(e.g., "lr.0.001_ep.20_optWSX_adam_cos")')
 
 
 def resolve_v_bits(args):
@@ -229,8 +237,8 @@ def build_quant_tag(args, for_gptq_cache=False):
         if getattr(args, 'pwl_no_hw_sim', False):
             parts.append("nohw")
         tag += "_".join(parts)
-    # Integer GEMM tag
-    if getattr(args, 'int_gemm', False):
+    # Integer GEMM tag (omitted for GPTQ cache — GPTQ doesn't use the accumulator)
+    if getattr(args, 'int_gemm', False) and not for_gptq_cache:
         parts = ["_intgemm"]
         if getattr(args, 'acc_bits', 32) != 32:
             parts.append(f"acc{args.acc_bits}")
@@ -238,6 +246,9 @@ def build_quant_tag(args, for_gptq_cache=False):
             parts.append(f"bk{args.acc_block_k}")
         if getattr(args, 'acc_wrap', False):
             parts.append("wrap")
+        acc_dtype_str = getattr(args, 'acc_dtype', 'float')
+        if acc_dtype_str.lower().strip() not in ('float', 'fp32'):
+            parts.append(f"t2{acc_dtype_str}")
         tag += "_".join(parts)
     # SMQ tag
     if getattr(args, 'smq', 0) > 0:
@@ -267,6 +278,12 @@ def build_quant_tag(args, for_gptq_cache=False):
     # Group scaler tag
     if getattr(args, 'gscaler', None):
         tag += f"_G-scaler-{args.gscaler}"
+    # AdaQuant tag
+    _aq = getattr(args, 'adaquant', None)
+    if _aq is not None:
+        tag += "_adaquant"
+        if _aq != 'default':
+            tag += f"-{_aq}"
     return tag
 
 
@@ -285,6 +302,17 @@ def resolve_gptq_checkpoint_dir(model_path, mode, quant_tag, w_bits, imitate_ggu
     w_suffix = 'w0' if imitate_gguf else f'w{w_bits}'
     return os.path.join(
         _DATA_DIR, 'gptq_checkpoints',
+        f'{mode}_{model_name}_{quant_tag}',
+        f'{model_name}_{w_suffix}',
+    )
+
+
+def resolve_adaquant_checkpoint_dir(model_path, mode, quant_tag, w_bits, imitate_gguf=False):
+    """Resolve AdaQuant checkpoint directory (containing .pth files)."""
+    model_name = model_name_from_path(model_path)
+    w_suffix = 'w0' if imitate_gguf else f'w{w_bits}'
+    return os.path.join(
+        _DATA_DIR, 'adaquant_checkpoints',
         f'{mode}_{model_name}_{quant_tag}',
         f'{model_name}_{w_suffix}',
     )
@@ -318,6 +346,9 @@ def build_quant_args(args):
                 '--acc_block_k', str(args.acc_block_k)]
         if args.acc_wrap:
             cmd.append('--acc_wrap')
+        acc_dtype_str = getattr(args, 'acc_dtype', 'float')
+        if acc_dtype_str.lower().strip() not in ('float', 'fp32'):
+            cmd += ['--acc_dtype', acc_dtype_str]
     if getattr(args, 'smq', 0) > 0:
         cmd += ['--smq', str(args.smq)]
     if getattr(args, 'imitate_gguf', None):
@@ -332,6 +363,9 @@ def build_quant_args(args):
         cmd += ['--gptq_strength', str(args.gptq_strength)]
     if getattr(args, 'gscaler', None):
         cmd += ['--gscaler', args.gscaler]
+    _aq = getattr(args, 'adaquant', None)
+    if _aq is not None:
+        cmd += ['--adaquant', _aq]
     return cmd
 
 

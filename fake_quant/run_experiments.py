@@ -137,8 +137,8 @@ Examples:
                         help='Run experiments one at a time, each with --wait for a clear GPU')
     parser.add_argument('--max_used_mb', type=int, default=200,
                         help='Max used memory (MiB) for --sequential GPU waiting (default: 200)')
-    parser.add_argument('--refresh', type=int, default=15,
-                        help='Status refresh interval in seconds (default: 15)')
+    parser.add_argument('--refresh', type=int, default=10,
+                        help='Status refresh interval in seconds (default: 10)')
     parser.add_argument('--dry', action='store_true',
                         help='Print commands without running them')
 

@@ -101,6 +101,10 @@ def parser_gen():
     parser.add_argument('--acc_wrap', action=argparse.BooleanOptionalAction, default=False,
                         help='Use two\'s-complement wrap-around on accumulator overflow instead of '
                              'saturation (clamp). Default: False (saturation).')
+    parser.add_argument('--acc_dtype', type=str, default='float',
+                        help='Tier-2 accumulator dtype for integer GEMM. '
+                             'Accepts int<N> (e.g. int16, int24, int32), float/fp32, half/fp16, bfloat/bf16. '
+                             'Non-float32 requires static activation scales or a16. (default: float)')
     parser.add_argument('--int_gemm_use_triton', action=argparse.BooleanOptionalAction, default=True,
                         help='Use Triton kernel for integer GEMM (default: True). '
                              'Set --no-int_gemm_use_triton for pure-PyTorch reference.')
@@ -148,6 +152,10 @@ def parser_gen():
     parser.add_argument('--gscaler', type=str, default=None,
                         help='Group scale format: M5S3, M6E4b2, M6S4l2, etc. '
                              '(default: None = FP32 scales)')
+    parser.add_argument('--adaquant', type=str, nargs='?', const='default', default=None,
+                        help='Use AdaQuant instead of GPTQ. No value = defaults. '
+                             'Inline params string to customise '
+                             '(e.g., "lr.0.001_ep.20_optWSX_adam_cos")')
 
     # General Quantization Arguments
     parser.add_argument('--w_bits_down_proj', type=int, default=None,
@@ -302,6 +310,24 @@ def parser_gen():
             assert args.acc_block_k <= args.w_groupsize, (
                 f'acc_block_k ({args.acc_block_k}) must be <= w_groupsize ({args.w_groupsize}) '
                 'to avoid straddling weight group boundaries in the kernel')
+        # Validate --acc_dtype
+        from int_acc_gemm import parse_acc_dtype
+        acc_kind, acc_type_bits = parse_acc_dtype(args.acc_dtype)
+        if not (acc_kind == 'float' and acc_type_bits == 32):
+            # Non-float32 tier-2 requires per-token activation scales (not per-group)
+            is_static = getattr(args, 'act_scales_path', None) is not None
+            is_a16 = args.a_bits >= 16
+            assert is_static or is_a16, (
+                f'--acc_dtype {args.acc_dtype} requires static activation scales '
+                '(--act_scales_path) or unquantized activations (a_bits >= 16). '
+                'Per-group activation scales inside the K-loop are incompatible '
+                'with non-float32 tier-2 accumulators.')
+
+    if hasattr(args, 'acc_dtype') and not args.int_gemm:
+        from int_acc_gemm import parse_acc_dtype
+        acc_kind, acc_type_bits = parse_acc_dtype(args.acc_dtype)
+        if not (acc_kind == 'float' and acc_type_bits == 32):
+            assert False, '--acc_dtype requires --int_gemm'
 
     if args.model == 'facebook/opt-125m' or args.model == 'facebook/opt-1.3b':
         logging.warning('Warning: OPT-125M/1.3B is only for debugging purposes!!')

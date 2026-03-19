@@ -50,6 +50,7 @@ Options:
   --acc_bits N         Accumulator bit-width                         (default: 32)
   --acc_block_k N      K-block size for accumulator capping          (default: 32)
   --acc_wrap           Use wrap-around instead of saturation on overflow
+  --acc_dtype S        Tier-2 accumulator dtype (e.g. fp16, int24)     (default: float)
   --smq N              Softmax output quantization bits (0=disabled, default: 0)
   --sd_check T         Compare static vs dynamic quantization per-layer (threshold T, 0=off)
   --sd_check_norm N    Norm for sd_check: 1, 2, or inf                   (default: inf)
@@ -119,6 +120,7 @@ INT_GEMM=0
 ACC_BITS=32
 ACC_BLOCK_K=32
 ACC_WRAP=0
+ACC_DTYPE="float"
 SMQ=0
 SD_CHECK=0
 SD_CHECK_NORM="inf"
@@ -159,6 +161,7 @@ while [[ $# -gt 0 ]]; do
         --acc_bits)    ACC_BITS="$2";    shift 2 ;;
         --acc_block_k) ACC_BLOCK_K="$2"; shift 2 ;;
         --acc_wrap)    ACC_WRAP=1;        shift   ;;
+        --acc_dtype)   ACC_DTYPE="$2";   shift 2 ;;
         --smq)         SMQ="$2";         shift 2 ;;
         --sd_check)    SD_CHECK="$2";    shift 2 ;;
         --sd_check_norm) SD_CHECK_NORM="$2"; shift 2 ;;
@@ -312,6 +315,9 @@ if [ "$INT_GEMM" == "1" ]; then
     INT_GEMM_FLAG="--int_gemm --acc_bits ${ACC_BITS} --acc_block_k ${ACC_BLOCK_K}"
     if [ "$ACC_WRAP" == "1" ]; then
         INT_GEMM_FLAG="${INT_GEMM_FLAG} --acc_wrap"
+    fi
+    if [ "$ACC_DTYPE" != "float" ]; then
+        INT_GEMM_FLAG="${INT_GEMM_FLAG} --acc_dtype ${ACC_DTYPE}"
     fi
 fi
 
