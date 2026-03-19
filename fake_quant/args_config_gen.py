@@ -186,7 +186,8 @@ def parser_gen():
     # GGUF imitation (per-layer bit-width matching)
     parser.add_argument('--imitate_gguf', type=str, default=None,
                         help='Match per-layer weight bit-widths from a GGUF file. '
-                             'Pass a quant type (e.g. Q4_K_M) or explicit .gguf path.')
+                             'Pass a quant scheme name (e.g. Q4_K_S, Q4_K_M, Q4_K_L) '
+                             'to lookup <ModelName>-<scheme>.gguf, or an explicit .gguf path.')
 
     # GGUF Pre-quantized Weights
     parser.add_argument('--gguf_path', type=str, default=None,

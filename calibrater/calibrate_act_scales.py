@@ -406,12 +406,14 @@ Examples:
     # GGUF imitation (per-layer bit-width matching)
     parser.add_argument('--imitate_gguf', type=str, default=None,
                         help='Match per-layer weight bit-widths from a GGUF file. '
-                             'Pass a quant type (e.g. Q4_K_M) or explicit .gguf path.')
+                             'Pass a quant scheme name (e.g. Q4_K_S, Q4_K_M, Q4_K_L) '
+                             'to lookup <ModelName>-<scheme>.gguf, or an explicit .gguf path.')
 
     # GGUF pre-quantized weights
     parser.add_argument('--gguf', type=str, default=None,
                         help='Use GGUF pre-quantized weights. Pass a quant type '
-                             '(e.g. Q4_K_M, Q4_K_S) to lookup from quantized_models/, '
+                             '(e.g. Q4_K_S, Q4_K_M, Q4_K_L) to lookup '
+                             '<ModelName>-<scheme>.gguf from quantized_models/, '
                              'or an explicit path to a .gguf file.')
     parser.add_argument('--quant_warnings', action='store_true',
                         help='Warn when quantization params mismatch GGUF tensor specs')

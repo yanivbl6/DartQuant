@@ -56,7 +56,7 @@ Options:
   --selective-dyn P    Comma-separated layer patterns to force dynamic    (e.g., "v_proj,o_proj")
   --weights_stats F  Write weight sparsity stats to file F
   --gptq_strength F  GPTQ error-propagation strength (0.0–1.0, default: 1.0)
-  --gguf TYPE      Use GGUF pre-quantized weights (e.g. Q4_K_M, Q4_K_S, or path)
+  --gguf TYPE      Use GGUF pre-quantized weights (scheme name like Q4_K_S, Q4_K_M, Q4_K_L, or path)
   --quant_warnings Warn on GGUF vs config quantization mismatches
   --wait           Wait for a clear GPU (polls every 20s, overrides -g)
   --max_used_mb N  Max used memory (MiB) for a GPU to be "clear"   (default: 200)
@@ -223,9 +223,9 @@ SCRIPT_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
 DATA_DIR="${SCRIPT_BASE}/data"
 
 # --- Resolve GGUF path ---
-# GGUF can be a quant-type shorthand (Q4_K_M, Q4_K_S) or an explicit path.
+# GGUF can be a quant scheme name (e.g. Q4_K_S, Q4_K_M, Q4_K_L) or an explicit path.
 if [ -n "$GGUF" ] && [[ "$GGUF" != */* ]] && [[ "$GGUF" != *.gguf ]]; then
-    # Shorthand like Q4_K_M -> look up in quantized_models/
+    # Scheme name -> look up in quantized_models/<ModelName>-<scheme>.gguf
     GGUF_DIR="${DATA_DIR}/quantized_models"
     GGUF_FILE="${GGUF_DIR}/${MODEL_NAME}-${GGUF}.gguf"
     if [ ! -f "$GGUF_FILE" ]; then
