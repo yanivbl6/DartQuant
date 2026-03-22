@@ -61,6 +61,7 @@ Options:
   --quant_warnings Warn on GGUF vs config quantization mismatches
   --wait           Wait for a clear GPU (polls every 20s, overrides -g)
   --max_used_mb N  Max used memory (MiB) for a GPU to be "clear"   (default: 200)
+  --sim_version N  Simulation version tag for A/B comparisons       (default: 0=omitted)
   -F               Fast mode (skip lm_eval tasks)
   --very-fast      Very fast mode (skip lm_eval, PPL on wikitext2 only)
   -h               Show this help message
@@ -134,6 +135,7 @@ GPTQ_STRENGTH=""
 QUANT_WARNINGS=0
 WAIT_GPU=0
 MAX_USED_MB=200
+SIM_VERSION=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -173,6 +175,7 @@ while [[ $# -gt 0 ]]; do
         --gscaler)     GSCALER="$2";        shift 2 ;;
         --gptq_strength) GPTQ_STRENGTH="$2"; shift 2 ;;
         --quant_warnings) QUANT_WARNINGS=1; shift   ;;
+        --sim_version) SIM_VERSION="$2";   shift 2 ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
@@ -377,6 +380,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ -n "$IMITATE_GGUF_TAG_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${IMITATE_GGUF_TAG_FLAG}"
 [ -n "$GPTQ_STRENGTH_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GPTQ_STRENGTH_FLAG}"
 [ -n "$GSCALER_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GSCALER_FLAG}"
+[ "$SIM_VERSION" != "0" ] && TAG_ARGS="${TAG_ARGS} --sim_version ${SIM_VERSION}"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
 QUANT_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS})

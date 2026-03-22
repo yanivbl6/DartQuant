@@ -449,6 +449,10 @@ Examples:
     parser.add_argument('--gptq', action='store_true',
                         help='Delete cached GPTQ checkpoint and re-quantize')
 
+    # Simulation version tag (no-op here, used for experiment tagging)
+    parser.add_argument('--sim_version', type=int, default=0,
+                        help='Simulation version tag for A/B comparisons (0=omitted from tag)')
+
     return parser.parse_args()
 
 

@@ -92,6 +92,11 @@ if _HAS_TRITON:
         T2_IS_BF16: tl.constexpr,   # True = bfloat16 tier-2
         # Gscaler shift bias — w_scale was prescaled by 2^bias; undo after K-loop
         W_SHIFT_BIAS: tl.constexpr,
+        # Weight zero-point correction (asymmetric weights)
+        HAS_W_ZP: tl.constexpr,    # True = apply w_zp correction inside accumulator
+        W_zp_ptr,                   # [N, n_groups] or [N] int32 — weight zero points
+        stride_wzp_n,               # stride for N dimension of w_zp
+        stride_wzp_g,               # stride for group dimension of w_zp
         # Tile sizes
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -134,11 +139,27 @@ if _HAS_TRITON:
 
             # Cap to tier-1 accumulator range
             if ACC_WRAP:
-                # Two's-complement wrap-around (double-modulo handles C-style remainder)
                 partial = ((partial - ACC_MIN) % ACC_RANGE + ACC_RANGE) % ACC_RANGE + ACC_MIN
             else:
-                # Saturation (clamp)
                 partial = tl.minimum(tl.maximum(partial, ACC_MIN), ACC_MAX)
+
+            # Weight zero-point correction: partial += sum(a_block) * w_zp
+            # Applied after dot-product cap, then capped again.
+            if HAS_W_ZP:
+                a_block_sum = tl.sum(a_tile.to(tl.int32), axis=1)  # [BLOCK_M]
+                if GROUP_SIZE > 0:
+                    g_idx_zp = k_start // GROUP_SIZE
+                    w_zp_g = tl.load(W_zp_ptr + offs_n * stride_wzp_n + g_idx_zp * stride_wzp_g,
+                                     mask=offs_n < N, other=0)     # [BLOCK_N] int32
+                else:
+                    w_zp_g = tl.load(W_zp_ptr + offs_n * stride_wzp_n,
+                                     mask=offs_n < N, other=0)     # [BLOCK_N] int32
+                partial = partial + a_block_sum[:, None] * w_zp_g[None, :]
+                # Cap/wrap again after correction
+                if ACC_WRAP:
+                    partial = ((partial - ACC_MIN) % ACC_RANGE + ACC_RANGE) % ACC_RANGE + ACC_MIN
+                else:
+                    partial = tl.minimum(tl.maximum(partial, ACC_MIN), ACC_MAX)
 
             partial_f = partial.to(tl.float32)
 
@@ -241,6 +262,7 @@ def int_gemm_capped_reference(
     a_group_size: int = -1,
     acc_dtype: str = 'float',
     w_shift_bias: int = 0,
+    w_zp: Optional[torch.Tensor] = None,  # [N] or [N, n_groups] — weight zero-point correction
 ) -> torch.Tensor:
     """Pure-PyTorch reference for capped-accumulator integer GEMM."""
     M, K = a_int.shape
@@ -262,11 +284,24 @@ def int_gemm_capped_reference(
         partial = a_int[:, k_start:k_end].float() @ w_int[:, k_start:k_end].float().t()
         partial = partial.round()
         if acc_wrap:
-            # Two's-complement wrap-around (use int64 to avoid float32 precision loss)
             partial = ((partial.long() - acc_min) % acc_range + acc_min).float()
         else:
-            # Saturation (clamp)
             partial = partial.clamp(acc_min, acc_max)
+
+        # Weight zero-point correction: partial += sum(a_block) * w_zp
+        if w_zp is not None:
+            a_block_sum = a_int[:, k_start:k_end].long().sum(dim=1)  # [M]
+            if w_group_size > 0 and w_zp.dim() == 2:
+                g_idx = k_start // w_group_size
+                w_zp_g = w_zp[:, g_idx]                               # [N]
+            else:
+                w_zp_g = w_zp                                          # [N]
+            partial = partial + (a_block_sum.unsqueeze(1) * w_zp_g.unsqueeze(0)).round()
+            # Cap/wrap again after correction
+            if acc_wrap:
+                partial = ((partial.long() - acc_min) % acc_range + acc_min).float()
+            else:
+                partial = partial.clamp(acc_min, acc_max)
 
         # Per-group activation scale (static mode)
         if a_group_size > 0 and a_group_scale is not None:
@@ -379,7 +414,7 @@ def int_gemm_capped(
         a_group_size = -1
         a_token_scale = a_scale      # [M]
 
-    # Dispatch
+    # Dispatch — w_zp correction is now inside the kernel (before accumulator cap)
     if use_triton and _HAS_TRITON and x_float.is_cuda:
         output = _triton_int_gemm(a_int, a_token_scale, w_int, w_scale,
                                   acc_bits, block_k, w_group_size, bias,
@@ -387,7 +422,8 @@ def int_gemm_capped(
                                   a_gscale=a_group_scale,
                                   a_group_size=a_group_size,
                                   acc_dtype=acc_dtype,
-                                  w_shift_bias=w_shift_bias)
+                                  w_shift_bias=w_shift_bias,
+                                  w_zp=w_zp)
     else:
         output = int_gemm_capped_reference(a_int, a_token_scale, w_int, w_scale,
                                            acc_bits, block_k, w_group_size,
@@ -395,7 +431,8 @@ def int_gemm_capped(
                                            a_group_scale=a_group_scale,
                                            a_group_size=a_group_size,
                                            acc_dtype=acc_dtype,
-                                           w_shift_bias=w_shift_bias)
+                                           w_shift_bias=w_shift_bias,
+                                           w_zp=w_zp)
 
     # Zero-point correction for asymmetric activations (applied in float,
     # outside the capped accumulator).
@@ -403,16 +440,8 @@ def int_gemm_capped(
     if a_zp_correction is not None and w_zp_correction is not None:
         output += a_zp_correction.unsqueeze(1) * w_zp_correction.unsqueeze(0)
 
-    # Zero-point correction for asymmetric weights (applied in float,
-    # outside the capped accumulator).
-    # Term: w_zp * Σ_k(a_int) * a_scale * w_scale  per output channel
-    if w_zp is not None:
-        # w_scale may be prescaled by 2^w_shift_bias for tier-2 precision;
-        # the correction needs the original (un-prescaled) values.
-        w_scale_orig = w_scale * (2.0 ** (-w_shift_bias)) if w_shift_bias > 0 else w_scale
-        _apply_weight_zp_correction(
-            output, a_int, a_token_scale, a_group_scale, a_group_size,
-            w_zp, w_scale_orig, w_group_size, M, K, use_act_groups)
+    # NOTE: Weight zero-point correction (old Term C) is now inside the kernel,
+    # applied before the accumulator cap/wrap. No post-kernel correction needed.
 
     # Cross-term for combined activation + weight asymmetry (dynamic mode).
     # Term: a_zp_correction[m] * Σ_g(w_zp[j,g] * w_scale[j,g] * G)
@@ -498,6 +527,7 @@ def _triton_int_gemm(
     a_gscale=None, a_group_size=-1,
     acc_dtype='float',
     w_shift_bias=0,
+    w_zp=None,
 ):
     """Launch the Triton kernel."""
     BLOCK_M = 32
@@ -539,6 +569,22 @@ def _triton_int_gemm(
     else:
         a_gscale_ptr = torch.empty(0, device=a_int.device)
 
+    # Weight zero-point (asymmetric weights)
+    has_w_zp = w_zp is not None
+    if has_w_zp:
+        # Store as int32 for exact integer arithmetic inside kernel
+        w_zp_int = w_zp.round().to(torch.int32).contiguous()
+        if w_zp_int.dim() == 2:
+            stride_wzp_n = w_zp_int.stride(0)
+            stride_wzp_g = w_zp_int.stride(1)
+        else:
+            stride_wzp_n = w_zp_int.stride(0)
+            stride_wzp_g = 0
+    else:
+        w_zp_int = torch.empty(0, dtype=torch.int32, device=a_int.device)
+        stride_wzp_n = 0
+        stride_wzp_g = 0
+
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _int_gemm_capped_acc_kernel[grid](
@@ -567,6 +613,10 @@ def _triton_int_gemm(
         T2_IS_FP16=t2_is_fp16,
         T2_IS_BF16=t2_is_bf16,
         W_SHIFT_BIAS=w_shift_bias,
+        HAS_W_ZP=has_w_zp,
+        W_zp_ptr=w_zp_int,
+        stride_wzp_n=stride_wzp_n,
+        stride_wzp_g=stride_wzp_g,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -639,14 +689,11 @@ def _recover_int_and_scale_asym(
 
     We decompose this as::
 
-        w = scale * (q_centered + midpoint - zero)
-          = scale * q_centered  +  scale * zp_offset
+        w = scale * (q_centered + w_zp)
 
-    where ``midpoint = round(mean(zero))`` (adaptive, minimises |zp_offset|),
-    ``q_centered = q_unsigned - midpoint``, and ``zp_offset = midpoint - zero``.
-
-    ``q_centered`` is stored as int8 for the kernel (same range as symmetric).
-    The ``zp_offset`` correction is applied in float outside the accumulator.
+    where ``midpoint = (maxq + 1) // 2`` (fixed), ``q_centered = q_unsigned -
+    midpoint`` (always in true int4/intN range), and ``w_zp = midpoint - zero``
+    (per-row correction applied inside the kernel before accumulator cap).
 
     Parameters
     ----------
@@ -655,20 +702,19 @@ def _recover_int_and_scale_asym(
 
     Returns
     -------
-    q_centered : [N, G] int8 — midpoint-centred integer (same range as symmetric)
+    q_centered : [N, G] int8 — midpoint-centred integer (true intN range)
     scale      : [N, 1] float32 per-row scale
-    zp_offset  : [N, 1] float32 per-row ``midpoint - zero`` (correction factor)
+    w_zp       : [N, 1] float32 per-row ``midpoint - zero`` (correction factor)
     """
+    midpoint = (maxq + 1) // 2
     w_min = W_fq.amin(dim=1, keepdim=True)
     w_max = W_fq.amax(dim=1, keepdim=True)
     scale = ((w_max - w_min) / maxq).clamp(min=1e-10)
     zero = torch.round(-w_min / scale)
-    midpoint = _compute_adaptive_midpoint(zero, maxq)
     q_unsigned = torch.clamp(torch.round(W_fq / scale) + zero, 0, maxq)
-    # Fold zp into w_int: w_centered = q_unsigned - gptq_zero (true centered)
-    # This eliminates the w_zp correction term entirely.
-    w_centered = (q_unsigned.long() - zero.long()).clamp(-128, 127).to(torch.int8)
-    return w_centered, scale, None  # w_zp = None (folded in)
+    q_centered = (q_unsigned - midpoint).to(torch.int8)
+    w_zp = midpoint - zero                      # [N, 1] per-row correction
+    return q_centered, scale, w_zp
 
 
 def _requantize_with_gptq_params(
@@ -698,12 +744,13 @@ def _requantize_with_gptq_params(
     w_scale : [N, n_groups] or [N] float32
     w_zp   : [N, n_groups] or [N] float32 (midpoint - zero)
     """
+    midpoint = (maxq + 1) // 2
     N, K = W.shape
 
     # Verify gptq_zero is integer-valued (from torch.round in GPTQ)
     zp_frac = (gptq_zero - gptq_zero.round()).abs().max().item()
     assert zp_frac < 0.01, \
-        f"gptq_zero has fractional part {zp_frac:.4e} — cannot fold into int8"
+        f"gptq_zero has fractional part {zp_frac:.4e} — cannot use as integer zp"
 
     if w_group_size > 0:
         n_groups = gptq_scale.shape[1]
@@ -719,18 +766,19 @@ def _requantize_with_gptq_params(
             torch.round(W_padded / scale_expanded.clamp(min=1e-10)) + zero_expanded,
             0, maxq,
         )
-        # Fold w_zp: w_centered = q_unsigned - gptq_zero (true centered)
-        w_centered = (q_unsigned.long() - zero_expanded.long()).clamp(-128, 127).to(torch.int8)
-        w_int = w_centered[:, :K].contiguous()
-        return w_int, gptq_scale, None  # w_zp = None (folded in)
+        q_centered = (q_unsigned - midpoint).to(torch.int8)
+        w_int = q_centered[:, :K].contiguous()
+        w_zp = midpoint - gptq_zero              # [N, n_groups]
+        return w_int, gptq_scale, w_zp
     else:
         # Per-channel: gptq_scale/gptq_zero are [N, 1]
         q_unsigned = torch.clamp(
             torch.round(W / gptq_scale.clamp(min=1e-10)) + gptq_zero,
             0, maxq,
         )
-        w_centered = (q_unsigned.long() - gptq_zero.long()).clamp(-128, 127).to(torch.int8)
-        return w_centered, gptq_scale.squeeze(1), None  # w_zp = None (folded in)
+        q_centered = (q_unsigned - midpoint).to(torch.int8)
+        w_zp = midpoint - gptq_zero.squeeze(1)   # [N]
+        return q_centered, gptq_scale.squeeze(1), w_zp
 
 
 def prepare_int_weights(
@@ -766,15 +814,24 @@ def prepare_int_weights(
             linear._gptq_w_zero.to(dev).float(),
             maxq, w_group_size,
         )
-        # Diagnostic: measure reconstruction error (w_zp folded into w_int)
+        # Diagnostic: measure reconstruction error
         if w_group_size > 0 and w_scale.dim() == 2:
-            recon = w_scale.repeat_interleave(w_group_size, dim=1)[:, :K] * w_int.float()
+            w_zp_exp = w_zp.repeat_interleave(w_group_size, dim=1)[:, :K] if w_zp is not None else 0
+            recon = w_scale.repeat_interleave(w_group_size, dim=1)[:, :K] * (w_int.float() + w_zp_exp)
         else:
-            recon = w_scale.unsqueeze(1) * w_int.float()
+            w_zp_col = w_zp.unsqueeze(1) if (w_zp is not None and w_zp.dim() == 1) else (w_zp if w_zp is not None else 0)
+            recon = w_scale.unsqueeze(1) * (w_int.float() + w_zp_col)
         recon_err = (recon - W).abs().max().item()
         logging.info("  prepare_int_weights: STORED GPTQ params (w_bits=%d, maxq=%d, "
                      "scale=%s, recon_err=%.3e)", w_bits, maxq,
                      list(linear._gptq_w_scale.shape), recon_err)
+        # Verify true intN range
+        midpoint = (maxq + 1) // 2
+        w_min_val, w_max_val = w_int.min().item(), w_int.max().item()
+        assert w_min_val >= -midpoint, \
+            f"w_int below true int{w_bits} min: {w_min_val} < {-midpoint}"
+        assert w_max_val <= maxq - midpoint, \
+            f"w_int above true int{w_bits} max: {w_max_val} > {maxq - midpoint}"
         return w_int, w_scale, w_zp
 
     # --- Fallback: re-derive scale/zero from fake-quantized values ---
@@ -801,12 +858,24 @@ def prepare_int_weights(
         # Reshape back and trim padding
         w_int = q_flat.reshape(N, padded_K)[:, :K].contiguous()
         w_scale = scale_flat.squeeze(1).reshape(N, n_groups)
-        w_zp = None  # folded into w_int for asym, N/A for sym
+        if not w_sym:
+            w_zp = result[2].squeeze(1).reshape(N, n_groups)
+        else:
+            w_zp = None
     else:
         result = recover_fn(W, maxq)
         w_int = result[0]
         w_scale = result[1].squeeze(1)                # [N]
-        w_zp = None  # folded into w_int for asym, N/A for sym
+        w_zp = result[2].squeeze(1) if not w_sym else None
+
+    # Verify true intN range for asymmetric weights
+    if not w_sym:
+        midpoint = (2 ** w_bits) // 2
+        w_min_val, w_max_val = w_int.min().item(), w_int.max().item()
+        assert w_min_val >= -midpoint, \
+            f"w_int below true int{w_bits} min: {w_min_val} < {-midpoint}"
+        assert w_max_val <= maxq - midpoint, \
+            f"w_int above true int{w_bits} max: {w_max_val} > {maxq - midpoint}"
 
     return w_int, w_scale, w_zp
 

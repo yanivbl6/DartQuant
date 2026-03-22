@@ -193,6 +193,10 @@ def add_quant_args(parser):
                              'Inline params string to customise '
                              '(e.g., "lr.0.001_ep.20_optWSX_adam_cos")')
 
+    # Simulation version (for A/B comparisons, does not affect the run)
+    parser.add_argument('--sim_version', type=int, default=0,
+                        help='Simulation version tag for A/B comparisons (0=omitted from tag)')
+
 
 def resolve_v_bits(args):
     """Default v_bits to k_bits when not explicitly given."""
@@ -284,6 +288,11 @@ def build_quant_tag(args, for_gptq_cache=False):
         tag += "_adaquant"
         if _aq != 'default':
             tag += f"-{_aq}"
+    # Simulation version tag (non-gptq only, for A/B comparisons)
+    if not for_gptq_cache:
+        _sv = getattr(args, 'sim_version', 0)
+        if _sv:
+            tag += f"_v{_sv}"
     return tag
 
 
@@ -366,6 +375,8 @@ def build_quant_args(args):
     _aq = getattr(args, 'adaquant', None)
     if _aq is not None:
         cmd += ['--adaquant', _aq]
+    if getattr(args, 'sim_version', 0):
+        cmd += ['--sim_version', str(args.sim_version)]
     return cmd
 
 
