@@ -571,7 +571,10 @@ class ActQuantWrapper(torch.nn.Module):
         # kernel accumulates larger values in tier-2.  The bias is applied
         # back (as 2^-bias) after the K-loop.  Corrections above use the
         # original w_scale, so this must come last.
-        if gscaler_parsed is not None and gscaler_parsed['bias'] >= 1:
+        # Only prescale for integer tier-2 — float types handle the small
+        # scales natively, and fp16 would overflow with large prescaling.
+        if (gscaler_parsed is not None and gscaler_parsed['bias'] >= 1
+                and acc_dtype.startswith('int')):
             self.w_shift_bias = gscaler_parsed['bias']
             self.w_scale = self.w_scale * (2.0 ** self.w_shift_bias)
         else:
