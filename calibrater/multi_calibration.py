@@ -40,7 +40,7 @@ def stream_output(proc, prefix):
             print(f"[{prefix}] {line}", end='', flush=True)
 
 
-def run_job(cmd, env, label):
+def run_job(cmd, env, label, cwd=None):
     """Run a subprocess, stream its output with a label prefix, return the exit code."""
     print(f"\n{'='*60}")
     print(f"[{label}] Starting: {' '.join(cmd)}")
@@ -49,6 +49,7 @@ def run_job(cmd, env, label):
     proc = subprocess.Popen(
         cmd,
         env=env,
+        cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -164,7 +165,7 @@ def parse_gpus(gpu_str, n_needed=3):
     return [int(p) for p in parts]
 
 
-def run_batch(jobs, gpus, dry=False):
+def run_batch(jobs, gpus, dry=False, cwd=None):
     """Run a list of (label, cmd) jobs in batches of len(gpus).
 
     Each batch runs in parallel (one job per GPU), then waits for all to finish
@@ -185,7 +186,7 @@ def run_batch(jobs, gpus, dry=False):
         results = {}
 
         def worker(label, cmd, gpu_id):
-            results[label] = run_job(cmd, make_env(gpu_id), label)
+            results[label] = run_job(cmd, make_env(gpu_id), label, cwd=cwd)
 
         for i, (label, cmd) in enumerate(batch):
             gpu = gpus[i % len(gpus)]
@@ -263,7 +264,7 @@ def parse_runfile_for_calibration(path):
     return runs
 
 
-def ensure_r1r2(model_names, gpus, dry=False):
+def ensure_r1r2(model_names, gpus, dry=False, cwd=None):
     """Train R1/R2 for any model that needs it."""
     for model_name in model_names:
         if cfg.r1r2_exist(model_name):
@@ -275,7 +276,7 @@ def ensure_r1r2(model_names, gpus, dry=False):
         if dry:
             print(f"  CUDA_VISIBLE_DEVICES={gpus[0]} {' '.join(r1r2_cmd)}")
         else:
-            ret = run_job(r1r2_cmd, make_env(gpus[0]), f'R1/R2 train ({model_name})')
+            ret = run_job(r1r2_cmd, make_env(gpus[0]), f'R1/R2 train ({model_name})', cwd=cwd)
             if ret != 0:
                 print(f"R1/R2 training failed for {model_name}. Aborting.")
                 sys.exit(1)

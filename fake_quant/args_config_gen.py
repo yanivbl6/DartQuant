@@ -39,7 +39,13 @@ def parser_gen():
     parser.add_argument('--kv_ex', type=int, default=0,
                         help='When non-zero, disable R3 and quantize K-cache to N bits (no rotation).')
     parser.add_argument('--proj_ex', type=int, default=0,
-                        help='When non-zero, disable R4 and quantize down_proj input to N bits (no rotation).')
+                        help='When non-zero, disable R4 and quantize down_proj input to N bits. Shorthand for --no_r4 --down_bits X.')
+    parser.add_argument('--no_r4', action='store_true',
+                        help='Disable R4 rotation on down_proj (without changing bits)')
+    parser.add_argument('--down_bits', type=int, default=None,
+                        help='Override down_proj input activation bits (without disabling R4)')
+    parser.add_argument('--eq', action='store_true',
+                        help='Enable per-channel equalization on down_proj inputs')
     parser.add_argument('--rotate_mode', type=str, default='hadamard', choices=['hadamard', 'random'])
     # parser.add_argument('--rotation_seed', type=int, default=-1,
     #                     help='Random Seed for generating random matrix!!')
@@ -112,6 +118,14 @@ def parser_gen():
     parser.add_argument('--ig_compare', action=argparse.BooleanOptionalAction, default=False,
                         help='Compare int_gemm output vs normal fake-quant GEMM per layer. '
                              'Prints relative error and uses the float path for PPL.')
+
+    # FP32 model precision
+    parser.add_argument('--fp32', action=argparse.BooleanOptionalAction, default=False,
+                        help='Run model in float32 instead of float16 (isolate precision effects)')
+
+    # Real integer quantization (bypass the 16-bit passthrough)
+    parser.add_argument('--realint', action=argparse.BooleanOptionalAction, default=False,
+                        help='Force real integer quantize/dequantize even at 16 bits')
 
     # Static vs Dynamic comparison diagnostic
     parser.add_argument('--sd_check', type=float, default=0,
@@ -312,7 +326,7 @@ def parser_gen():
                 'to avoid straddling weight group boundaries in the kernel')
         # Validate --acc_dtype
         from int_acc_gemm import parse_acc_dtype
-        acc_kind, acc_type_bits = parse_acc_dtype(args.acc_dtype)
+        acc_kind, acc_type_bits, _acc_frac = parse_acc_dtype(args.acc_dtype)
         if not (acc_kind == 'float' and acc_type_bits == 32):
             # Non-float32 tier-2 requires per-token activation scales (not per-group)
             is_static = getattr(args, 'act_scales_path', None) is not None
@@ -325,7 +339,7 @@ def parser_gen():
 
     if hasattr(args, 'acc_dtype') and not args.int_gemm:
         from int_acc_gemm import parse_acc_dtype
-        acc_kind, acc_type_bits = parse_acc_dtype(args.acc_dtype)
+        acc_kind, acc_type_bits, _acc_frac = parse_acc_dtype(args.acc_dtype)
         if not (acc_kind == 'float' and acc_type_bits == 32):
             assert False, '--acc_dtype requires --int_gemm'
 

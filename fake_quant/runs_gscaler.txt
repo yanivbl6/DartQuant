@@ -21,10 +21,10 @@
 [DONE] gscaler_M8S0b10_t2fp16_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --sim_version 2
 [DONE] gscaler_M8S0b10_t2int24_wrap_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int24 --acc_wrap --sim_version 2
 [DONE] gscaler_M8S0b10_t2int24_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int24 --sim_version 2
-gscaler_M8S0b10_t2int22_wrap_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int22 --acc_wrap --sim_version 2
-gscaler_M8S0b10_t2int22_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int22 --sim_version 2
-gscaler_M8S0b10_t2int16_wrap_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int16 --acc_wrap --sim_version 2
-gscaler_M8S0b10_t2int16_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int16 --sim_version 2
+[DONE] gscaler_M8S0b10_t2int22_wrap_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int22 --acc_wrap --sim_version 2
+[DONE] gscaler_M8S0b10_t2int22_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int22 --sim_version 2
+[DONE] gscaler_M8S0b10_t2int16_wrap_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int16 --acc_wrap --sim_version 2
+[DONE] gscaler_M8S0b10_t2int16_v2: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int16 --sim_version 2
 
 
 

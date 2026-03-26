@@ -1,0 +1,90 @@
+# FP32 model validation: isolate tier-2 accumulator precision from float16 bottleneck
+# Format: name: MODE [args for dart_gptq_wxaykvz.sh, without -g]
+#
+# With --fp32, the model runs in float32 so .to(x_dtype) no longer truncates to
+# float16's 10-bit mantissa. The tier-2 accumulator becomes the true bottleneck.
+# With gscaler M8S0b10 (bias=10), effective_bits = tier2_bits - 10.
+# Expected: degradation visible around int26 (16 eff bits) and below,
+# unlike float16 where everything above int22 was identical.
+#
+# Usage: python run_experiments.py --runfile runs_fp32_validation.txt -g 2,3,4
+
+# --- Tier-2 sweep with --fp32 (mirrors runs_gscaler.txt lines 31-42) ---
+
+
+
+[DONE] fp32_t2int32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --fp32 --acc_wrap
+
+
+#fp32_t2int32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int32 --acc_wrap --fp32
+#fp32_t2int28: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int28 --acc_wrap --fp32
+#fp32_t2int26: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int26 --acc_wrap --fp32
+[DONE] fp32_t2int24: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int24 --acc_wrap --fp32
+[DONE] fp32_t2int22: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int22 --acc_wrap --fp32
+[DONE] fp32_t2int20: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int20 --acc_wrap --fp32
+#fp32_t2int18: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int18 --acc_wrap --fp32
+#fp32_t2int16: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int16 --acc_wrap --fp32
+#fp32_t2half: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp16 --acc_wrap --fp32
+#fp32_t2bf16: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype bfloat --acc_wrap --fp32
+
+# --- Baseline:realint, no gscaler (compare to fp32_t2int32 in runs_fp32_validation.txt) ---
+[DONE] rint_t2int32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+
+# --- Tier-2 sweep with --realint (mirrors runs_fp32_validation.txt) ---
+[DONE] rint_t2int24: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int24 --acc_wrap --realint
+[DONE] rint_t2int22: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int22 --acc_wrap --realint
+[DONE] rint_t2int20: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int20 --acc_wrap --realint
+
+# --- Baseline: fp32 + realint, no gscaler (compare to fp32_t2int32 in runs_fp32_validation.txt) ---
+[DONE] rint_t2int32_fp32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint --fp32
+
+# --- Tier-2 sweep with --fp32 --realint (mirrors runs_fp32_validation.txt) ---
+[DONE] rint_t2int24_fp32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int24 --acc_wrap --realint --fp32
+[DONE] rint_t2int22_fp32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int22 --acc_wrap --realint --fp32
+[DONE] rint_t2int20_fp32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int20 --acc_wrap --realint --fp32
+
+[DONE] rint_t2int26_fp32:  baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int26 --acc_wrap --realint --fp32
+[DONE] t2int26_fp32:  baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int26 --acc_wrap --fp32
+[DONE] rint_t2int26:  baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int26 --acc_wrap --realint
+[DONE] rint_t2int32_fp32:  baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int32 --acc_wrap --realint --fp32
+
+# --- v2: clip_ratio=1.0 for 16-bit realint (no gscaler, int24 tier-2) ---
+[DONE] v2_rint_base_fp32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint --fp32 --sim_version 2
+[DONE] v2_rint_base: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint --sim_version 2
+[DONE] v2_rint_t2int24_fp32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int24 --acc_wrap --realint --fp32 --sim_version 2
+[DONE] v2_rint_t2int24: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype int24 --acc_wrap --realint --sim_version 2
+
+# --- proj_ex bit sweep (no gscaler) — is 16-bit realint enough? ---
+# Re-run after fix: GPTQ int_gemm was overriding quantizer (bits→8, sym→True)
+# which corrupted calibration scales for proj_ex >= 16.  Now re-applied after GPTQ.
+rint_proj18_fp32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 18 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint --fp32
+rint_proj20_fp32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 20 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint --fp32
+# rint_proj23_fp32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 23 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint --fp32
+rint_proj18: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 18 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+rint_proj20: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 20 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+# rint_proj23: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 23 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+
+# --- static realint, lower bits (sanity check: should degrade monotonically) ---
+[DONE] rint_proj10: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 10 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+[DONE] rint_proj12: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 12 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+[DONE] rint_proj14: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 14 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+# KNOWN-BROKEN (PPL 690K): proj_ex=8 uses int_gemm for down_proj too — separate issue from maxq overflow
+[DONE] rint_proj8: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 8 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+
+
+#rint_proj18_fp32: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 18 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint --fp32
+
+# --- dynamic realint (no --static-act, no calibration needed) ---
+#dyn_rint_proj10: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+#dyn_rint_proj16: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 18 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+#dyn_rint_proj20: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 20 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --realint
+
+[DONE] rint_proj12: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 14 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --static-act
+[DONE] rint_proj14: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 12 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --static-act
+[DONE] rint_proj12_fp32: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 14 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --fp32 --static-act
+[DONE] rint_proj14_fp32: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 12 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --fp32 --static-act
+
+[DONE] rint_proj10: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 10 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --static-act
+[DONE] rint_proj8: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 8 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --static-act
+[DONE] rint_proj10_fp32: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 10 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --fp32 --static-act
+[DONE] rint_proj8_fp32: baseline -m 1b -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --proj_ex 8 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_wrap --fp32 --static-act

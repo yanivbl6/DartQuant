@@ -24,22 +24,30 @@ import torch.nn.functional as F
 def parse_acc_dtype(s):
     """Parse tier-2 accumulator dtype string.
 
-    Returns (kind, bits) where kind is 'int', 'float', or 'bfloat'.
-    Accepts: int<N> (any N, e.g. int25), float/fp32, half/fp16, bfloat/bf16.
+    Returns (kind, bits, frac_bits) where:
+      kind      : 'int', 'float', or 'bfloat'
+      bits      : total bit-width
+      frac_bits : number of fractional bits (0 for float types)
+
+    Format: int<N>[p<M>] — e.g. int32, int32p4, int26p8.
+    Also:   float/fp32, half/fp16, bfloat/bf16.
     """
     s = s.lower().strip()
     aliases = {
-        'float': ('float', 32), 'fp32': ('float', 32),
-        'half': ('float', 16), 'fp16': ('float', 16),
-        'bfloat': ('bfloat', 16), 'bf16': ('bfloat', 16),
+        'float': ('float', 32, 0), 'fp32': ('float', 32, 0),
+        'half': ('float', 16, 0), 'fp16': ('float', 16, 0),
+        'bfloat': ('bfloat', 16, 0), 'bf16': ('bfloat', 16, 0),
     }
     if s in aliases:
         return aliases[s]
-    m = re.match(r'^int(\d+)$', s)
+    m = re.match(r'^int(\d+)(?:p(\d+))?$', s)
     if m:
-        return ('int', int(m.group(1)))
+        bits = int(m.group(1))
+        frac = int(m.group(2)) if m.group(2) else 0
+        return ('int', bits, frac)
     raise ValueError(
-        f"Unknown acc_dtype: '{s}'. Must be int<N> (e.g. int25), "
+        f"Unknown acc_dtype: '{s}'. Must be int<N>[p<M>] "
+        "(e.g. int25, int32p4, int26p8), "
         "or float/fp32, half/fp16, bfloat/bf16"
     )
 
@@ -90,6 +98,9 @@ if _HAS_TRITON:
         T2_MIN: tl.constexpr,       # tier-2 int clamp min (ignored if T2_IS_INT=False)
         T2_IS_FP16: tl.constexpr,   # True = fp16 tier-2
         T2_IS_BF16: tl.constexpr,   # True = bfloat16 tier-2
+        # Fixed-point fractional bits for integer tier-2 (int32p4 → 4)
+        T2_FRAC_BITS: tl.constexpr,
+        T2_FRAC_SCALE: tl.constexpr,  # = 2^T2_FRAC_BITS as float (precomputed)
         # Gscaler shift bias — w_scale was prescaled by 2^bias; undo after K-loop
         W_SHIFT_BIAS: tl.constexpr,
         # Weight zero-point correction (asymmetric weights)
@@ -132,7 +143,7 @@ if _HAS_TRITON:
             a_tile = tl.load(a_ptrs, mask=a_mask, other=0)
             b_tile = tl.load(b_ptrs, mask=b_mask, other=0)
 
-            # int8 x int8 → int32 dot product (uses tensor cores on Ampere+)
+            # int8 × int8 → int32 dot product
             # tl.dot expects [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N]
             # b_tile is [BLOCK_N, BLOCK_K] so we transpose it
             partial = tl.dot(a_tile, tl.trans(b_tile))  # [BLOCK_M, BLOCK_N] int32
@@ -182,7 +193,10 @@ if _HAS_TRITON:
 
             # Accumulate in tier-2 dtype
             if T2_IS_INT:
-                acc += contrib.to(tl.int32)
+                if T2_FRAC_BITS > 0:
+                    acc += (contrib * T2_FRAC_SCALE).to(tl.int32)
+                else:
+                    acc += contrib.to(tl.int32)
                 # Clamp to tier-2 accumulator range
                 acc = tl.minimum(tl.maximum(acc, T2_MIN), T2_MAX)
             elif T2_IS_FP16:
@@ -196,12 +210,14 @@ if _HAS_TRITON:
             a_ptrs += BLOCK_K * stride_ak
             b_ptrs += BLOCK_K * stride_bk
 
-        # Convert tier-2 accumulator to float32 for final scale application
+        # Convert to float, then undo frac bits and gscaler prescaling together
         acc = acc.to(tl.float32)
-
-        # Undo gscaler prescaling: w_scale was multiplied by 2^bias during
-        # setup so tier-2 accumulated larger values.  Apply 2^(-bias) now.
-        if W_SHIFT_BIAS > 0:
+        if T2_FRAC_BITS > 0:
+            if W_SHIFT_BIAS > 0:
+                acc = acc * (2.0 ** (-(T2_FRAC_BITS + W_SHIFT_BIAS)))
+            else:
+                acc = acc * (2.0 ** (-T2_FRAC_BITS))
+        elif W_SHIFT_BIAS > 0:
             acc = acc * (2.0 ** (-W_SHIFT_BIAS))
 
         # Apply scales that weren't folded in during the K-block loop
@@ -235,7 +251,7 @@ def _t2_acc_dtype_info(acc_dtype_str):
     For float types: returns (torch_dtype, None, None).
     For int types: returns (torch.int64, max_val, min_val) — int64 storage with clamping.
     """
-    kind, bits = parse_acc_dtype(acc_dtype_str)
+    kind, bits, _frac, _mode = parse_acc_dtype(acc_dtype_str)
     if kind == 'int':
         max_val = 2 ** (bits - 1) - 1
         min_val = -max_val - 1
@@ -248,8 +264,47 @@ def _t2_acc_dtype_info(acc_dtype_str):
         return torch.float32, None, None
 
 
+def _int16_gemm_reference(
+    a_int16: torch.Tensor,      # [M, K] int16
+    a_scale: torch.Tensor,
+    w_int: torch.Tensor,
+    w_scale: torch.Tensor,
+    acc_bits: int,
+    block_k: int,
+    w_group_size: int = -1,
+    bias: Optional[torch.Tensor] = None,
+    acc_wrap: bool = False,
+    a_group_scale: Optional[torch.Tensor] = None,
+    a_group_size: int = -1,
+    acc_dtype: str = 'float',
+    w_shift_bias: int = 0,
+    w_zp: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Int16 reference GEMM via two int8 reference calls with carry decomposition."""
+    M, K = a_int16.shape
+    N = w_int.shape[0]
+    a_hi, a_lo = _decompose_int16_to_int8(a_int16)
+
+    # Both halves are int8 — use the original acc_bits (no doubling needed)
+    out_hi = int_gemm_capped_reference(
+        a_hi, a_scale, w_int, w_scale, acc_bits, block_k,
+        w_group_size, None, acc_wrap,
+        a_group_scale=a_group_scale, a_group_size=a_group_size,
+        acc_dtype=acc_dtype, w_shift_bias=w_shift_bias, w_zp=w_zp)
+    out_lo = int_gemm_capped_reference(
+        a_lo, a_scale, w_int, w_scale, acc_bits, block_k,
+        w_group_size, None, acc_wrap,
+        a_group_scale=a_group_scale, a_group_size=a_group_size,
+        acc_dtype=acc_dtype, w_shift_bias=w_shift_bias, w_zp=w_zp)
+
+    output = out_hi * 256.0 + out_lo
+    if bias is not None:
+        output += bias.unsqueeze(0)
+    return output
+
+
 def int_gemm_capped_reference(
-    a_int: torch.Tensor,        # [M, K] int8
+    a_int: torch.Tensor,        # [M, K] int8 or int16
     a_scale: torch.Tensor,      # [M] float  (used when a_group_size <= 0)
     w_int: torch.Tensor,        # [N, K] int8
     w_scale: torch.Tensor,      # [N] or [N, n_groups] float
@@ -268,13 +323,23 @@ def int_gemm_capped_reference(
     M, K = a_int.shape
     N = w_int.shape[0]
 
+    # --- int16: delegate to decomposition wrapper ---
+    if a_int.dtype == torch.int16:
+        return _int16_gemm_reference(
+            a_int, a_scale, w_int, w_scale, acc_bits, block_k,
+            w_group_size, bias, acc_wrap,
+            a_group_scale=a_group_scale, a_group_size=a_group_size,
+            acc_dtype=acc_dtype, w_shift_bias=w_shift_bias, w_zp=w_zp)
+
     acc_max = 2 ** (acc_bits - 1) - 1
     acc_min = -acc_max - 1
-    acc_range = acc_max - acc_min + 1  # = 2^acc_bits
+    acc_range = acc_max - acc_min + 1  # = 2^effective_acc_bits
 
     # Tier-2 accumulator setup
     t2_dtype, t2_clamp_max, t2_clamp_min = _t2_acc_dtype_info(acc_dtype)
     t2_is_int = t2_clamp_max is not None
+    _, _, t2_frac_bits = parse_acc_dtype(acc_dtype)
+    t2_frac_scale = float(1 << t2_frac_bits) if t2_frac_bits > 0 else 1.0
     output = torch.zeros(M, N, dtype=t2_dtype, device=a_int.device)
 
     for k_start in range(0, K, block_k):
@@ -316,17 +381,19 @@ def int_gemm_capped_reference(
             contrib = partial.float()
 
         if t2_is_int:
-            output += contrib.round().long()
+            if t2_frac_bits > 0:
+                output += (contrib * t2_frac_scale).round().long()
+            else:
+                output += contrib.round().long()
             output = output.clamp(t2_clamp_min, t2_clamp_max)
         else:
             output += contrib.to(t2_dtype)
 
-    # Convert tier-2 accumulator to float32 for final scale application
+    # Convert to float, then undo frac bits and gscaler prescaling together
+    total_shift = t2_frac_bits + w_shift_bias
     output = output.float()
-
-    # Undo gscaler prescaling
-    if w_shift_bias > 0:
-        output *= 2.0 ** (-w_shift_bias)
+    if total_shift > 0:
+        output *= 2.0 ** (-total_shift)
 
     # Apply scales that weren't folded in during the K-block loop
     if a_group_size <= 0:
@@ -415,16 +482,20 @@ def int_gemm_capped(
         a_token_scale = a_scale      # [M]
 
     # Dispatch — w_zp correction is now inside the kernel (before accumulator cap)
+    is_int16 = (a_int.dtype == torch.int16)
+
     if use_triton and _HAS_TRITON and x_float.is_cuda:
-        output = _triton_int_gemm(a_int, a_token_scale, w_int, w_scale,
-                                  acc_bits, block_k, w_group_size, bias,
-                                  M, N, K, acc_wrap,
-                                  a_gscale=a_group_scale,
-                                  a_group_size=a_group_size,
-                                  acc_dtype=acc_dtype,
-                                  w_shift_bias=w_shift_bias,
-                                  w_zp=w_zp)
+        _launcher = _triton_int16_gemm if is_int16 else _triton_int_gemm
+        output = _launcher(a_int, a_token_scale, w_int, w_scale,
+                           acc_bits, block_k, w_group_size, bias,
+                           M, N, K, acc_wrap,
+                           a_gscale=a_group_scale,
+                           a_group_size=a_group_size,
+                           acc_dtype=acc_dtype,
+                           w_shift_bias=w_shift_bias,
+                           w_zp=w_zp)
     else:
+        # Reference impl handles int16 internally via _int16_gemm_reference
         output = int_gemm_capped_reference(a_int, a_token_scale, w_int, w_scale,
                                            acc_bits, block_k, w_group_size,
                                            bias, acc_wrap,
@@ -520,6 +591,75 @@ def _apply_weight_zp_correction(
     output += correction
 
 
+def _decompose_int16_to_int8(a_int16):
+    """Decompose int16 activations into (a_hi, a_lo) both signed int8.
+
+    Identity (with signed reinterpretation of the low byte):
+        a_int16 = a_hi_adj * 256 + a_lo_signed
+    where a_lo_signed = int8 reinterpret of (a_int16 & 0xFF), and
+    a_hi_adj = (a_int16 >> 8) + carry, carry = 1 if unsigned_lo >= 128.
+
+    Overflow note: a_hi_adj can reach 128 when a_int16 is in [32640, 32767],
+    which overflows int8.  We pre-clamp a_int16 to [-32768, 32639] so the
+    decomposition is exact.  For bits <= 15 (maxq <= 16383) this never
+    triggers.  For bits=16 it clips 128 out of 65536 values (0.2%).
+
+    Returns (a_hi, a_lo) both int8.
+    """
+    a32 = a_int16.to(torch.int32).clamp(-32768, 32639)
+    a_lo = (a32 & 0xFF).to(torch.int8)             # reinterpret as signed
+    carry = (a32 & 0x80) >> 7                       # 1 if unsigned lo >= 128 (int32)
+    a_hi = ((a32 >> 8) + carry).to(torch.int8)     # safe: max is 127 after clamp
+    return a_hi, a_lo
+
+
+def _triton_int16_gemm(
+    a_int16, a_scale, w_int, w_scale,
+    acc_bits, block_k, w_group_size, bias,
+    M, N, K, acc_wrap=False,
+    a_gscale=None, a_group_size=-1,
+    acc_dtype='float',
+    w_shift_bias=0,
+    w_zp=None,
+):
+    """Int16 GEMM via two int8 kernel calls.
+
+    Decomposes int16 activations into signed (a_hi, a_lo) int8 bytes
+    using carry absorption so that:  a_int16 = a_hi * 256 + a_lo  (exact).
+
+    Result = kernel(a_hi, w) * 256 + kernel(a_lo, w).
+
+    Both calls use the unmodified int8 Triton kernel with the same acc_bits.
+    """
+    a_hi, a_lo = _decompose_int16_to_int8(a_int16)
+
+    # Both halves are int8 — use the original acc_bits (no doubling needed)
+    # Two int8 kernel calls — no bias (added after combining)
+    out_hi = _triton_int_gemm(
+        a_hi, a_scale, w_int, w_scale,
+        acc_bits, block_k, w_group_size, None,
+        M, N, K, acc_wrap,
+        a_gscale=a_gscale, a_group_size=a_group_size,
+        acc_dtype=acc_dtype,
+        w_shift_bias=w_shift_bias,
+        w_zp=w_zp,
+    )
+    out_lo = _triton_int_gemm(
+        a_lo, a_scale, w_int, w_scale,
+        acc_bits, block_k, w_group_size, None,
+        M, N, K, acc_wrap,
+        a_gscale=a_gscale, a_group_size=a_group_size,
+        acc_dtype=acc_dtype,
+        w_shift_bias=w_shift_bias,
+        w_zp=w_zp,
+    )
+
+    output = out_hi * 256.0 + out_lo
+    if bias is not None:
+        output += bias.unsqueeze(0)
+    return output
+
+
 def _triton_int_gemm(
     a_int, a_scale, w_int, w_scale,
     acc_bits, block_k, w_group_size, bias,
@@ -529,23 +669,30 @@ def _triton_int_gemm(
     w_shift_bias=0,
     w_zp=None,
 ):
-    """Launch the Triton kernel."""
+    """Launch the Triton int8 kernel.  a_int must be int8."""
+    assert a_int.dtype == torch.int8, \
+        f"_triton_int_gemm requires int8 activations (got {a_int.dtype})"
+
     BLOCK_M = 32
     BLOCK_N = 64
     BLOCK_K = block_k
 
-    acc_max = 2 ** (acc_bits - 1) - 1
-    acc_min = -acc_max - 1
-    acc_range = acc_max - acc_min + 1  # = 2^acc_bits
+    # float32 can't represent INT32_MAX (2^31-1) exactly — it rounds up to
+    # 2^31 which overflows int32.  Cap clamp boundaries at 2^30 so
+    # tl.minimum/tl.maximum constexprs survive float32 promotion in Triton.
+    _F32_SAFE = 2 ** 30
+
+    acc_max = min(2 ** (acc_bits - 1) - 1, _F32_SAFE)
+    acc_min = -acc_max
+    acc_range = acc_max - acc_min + 1
 
     # Tier-2 accumulator constexprs
-    t2_kind, t2_bits = parse_acc_dtype(acc_dtype)
+    t2_kind, t2_bits, t2_frac_bits = parse_acc_dtype(acc_dtype)
     t2_is_int = (t2_kind == 'int')
-    t2_max = 2 ** (t2_bits - 1) - 1 if t2_is_int else 0
-    t2_min = -t2_max - 1 if t2_is_int else 0
+    t2_max = min(2 ** (t2_bits - 1) - 1, _F32_SAFE) if t2_is_int else 0
+    t2_min = -t2_max if t2_is_int else 0
     t2_is_fp16 = (t2_kind == 'float' and t2_bits == 16)
     t2_is_bf16 = (t2_kind == 'bfloat')
-
     output = torch.empty(M, N, dtype=torch.float32, device=a_int.device)
 
     has_bias = bias is not None
@@ -612,6 +759,8 @@ def _triton_int_gemm(
         T2_MIN=t2_min,
         T2_IS_FP16=t2_is_fp16,
         T2_IS_BF16=t2_is_bf16,
+        T2_FRAC_BITS=t2_frac_bits,
+        T2_FRAC_SCALE=float(1 << t2_frac_bits) if t2_frac_bits > 0 else 1.0,
         W_SHIFT_BIAS=w_shift_bias,
         HAS_W_ZP=has_w_zp,
         W_zp_ptr=w_zp_int,

@@ -40,6 +40,9 @@ Options:
   --gptq           Delete cached GPTQ checkpoint and re-quantize
   --kv_ex N        K-cache quant without R3 rotation            (default: 0=off)
   --proj_ex N      Down-proj input quant without R4 rotation   (default: 0=off)
+  --no_r4          Disable R4 rotation on down_proj            (default: off)
+  --down_bits N    Override down_proj input activation bits     (default: a_bits)
+  --eq             Enable per-channel equalization on down_proj (default: off)
   --static-act     Use pre-calibrated static activation scales
   --pwl_act            Replace activations with PWL approximation
   --pwl_n_segments N   Number of PWL segments                     (default: 9)
@@ -62,6 +65,8 @@ Options:
   --wait           Wait for a clear GPU (polls every 20s, overrides -g)
   --max_used_mb N  Max used memory (MiB) for a GPU to be "clear"   (default: 200)
   --sim_version N  Simulation version tag for A/B comparisons       (default: 0=omitted)
+  --fp32           Run model in float32 instead of float16 (isolate precision effects)
+  --realint        Force real integer quantize/dequantize even at 16 bits
   -F               Fast mode (skip lm_eval tasks)
   --very-fast      Very fast mode (skip lm_eval, PPL on wikitext2 only)
   -h               Show this help message
@@ -112,6 +117,9 @@ STATIC_ACT=0
 REDO_GPTQ=0
 KV_EX=0
 PROJ_EX=0
+NO_R4=0
+DOWN_BITS=""
+EQ=0
 PWL_ACT=0
 PWL_N_SEGMENTS=9
 PWL_INPUT_BITS=16
@@ -136,6 +144,8 @@ QUANT_WARNINGS=0
 WAIT_GPU=0
 MAX_USED_MB=200
 SIM_VERSION=0
+FP32=0
+REALINT=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -154,6 +164,9 @@ while [[ $# -gt 0 ]]; do
         --gptq)   REDO_GPTQ=1;   shift   ;;
         --kv_ex)  KV_EX="$2";   shift 2 ;;
         --proj_ex) PROJ_EX="$2"; shift 2 ;;
+        --no_r4)  NO_R4=1;     shift   ;;
+        --down_bits) DOWN_BITS="$2"; shift 2 ;;
+        --eq)     EQ=1;        shift   ;;
         --pwl_act) PWL_ACT=1;    shift   ;;
         --pwl_n_segments) PWL_N_SEGMENTS="$2"; shift 2 ;;
         --pwl_input_bits) PWL_INPUT_BITS="$2"; shift 2 ;;
@@ -176,6 +189,8 @@ while [[ $# -gt 0 ]]; do
         --gptq_strength) GPTQ_STRENGTH="$2"; shift 2 ;;
         --quant_warnings) QUANT_WARNINGS=1; shift   ;;
         --sim_version) SIM_VERSION="$2";   shift 2 ;;
+        --fp32)        FP32=1;             shift   ;;
+        --realint)     REALINT=1;          shift   ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
@@ -339,6 +354,16 @@ if [ -n "$GPTQ_STRENGTH" ]; then
     GPTQ_STRENGTH_FLAG="--gptq_strength ${GPTQ_STRENGTH}"
 fi
 
+FP32_FLAG=""
+if [ "$FP32" == "1" ]; then
+    FP32_FLAG="--fp32"
+fi
+
+REALINT_FLAG=""
+if [ "$REALINT" == "1" ]; then
+    REALINT_FLAG="--realint"
+fi
+
 GGUF_FLAG=""
 GGUF_TAG_FLAG=""
 QUANT_WARN_FLAG=""
@@ -373,6 +398,9 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ "$W_ASYM" == "1" ] && TAG_ARGS="${TAG_ARGS} --w_asym"
 [ "$KV_EX" != "0" ] && TAG_ARGS="${TAG_ARGS} --kv_ex ${KV_EX}"
 [ "$PROJ_EX" != "0" ] && TAG_ARGS="${TAG_ARGS} --proj_ex ${PROJ_EX}"
+[ "$PROJ_EX" == "0" ] && [ "$NO_R4" == "1" ] && TAG_ARGS="${TAG_ARGS} --no_r4"
+[ "$PROJ_EX" == "0" ] && [ -n "$DOWN_BITS" ] && TAG_ARGS="${TAG_ARGS} --down_bits ${DOWN_BITS}"
+[ "$EQ" == "1" ] && TAG_ARGS="${TAG_ARGS} --eq"
 [ -n "$PWL_ACT_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${PWL_ACT_FLAG}"
 [ -n "$INT_GEMM_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${INT_GEMM_FLAG}"
 [ -n "$SMQ_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${SMQ_FLAG}"
@@ -381,6 +409,8 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ -n "$GPTQ_STRENGTH_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GPTQ_STRENGTH_FLAG}"
 [ -n "$GSCALER_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GSCALER_FLAG}"
 [ "$SIM_VERSION" != "0" ] && TAG_ARGS="${TAG_ARGS} --sim_version ${SIM_VERSION}"
+[ "$FP32" == "1" ] && TAG_ARGS="${TAG_ARGS} --fp32"
+[ "$REALINT" == "1" ] && TAG_ARGS="${TAG_ARGS} --realint"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
 QUANT_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS})
@@ -512,8 +542,13 @@ python main_for_test.py \
     ${QUANT_WARN_FLAG} \
     ${GSCALER_FLAG} \
     ${GPTQ_STRENGTH_FLAG} \
+    ${FP32_FLAG} \
+    ${REALINT_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
+    $([ "$NO_R4" == "1" ] && echo "--no_r4") \
+    $([ -n "$DOWN_BITS" ] && echo "--down_bits ${DOWN_BITS}") \
+    $([ "$EQ" == "1" ] && echo "--eq") \
     --percdamp 0.1 \
     --no-w_ft \
     --ft_percdamp 0.0 \

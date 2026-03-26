@@ -132,7 +132,13 @@ def add_quant_args(parser):
     parser.add_argument('--kv_ex', type=int, default=0,
                         help='K-cache quant without R3 rotation (0=off)')
     parser.add_argument('--proj_ex', type=int, default=0,
-                        help='Down-proj input quant without R4 rotation (0=off)')
+                        help='Down-proj input quant without R4 rotation (0=off). Shorthand for --no_r4 --down_bits X')
+    parser.add_argument('--no_r4', action='store_true',
+                        help='Disable R4 rotation on down_proj (without changing bits)')
+    parser.add_argument('--down_bits', type=int, default=None,
+                        help='Override down_proj input activation bits (without disabling R4)')
+    parser.add_argument('--eq', action='store_true',
+                        help='Enable per-channel equalization on down_proj inputs')
 
     # PWL activation
     parser.add_argument('--pwl_act', action='store_true',
@@ -197,6 +203,14 @@ def add_quant_args(parser):
     parser.add_argument('--sim_version', type=int, default=0,
                         help='Simulation version tag for A/B comparisons (0=omitted from tag)')
 
+    # FP32 model precision (isolate float16 bottleneck)
+    parser.add_argument('--fp32', action='store_true',
+                        help='Run model in float32 instead of float16 (isolate precision effects)')
+
+    # Real integer quantization (bypass the 16-bit passthrough)
+    parser.add_argument('--realint', action='store_true',
+                        help='Force real integer quantize/dequantize even at 16 bits')
+
 
 def resolve_v_bits(args):
     """Default v_bits to k_bits when not explicitly given."""
@@ -229,6 +243,13 @@ def build_quant_tag(args, for_gptq_cache=False):
         tag += f"_kvex{args.kv_ex}"
     if args.proj_ex != 0:
         tag += f"_projex{args.proj_ex}"
+    else:
+        if getattr(args, 'no_r4', False):
+            tag += "_noR4"
+        if getattr(args, 'down_bits', None) is not None:
+            tag += f"_down{args.down_bits}"
+    if getattr(args, 'eq', False):
+        tag += "_eq"
     # PWL activation tag
     if getattr(args, 'pwl_act', False):
         parts = ["_pwl"]
@@ -293,6 +314,12 @@ def build_quant_tag(args, for_gptq_cache=False):
         _sv = getattr(args, 'sim_version', 0)
         if _sv:
             tag += f"_v{_sv}"
+    # FP32 model tag
+    if getattr(args, 'fp32', False):
+        tag += "_FP32"
+    # Real integer quantization tag
+    if getattr(args, 'realint', False):
+        tag += "_RINT"
     return tag
 
 
@@ -342,6 +369,13 @@ def build_quant_args(args):
         cmd += ['--kv_ex', str(args.kv_ex)]
     if args.proj_ex:
         cmd += ['--proj_ex', str(args.proj_ex)]
+    else:
+        if getattr(args, 'no_r4', False):
+            cmd.append('--no_r4')
+        if getattr(args, 'down_bits', None) is not None:
+            cmd += ['--down_bits', str(args.down_bits)]
+    if getattr(args, 'eq', False):
+        cmd.append('--eq')
     if args.pwl_act:
         cmd += ['--pwl_act',
                 '--pwl_n_segments', str(args.pwl_n_segments),
@@ -377,6 +411,10 @@ def build_quant_args(args):
         cmd += ['--adaquant', _aq]
     if getattr(args, 'sim_version', 0):
         cmd += ['--sim_version', str(args.sim_version)]
+    if getattr(args, 'fp32', False):
+        cmd.append('--fp32')
+    if getattr(args, 'realint', False):
+        cmd.append('--realint')
     return cmd
 
 

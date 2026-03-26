@@ -80,12 +80,15 @@ def snap_scale_to_gscaler(scale, gscaler):
 
 
 def get_minq_maxq(bits, sym):
+    # Return float32 tensors to prevent fp16 promotion overflow.
+    # int64 maxq (e.g. 262143 for 18-bit) would silently become inf
+    # when PyTorch promotes it to fp16 during mixed-type arithmetic.
     if sym:
-        maxq = torch.tensor(2**(bits - 1) - 1)
+        maxq = torch.tensor(2**(bits - 1) - 1, dtype=torch.float32)
         minq = -maxq - 1
     else:
-        maxq = torch.tensor(2**bits - 1)
-        minq = 0
+        maxq = torch.tensor(2**bits - 1, dtype=torch.float32)
+        minq = torch.tensor(0, dtype=torch.float32)
 
     return minq, maxq
 
@@ -97,6 +100,7 @@ def _stochastic_round(x):
 
 
 def asym_quant(x, scale, zero, maxq, stochastic=False):
+    assert maxq != float('inf'), "maxq is inf — likely fp16 overflow"
     scale = scale.to(x.device)
     zero = zero.to(x.device)
     _round = _stochastic_round if stochastic else torch.round
@@ -182,6 +186,11 @@ class ActQuantizer(torch.nn.Module):
         self.register_buffer('scale', torch.zeros(1))
         self.register_buffer('zero', torch.zeros(1))
         self.bits = 16
+        self.realint = False
+        self.groupsize = -1
+        self.sym = False
+        self.clip_ratio = 1.0
+        self.residual = False
         self.static = False
         # sd_check: compare static vs dynamic quantization
         self._sd_check = 0        # threshold (0 = disabled)
@@ -209,6 +218,19 @@ class ActQuantizer(torch.nn.Module):
         if rel_err > self._sd_check:
             print(f"[sd_check] {self._sd_name}: {norm_str}_rel_err={rel_err:.4e} "
                   f"EXCEEDS threshold {self._sd_check:.4e}", flush=True)
+            # Diagnostic: show scale/zero/input stats
+            rs = result_static.float()
+            rd = result_dynamic.float()
+            print(f"  static  out: min={rs.min().item():.4e} max={rs.max().item():.4e} mean={rs.mean().item():.4e}", flush=True)
+            print(f"  dynamic out: min={rd.min().item():.4e} max={rd.max().item():.4e} mean={rd.mean().item():.4e}", flush=True)
+            print(f"  diff:        min={diff.min().item():.4e} max={diff.max().item():.4e} abs_max={diff.abs().max().item():.4e}", flush=True)
+            if self.scale is not None:
+                s = self.scale.float()
+                print(f"  static scale: shape={list(s.shape)} min={s.min().item():.4e} max={s.max().item():.4e} mean={s.mean().item():.4e}", flush=True)
+            if self.zero is not None:
+                z = self.zero.float()
+                print(f"  static zero:  shape={list(z.shape)} min={z.min().item():.4e} max={z.max().item():.4e} mean={z.mean().item():.4e}", flush=True)
+            print(f"  bits={self.bits} maxq={self.maxq}", flush=True)
 
     def _compare_sd(self, x, q_static):
         """Compare static fake-quant result with what dynamic would produce."""
@@ -228,8 +250,12 @@ class ActQuantizer(torch.nn.Module):
     def forward(self, x):
         x_dtype = x.dtype
 
-        if self.bits == 16:
+        if self.bits == 16 and not self.realint:
             return x
+
+        if self.realint:
+            assert self.maxq != float('inf'), \
+                f"maxq overflowed (bits={self.bits}); likely fp16 promotion bug"
 
         if not self.static:
             self.find_params(x)  # dynamic: recompute every forward
@@ -266,32 +292,35 @@ class ActQuantizer(torch.nn.Module):
             return asym_quant(x, self.scale, self.zero, self.maxq)
 
     def quantize_to_int(self, x):
-        """Quantize activations to int8 and return (q_int8, scale_vec, zp_correction).
+        """Quantize activations to integer and return (q_int, scale_vec, zp_correction).
 
         Unlike ``forward`` (fake-quant) or ``quantize`` (returns float integers),
-        this method returns *actual* int8 values and a 1-D scale vector,
+        this method returns *actual* int8/int16 values and a 1-D scale vector,
         suitable for feeding into the integer GEMM kernel.
+
+        For bits <= 8, returns int8.  For 9 <= bits <= 16, returns int16.
 
         Static mode with groupsize > 0: per-group scales along K, aligned with
         acc_block_k.  Each group of G columns shares one scale.  Returns
-        ``(q_int8[M,K], group_scales[n_groups], None)``.
+        ``(q_int[M,K], group_scales[n_groups], None)``.
 
         Static mode with groupsize <= 0: per-tensor scale (max of all column
-        scales).  Returns ``(q_int8[M,K], per_token_scale[M], zp_correction)``.
+        scales).  Returns ``(q_int[M,K], per_token_scale[M], zp_correction)``.
 
         Dynamic mode: computes per-token scales from x at runtime.
-        Returns ``(q_int8[M,K], per_token_scale[M], zp_correction)``.
+        Returns ``(q_int[M,K], per_token_scale[M], zp_correction)``.
 
-        For asymmetric quantization, q is shifted into signed int8 range and a
+        For asymmetric quantization, q is shifted into signed range and a
         zero-point correction factor is returned.  The caller must combine it
         with the precomputed ``w_zp_correction`` vector:
 
             output += zp_correction[:, None] * w_zp_correction[None, :]
 
-        Requires bits <= 8.
+        Requires bits <= 16.
         """
-        assert self.bits <= 8, \
-            f"quantize_to_int requires bits <= 8 (got {self.bits}); values would overflow int8"
+        assert self.bits <= 16, \
+            f"quantize_to_int requires bits <= 16 (got {self.bits}); values would overflow int16"
+        _int_dtype = torch.int16 if self.bits > 8 else torch.int8
 
         dev = x.device
         self.maxq = self.maxq.to(dev)
@@ -313,19 +342,19 @@ class ActQuantizer(torch.nn.Module):
                 q_grouped = torch.clamp(
                     torch.round(x_grouped / group_scale[None, :, None]),
                     -(self.maxq + 1), self.maxq)
-                q_int8 = q_grouped.reshape(M, K).to(torch.int8)
+                q_int = q_grouped.reshape(M, K).to(_int_dtype)
             else:
-                # Asymmetric: quantize to [0, maxq], shift to signed int8
+                # Asymmetric: quantize to [0, maxq], shift to signed range
                 q_grouped = torch.clamp(
                     torch.round(x_grouped / group_scale[None, :, None])
                     + group_zero[None, :, None],
                     0, self.maxq)
-                shift = (int(self.maxq.item()) + 1) // 2  # 128 for 8-bit
-                q_int8 = (q_grouped - shift).reshape(M, K).to(torch.int8)
+                shift = (int(self.maxq.item()) + 1) // 2
+                q_int = (q_grouped - shift).reshape(M, K).to(_int_dtype)
 
             # zp_correction is None: for per-group static asymmetric, the
             # correction is precomputed as static_zp_bias in ActQuantWrapper.
-            return q_int8, group_scale, None
+            return q_int, group_scale, None
 
         if self.static:
             # Per-tensor static scale (groupsize <= 0 fallback).
@@ -336,7 +365,7 @@ class ActQuantizer(torch.nn.Module):
                 per_tensor_scale = col_scale.max()
                 q = torch.clamp(torch.round(x / per_tensor_scale),
                                 -(self.maxq + 1), self.maxq)
-                q_int8 = q.reshape(-1, q.shape[-1]).to(torch.int8)
+                q_int = q.reshape(-1, q.shape[-1]).to(_int_dtype)
                 per_token_scale = torch.full((M,), per_tensor_scale.item(),
                                              device=dev, dtype=col_scale.dtype)
                 zp_correction = None
@@ -355,19 +384,24 @@ class ActQuantizer(torch.nn.Module):
                 q = torch.clamp(torch.round(x / per_tensor_scale) + global_zero,
                                 0, self.maxq)
                 shift = (int(self.maxq.item()) + 1) // 2
-                q_int8 = (q - shift).reshape(-1, q.shape[-1]).to(torch.int8)
+                q_int = (q - shift).reshape(-1, q.shape[-1]).to(_int_dtype)
                 per_token_scale = torch.full((M,), per_tensor_scale.item(),
                                              device=dev, dtype=col_scale.dtype)
                 zp_corr_scalar = per_tensor_scale * (shift - global_zero)
                 zp_correction = torch.full((M,), zp_corr_scalar.item(),
                                            device=dev, dtype=col_scale.dtype)
 
-            return q_int8, per_token_scale, zp_correction
+            return q_int, per_token_scale, zp_correction
 
         # Dynamic: compute per-token scales from x at runtime.
         assert self.groupsize <= 0, \
             "quantize_to_int with groupsize > 0 requires static mode"
+        # find_params skips bits=16 without realint (fake-quant no-op), but
+        # quantize_to_int always needs actual scales.  Force realint temporarily.
+        _saved_realint = self.realint
+        self.realint = True
         self.find_params(x)
+        self.realint = _saved_realint
 
         # Extract per-token scalar scale (works for both sym and asym).
         # self.scale has shape [..., K] with repeated values along K.
@@ -379,13 +413,13 @@ class ActQuantizer(torch.nn.Module):
 
         if self.sym:
             q, _scale = sym_quant(x, self.scale, self.maxq)
-            q_int8 = q.reshape(-1, q.shape[-1]).to(torch.int8)
+            q_int = q.reshape(-1, q.shape[-1]).to(_int_dtype)
             zp_correction = None
         else:
             q, _scale, zero = asym_quant(x, self.scale, self.zero, self.maxq)
-            # q is in [0, maxq]. Shift into signed int8 range.
-            shift = (int(self.maxq.item()) + 1) // 2   # 128 for 8-bit
-            q_int8 = (q - shift).reshape(-1, q.shape[-1]).to(torch.int8)
+            # q is in [0, maxq]. Shift into signed range.
+            shift = (int(self.maxq.item()) + 1) // 2
+            q_int = (q - shift).reshape(-1, q.shape[-1]).to(_int_dtype)
 
             flat_zero = zero.reshape(-1, zero.shape[-1])
             per_token_zero = flat_zero[:, 0].contiguous()  # [M]
@@ -394,7 +428,7 @@ class ActQuantizer(torch.nn.Module):
 
         self.free()
 
-        return q_int8, per_token_scale, zp_correction
+        return q_int, per_token_scale, zp_correction
 
     def configure(self, bits,
                   groupsize=-1,
@@ -414,7 +448,6 @@ class ActQuantizer(torch.nn.Module):
     def find_params_per_token_groupwise(self, x):
         init_shape = x.shape
         reshaped_x = x.reshape(-1, x.shape[-2], x.shape[-1] // self.groupsize, self.groupsize)
-
         xmax = torch.amax(reshaped_x, dim=3, keepdim=True) * self.clip_ratio
         xmin = torch.amin(reshaped_x, dim=3, keepdim=True) * self.clip_ratio
         if self.sym:
@@ -434,7 +467,7 @@ class ActQuantizer(torch.nn.Module):
         self.zero = self.zero.repeat(1, 1, 1, self.groupsize).reshape(init_shape)
 
     def find_params(self, x):
-        if self.bits == 16:
+        if self.bits == 16 and not self.realint:
             return
 
         dev = x.device
@@ -515,6 +548,8 @@ class ActQuantWrapper(torch.nn.Module):
         self.w_group_size = -1
         self.register_buffer('static_zp_bias', None)
         self._buffers['static_zp_bias'] = None
+        # Equalization: per-channel factors for down_proj (set by --eq)
+        self.eq_factors = None
         # Calibration intermediates (set when _calibrating=True)
         self._calibrating = False
         self._cal_input = None     # post-rotation, pre-quantization
@@ -573,6 +608,10 @@ class ActQuantWrapper(torch.nn.Module):
         # original w_scale, so this must come last.
         # Only prescale for integer tier-2 — float types handle the small
         # scales natively, and fp16 would overflow with large prescaling.
+        # Note: fixed-point frac_bits (int32p4) are handled separately in the
+        # kernel — they scale the contribution by 2^frac inside the K-loop
+        # and undo via integer right-shift after the loop, BEFORE the gscaler
+        # float multiply.  They are NOT folded into w_scale prescaling.
         if (gscaler_parsed is not None and gscaler_parsed['bias'] >= 1
                 and acc_dtype.startswith('int')):
             self.w_shift_bias = gscaler_parsed['bias']
@@ -646,11 +685,11 @@ class ActQuantWrapper(torch.nn.Module):
 
     def extra_repr(self) -> str:
         str_ = f'Input Quantizer Bits: {self.quantizer.bits}'
-        if self.quantizer.bits < 16:
+        if self.quantizer.bits < 16 or self.quantizer.realint:
             str_ += f' (Asymmetric Per-Token)' if not self.quantizer.sym else f' (Symmetric Per-Token)'
 
         str_ += f'\nOutput Quantizer Bits: {self.out_quantizer.bits}'
-        if self.out_quantizer.bits < 16:
+        if self.out_quantizer.bits < 16 or self.out_quantizer.realint:
             str_ += f' (Asymmetric Per-Token)' if not self.out_quantizer.sym else f' (Symmetric Per-Token)'
 
         if self.use_int_gemm:
@@ -688,11 +727,15 @@ class ActQuantWrapper(torch.nn.Module):
                 x = x.to(x_dtype)
             x = x.reshape(init_shape)
 
-        if self._calibrating:
-            self._cal_input = x  # post-rotation, pre-quantization
+        # Equalization: per-channel scaling (after rotation, before quantization)
+        if self.eq_factors is not None:
+            x = x / self.eq_factors.to(device=x.device, dtype=x.dtype)
 
-        if self.use_int_gemm and self.quantizer.bits <= 8:
-            # Integer GEMM path: quantize activations to int inside the kernel
+        if self._calibrating:
+            self._cal_input = x  # post-rotation/eq, pre-quantization
+
+        if self.use_int_gemm and self.quantizer.bits <= 16:
+            # Integer GEMM path: quantize activations to int8/int16 inside the kernel
             from int_acc_gemm import int_gemm_capped
             _ig_kwargs = dict(
                 w_int=self.w_int, w_scale=self.w_scale,
@@ -773,7 +816,7 @@ class ActQuantWrapper(torch.nn.Module):
                 x = x_fq  # use float path for correct PPL
         else:
             # Original fake-quant path
-            if self.quantizer.bits < 16:  # Quantize, if needed
+            if self.quantizer.bits < 16 or self.quantizer.realint:  # Quantize, if needed
                 # self.quantizer.find_params(x)  # QuaRot 源码，现修改在 quantizer.forward 函数中
                 x = self.quantizer(x).to(x_dtype)
                 self.quantizer.free()
@@ -783,7 +826,7 @@ class ActQuantWrapper(torch.nn.Module):
         if self._calibrating:
             self._cal_output = x  # post-matmul, pre-output-quantization
 
-        if self.out_quantizer.bits < 16:  # Quantize the output, if needed
+        if self.out_quantizer.bits < 16 or self.out_quantizer.realint:  # Quantize the output, if needed
             # self.out_quantizer.find_params(x) # QuaRot 源码，现修改在 quantizer.forward 函数中
             x = self.out_quantizer(x).to(x_dtype)
             self.out_quantizer.free()

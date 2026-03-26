@@ -139,11 +139,11 @@ def calibrate_act_scales(model, dataloader, args):
             qlayer._calibrating = True
         for name, qlayer in qlayers.items():
             full_name = f'model.layers.{i}.{name}'
-            if qlayer.quantizer.bits < 16:
+            if qlayer.quantizer.bits < 16 or qlayer.quantizer.realint:
                 hooks.append(
                     qlayer.register_forward_hook(
                         functools.partial(collect_hook, name=f'{full_name}.quantizer')))
-            if qlayer.out_quantizer.bits < 16:
+            if qlayer.out_quantizer.bits < 16 or qlayer.out_quantizer.realint:
                 hooks.append(
                     qlayer.register_forward_hook(
                         functools.partial(collect_output_hook, name=f'{full_name}.out_quantizer')))
@@ -154,11 +154,11 @@ def calibrate_act_scales(model, dataloader, args):
                 import pwl_utils
                 if isinstance(module, pwl_utils.PWLActivation):
                     full_name = f'model.layers.{i}.{name}'
-                    if module.input_quantizer.bits < 16:
+                    if module.input_quantizer.bits < 16 or module.input_quantizer.realint:
                         hooks.append(
                             module.register_forward_hook(
                                 functools.partial(collect_hook, name=f'{full_name}.input_quantizer')))
-                    if module.output_quantizer.bits < 16:
+                    if module.output_quantizer.bits < 16 or module.output_quantizer.realint:
                          hooks.append(
                             module.register_forward_hook(
                                 functools.partial(collect_output_hook, name=f'{full_name}.output_quantizer')))
@@ -170,7 +170,7 @@ def calibrate_act_scales(model, dataloader, args):
         wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
         if hasattr(layer.self_attn, wrapper_attr):
             wrapper = getattr(layer.self_attn, wrapper_attr)
-            if wrapper.k_quantizer.bits < 16:
+            if wrapper.k_quantizer.bits < 16 or wrapper.k_quantizer.realint:
                 original_forward = wrapper.forward
 
                 def make_k_hook(layer_idx, orig_fwd, wrap):
@@ -236,7 +236,6 @@ def calibrate_act_scales(model, dataloader, args):
             sym = qtz.sym
             clip_ratio = qtz.clip_ratio
             _, maxq = quant_utils.get_minq_maxq(bits, sym)
-            maxq = maxq.float()
 
             cmin = cmin * clip_ratio
             cmax = cmax * clip_ratio
@@ -366,7 +365,13 @@ Examples:
     parser.add_argument('--kv_ex', type=int, default=0,
                         help='When non-zero, disable R3 and quantize K-cache to N bits')
     parser.add_argument('--proj_ex', type=int, default=0,
-                        help='When non-zero, disable R4 and quantize down_proj input to N bits')
+                        help='When non-zero, disable R4 and quantize down_proj input to N bits. Shorthand for --no_r4 --down_bits X')
+    parser.add_argument('--no_r4', action='store_true',
+                        help='Disable R4 rotation on down_proj (without changing bits)')
+    parser.add_argument('--down_bits', type=int, default=None,
+                        help='Override down_proj input activation bits (without disabling R4)')
+    parser.add_argument('--eq', action='store_true',
+                        help='Enable per-channel equalization on down_proj inputs')
     parser.add_argument('--fp32_had', action='store_true')
     parser.add_argument('--rotate_mode', type=str, default='hadamard',
                         choices=['hadamard', 'random'])
@@ -453,6 +458,14 @@ Examples:
     parser.add_argument('--sim_version', type=int, default=0,
                         help='Simulation version tag for A/B comparisons (0=omitted from tag)')
 
+    # FP32 model precision
+    parser.add_argument('--fp32', action='store_true',
+                        help='Run model in float32 instead of float16 (isolate precision effects)')
+
+    # Real integer quantization (bypass the 16-bit passthrough)
+    parser.add_argument('--realint', action='store_true',
+                        help='Force real integer quantize/dequantize even at 16 bits')
+
     return parser.parse_args()
 
 
@@ -534,6 +547,8 @@ def main():
     print()
 
     model = model_utils.get_model(args.model, args.hf_token)
+    if getattr(args, 'fp32', False):
+        model = model.float()
     model.eval()
     model.model_name = model_name
 
@@ -555,6 +570,12 @@ def main():
         args.w_bits_map, _imit_label = gguf_utils.get_gguf_bits_map(gguf_imitate_path)
         print(f"imitate_gguf: loaded {len(args.w_bits_map)} layer bit-widths from {gguf_imitate_path}")
 
+    # --- Expand --proj_ex into --no_r4 + --down_bits ---
+    if args.proj_ex != 0:
+        args.no_r4 = True
+        if getattr(args, 'down_bits', None) is None:
+            args.down_bits = args.proj_ex
+
     # --- Set up rotations to match experiment pipeline ---
     if args.mode in ('quarot', 'dart'):
         rotation_utils.fuse_layer_norms(model)
@@ -571,7 +592,7 @@ def main():
         rot_args.r2_path = args.r2_path
         if args.r2_path and '.pt' not in args.r2_path and '.bin' not in args.r2_path:
             rot_args.r2_path += '/' + args.r2_path.split('/')[-1] + '.pt'
-        rot_args.use_r4 = (args.proj_ex == 0)
+        rot_args.use_r4 = not getattr(args, 'no_r4', False)
         rot_args.use_r3 = (args.kv_ex == 0)
         rot_args.o_per_head = args.o_per_head
         rot_args.smooth = None
@@ -593,7 +614,7 @@ def main():
     # Configure online Hadamard for R4 (down_proj) and online R2 (o_proj)
     if args.mode in ('quarot', 'dart'):
         for name in qlayers:
-            if 'down_proj' in name and args.proj_ex == 0:
+            if 'down_proj' in name and not getattr(args, 'no_r4', False):
                 had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
                 qlayers[name].online_full_had = True
                 qlayers[name].had_K = had_K
@@ -622,7 +643,7 @@ def main():
         layer_a_clip = args.a_clip_ratio
         residual = args.a_residual
 
-        if 'v_proj' in name and args.v_bits < 16:
+        if 'v_proj' in name and (args.v_bits < 16 or getattr(args, 'realint', False)):
             qlayers[name].out_quantizer.configure(
                 bits=args.v_bits, groupsize=args.v_groupsize,
                 sym=not args.v_asym, clip_ratio=args.v_clip_ratio)
@@ -636,13 +657,36 @@ def main():
             layer_groupsize = model_dim // num_heads
 
         if 'down_proj' in name:
-            if args.proj_ex != 0:
-                layer_input_bits = args.proj_ex
+            if getattr(args, 'down_bits', None) is not None:
+                layer_input_bits = args.down_bits
             layer_groupsize = down_proj_groupsize
 
         qlayers[name].quantizer.configure(
             bits=layer_input_bits, groupsize=layer_groupsize,
             sym=layer_a_sym, clip_ratio=layer_a_clip, residual=residual)
+
+        if getattr(args, 'realint', False):
+            qlayers[name].quantizer.realint = True
+            # Only set realint on out_quantizer if it was already configured (bits < 16)
+            if qlayers[name].out_quantizer.maxq != 0:
+                qlayers[name].out_quantizer.realint = True
+
+    # --- Equalization pre-pass (before GPTQ) ---
+    eq_factors = None
+    if getattr(args, 'eq', False):
+        import equalization as eq_module
+        print("Running equalization pre-pass to collect down_proj stats...")
+        eq_dataloader = data_utils.get_loaders(
+            args.calib_dataset, nsamples=args.nsamples,
+            seed=args.seed, model=args.model,
+            seqlen=model.seqlen, eval_mode=False)
+        eq_stats = eq_module.collect_eq_stats(
+            model, eq_dataloader, args.nsamples, dev='cuda')
+        eq_factors = eq_module.compute_eq_factors(eq_stats)
+        print(f"Computed equalization factors for {len(eq_factors)} layers")
+        eq_module.apply_eq_to_weights(model, eq_factors)
+        eq_module.setup_eq_online(model, eq_factors)
+        print("Equalization applied to weights and online scaling")
 
     # --- Weight quantization (GPTQ or AdaQuant) ---
     # Must happen before activation calibration so we measure activations
@@ -705,15 +749,19 @@ def main():
                 _quantizers, _x_scales = adaquant_utils.adaquant_fwrd(
                     model, trainloader, 'cuda', aq_args, aq_params)
 
-                os.makedirs(_aq_ckpt, exist_ok=True)
-                print(f"Saving AdaQuant checkpoint to: {_aq_ckpt}")
-                utils.save_model_in_parts(model, _aq_ckpt,
-                                          prefix=f'{model_name}_part')
-                if _x_scales:
-                    torch.save(_x_scales, os.path.join(_aq_ckpt, '_adaquant_x_scales.pt'))
-                if args.w_asym and getattr(args, 'int_gemm', False):
-                    from int_acc_gemm import save_gptq_w_params
-                    save_gptq_w_params(model, _aq_ckpt)
+                if os.path.isdir(_aq_ckpt) and any(
+                        f.endswith('.pth') for f in os.listdir(_aq_ckpt)):
+                    print(f"AdaQuant checkpoint already exists (written by another run) – skipping save: {_aq_ckpt}")
+                else:
+                    os.makedirs(_aq_ckpt, exist_ok=True)
+                    print(f"Saving AdaQuant checkpoint to: {_aq_ckpt}")
+                    utils.save_model_in_parts(model, _aq_ckpt,
+                                              prefix=f'{model_name}_part')
+                    if _x_scales:
+                        torch.save(_x_scales, os.path.join(_aq_ckpt, '_adaquant_x_scales.pt'))
+                    if args.w_asym and getattr(args, 'int_gemm', False):
+                        from int_acc_gemm import save_gptq_w_params
+                        save_gptq_w_params(model, _aq_ckpt)
 
         else:
             # --- GPTQ path ---
@@ -765,13 +813,19 @@ def main():
 
                 gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
 
-                os.makedirs(_gptq_ckpt, exist_ok=True)
-                print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
-                utils.save_model_in_parts(model, _gptq_ckpt,
-                                          prefix=f'{model_name}_part')
-                if args.w_asym and getattr(args, 'int_gemm', False):
-                    from int_acc_gemm import save_gptq_w_params
-                    save_gptq_w_params(model, _gptq_ckpt)
+                # Guard against parallel runs with the same GPTQ cache tag:
+                # if another process saved while we were running, skip saving.
+                if os.path.isdir(_gptq_ckpt) and any(
+                        f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
+                    print(f"GPTQ checkpoint already exists (written by another run) – skipping save: {_gptq_ckpt}")
+                else:
+                    os.makedirs(_gptq_ckpt, exist_ok=True)
+                    print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
+                    utils.save_model_in_parts(model, _gptq_ckpt,
+                                              prefix=f'{model_name}_part')
+                    if args.w_asym and getattr(args, 'int_gemm', False):
+                        from int_acc_gemm import save_gptq_w_params
+                        save_gptq_w_params(model, _gptq_ckpt)
 
         utils.cleanup_memory(verbos=True)
 
@@ -824,7 +878,7 @@ def main():
         print(f"Weight stats written to {ws_path} (effective sparsity: {effective_sparsity:.6f})")
 
     # Add K-cache quantization wrappers
-    if args.k_bits < 16:
+    if args.k_bits < 16 or getattr(args, 'realint', False):
         rope_function_name = model_utils.get_rope_function_name(model)
         layers = model_utils.get_layers(model)
         # QKRotationWrapper clamps k_groupsize to a valid divisor of head_dim
@@ -837,6 +891,11 @@ def main():
             rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
                 layer.self_attn, rope_function_name,
                 config=model.config, **k_quant_config)
+        if getattr(args, 'realint', False):
+            for layer in layers:
+                wrapper_attr = f'{rope_function_name}_qk_rotation_wrapper'
+                if hasattr(layer.self_attn, wrapper_attr):
+                    getattr(layer.self_attn, wrapper_attr).k_quantizer.realint = True
 
     # --- Replace activations with PWL (before calibration so scales reflect PWL) ---
     if args.pwl_act:
@@ -853,6 +912,10 @@ def main():
             input_bits=args.pwl_input_bits,
             output_bits=args.pwl_output_bits)
         print(f"Replaced {len(replaced)} activations with PWL ({act_name}, {args.pwl_n_segments} segments)")
+        if getattr(args, 'realint', False):
+            for pwl_mod in pwl_utils.find_pwl_activations(model).values():
+                pwl_mod.input_quantizer.realint = True
+                pwl_mod.output_quantizer.realint = True
 
     # --- Enable integer GEMM on ActQuantWrappers ---
     if args.int_gemm:
@@ -865,7 +928,7 @@ def main():
         _ig_w_bits_map = getattr(args, 'w_bits_map', None)
         n_ig = 0
         for name, qlayer in ig_qlayers.items():
-            if 'lm_head' in name or qlayer.quantizer.bits >= 16:
+            if 'lm_head' in name or qlayer.quantizer.bits > 16:
                 continue
             if getattr(qlayer.quantizer, 'groupsize', -1) > 0:
                 logging.info(f"  skipping int_gemm for {name} (act groupsize={qlayer.quantizer.groupsize})")
@@ -904,6 +967,11 @@ def main():
     # --- Run activation scale calibration ---
     act_scales = calibrate_act_scales(model, dataloader, args)
 
+    # --- Include equalization factors in saved output ---
+    if eq_factors is not None:
+        act_scales['__eq_factors__'] = {k: v.cpu() for k, v in eq_factors.items()}
+        print(f"Including equalization factors for {len(eq_factors)} layers")
+
     # --- Save ---
     save_dir = os.path.dirname(args.save_path)
     if save_dir:
@@ -911,6 +979,8 @@ def main():
     torch.save(act_scales, args.save_path)
     print(f"\nSaved {len(act_scales)} activation scale entries to {args.save_path}")
     for k in sorted(act_scales.keys()):
+        if k.startswith('__'):
+            continue
         s = act_scales[k]['scale']
         print(f"  {k}: scale shape={list(s.shape)}, range=[{s.min():.6f}, {s.max():.6f}]")
 

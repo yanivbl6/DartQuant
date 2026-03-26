@@ -299,16 +299,15 @@ def gptq_fwrd(model, dataloader, dev, args):
 
             # Enable int_gemm on just-quantized group so subsequent groups'
             # Hessians reflect the capped accumulator output.
+            # Three tiers: bits <= 8 → int8 GEMM, 9-16 → int16 GEMM, >16 → skip (fake-quant)
             if getattr(args, 'int_gemm', False):
-                _a_bits = getattr(args, 'a_bits', 16)
                 qlayers_ig = quant_utils.find_qlayers(layer, layers=[quant_utils.ActQuantWrapper])
                 for qname, ql in qlayers_ig.items():
                     if qname + '.module' not in names:
                         continue
-                    if ql.quantizer.bits >= 16 and _a_bits < 16:
-                        ql.quantizer.configure(bits=_a_bits, groupsize=-1,
-                                               sym=True, clip_ratio=1.0)
-                    if ql.quantizer.bits < 16 and getattr(ql.quantizer, 'groupsize', -1) <= 0:
+                    if ql.quantizer.bits > 16:
+                        pass  # too wide for int GEMM — leave as fake-quant
+                    elif ql.quantizer.bits <= 16 and getattr(ql.quantizer, 'groupsize', -1) <= 0:
                         # Resolve per-layer w_bits from bit-width map
                         _ig_wb = args.w_bits
                         if w_bits_map:
@@ -330,15 +329,13 @@ def gptq_fwrd(model, dataloader, dev, args):
 
         # Enable capped int GEMM on any remaining layers (safety net)
         if getattr(args, 'int_gemm', False):
-            _a_bits = getattr(args, 'a_bits', 16)
             qlayers_ig = quant_utils.find_qlayers(layer, layers=[quant_utils.ActQuantWrapper])
             for qname, ql in qlayers_ig.items():
                 if ql.use_int_gemm:
                     continue  # already set up per-group
-                if ql.quantizer.bits >= 16 and _a_bits < 16:
-                    ql.quantizer.configure(bits=_a_bits, groupsize=-1,
-                                           sym=True, clip_ratio=1.0)
-                if ql.quantizer.bits < 16 and getattr(ql.quantizer, 'groupsize', -1) <= 0:
+                if ql.quantizer.bits > 16:
+                    pass  # too wide for int GEMM — leave as fake-quant
+                elif ql.quantizer.bits <= 16 and getattr(ql.quantizer, 'groupsize', -1) <= 0:
                     # Resolve per-layer w_bits from bit-width map
                     _ig_wb = args.w_bits
                     if w_bits_map:

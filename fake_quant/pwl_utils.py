@@ -242,10 +242,8 @@ class PWLActivation(nn.Module):
         # Input / output quantizers (reuse existing ActQuantizer)
         self.input_quantizer = quant_utils.ActQuantizer()
         self.output_quantizer = quant_utils.ActQuantizer()
-        if input_bits < 16:
-            self.input_quantizer.configure(bits=input_bits, sym=True)
-        if output_bits < 16:
-            self.output_quantizer.configure(bits=output_bits, sym=True)
+        self.input_quantizer.configure(bits=input_bits, sym=True)
+        self.output_quantizer.configure(bits=output_bits, sym=True)
 
     def simulate_hw_precision(self):
         """Apply HW precision constraints to slopes and offsets."""
@@ -269,7 +267,7 @@ class PWLActivation(nn.Module):
         x_dtype = x.dtype
 
         # --- optional input quantization (simulate accumulator precision) ---
-        if self.input_quantizer.bits < 16:
+        if self.input_quantizer.bits < 16 or self.input_quantizer.realint:
             x = self.input_quantizer(x).to(x_dtype)
             self.input_quantizer.free()
 
@@ -291,7 +289,7 @@ class PWLActivation(nn.Module):
         y = y.to(x_dtype)
 
         # --- optional output quantization (simulate output encoding) ---
-        if self.output_quantizer.bits < 16:
+        if self.output_quantizer.bits < 16 or self.output_quantizer.realint:
             y = self.output_quantizer(y).to(x_dtype)
             self.output_quantizer.free()
 
@@ -301,9 +299,9 @@ class PWLActivation(nn.Module):
         parts = [f'name={self.name}', f'segments={len(self.slopes)}']
         if self.hw_config is not None:
             parts.append(f'hw=M{self.hw_config.mantissa_bits}E{self.hw_config.exp_bits}O{self.hw_config.offset_bits}')
-        if self.input_quantizer.bits < 16:
+        if self.input_quantizer.bits < 16 or self.input_quantizer.realint:
             parts.append(f'in_bits={self.input_quantizer.bits}')
-        if self.output_quantizer.bits < 16:
+        if self.output_quantizer.bits < 16 or self.output_quantizer.realint:
             parts.append(f'out_bits={self.output_quantizer.bits}')
         return ', '.join(parts)
 

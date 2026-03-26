@@ -30,6 +30,8 @@ def main():
 
     transformers.set_seed(args.seed)
     model = model_utils.get_model(args.model, args.hf_token)
+    if getattr(args, 'fp32', False):
+        model = model.float()
     model.eval()
     model.model_name = args.model.split('/')[-1]
 
@@ -63,9 +65,20 @@ def main():
         args.use_r3 = False
         args.k_bits = args.kv_ex
 
+    # Expand --proj_ex into --no_r4 + --down_bits
     if args.proj_ex != 0:
-        logging.info("proj_ex=%d: disabling R4, setting down_proj input bits=%d", args.proj_ex, args.proj_ex)
+        args.no_r4 = True
+        if getattr(args, 'down_bits', None) is None:
+            args.down_bits = args.proj_ex
+        logging.info("proj_ex=%d: setting no_r4=True, down_bits=%d", args.proj_ex, args.down_bits)
+
+    if getattr(args, 'no_r4', False):
+        logging.info("no_r4: disabling R4 rotation on down_proj")
         args.use_r4 = False
+
+    if getattr(args, 'down_bits', None) is not None:
+        logging.info("down_bits=%d: overriding down_proj input bits", args.down_bits)
+        args.a_bits_down_proj = args.down_bits
 
     # Enable softmax output quantization (replaces SDPA globally)
     if args.smq > 0:
@@ -106,6 +119,21 @@ def main():
         # Add Activation Wrapper to the model as the rest of the code assumes it is present
         quant_utils.add_actquant(model)
 
+    # --- Equalization: load factors and apply to weights + online scaling ---
+    if getattr(args, 'eq', False) and args.act_scales_path:
+        import equalization as eq_module
+        _eq_data = torch.load(args.act_scales_path, map_location='cpu',
+                              weights_only=True)
+        if '__eq_factors__' in _eq_data:
+            _eq_factors = _eq_data['__eq_factors__']
+            logging.info("Applying equalization factors for %d layers",
+                         len(_eq_factors))
+            eq_module.apply_eq_to_weights(model, _eq_factors)
+            eq_module.setup_eq_online(model, _eq_factors)
+        else:
+            logging.warning("--eq enabled but no eq_factors found in %s",
+                            args.act_scales_path)
+
     # Replace activations with PWL approximation (before GPTQ so Hessians see PWL)
     if args.pwl_act:
         import pwl_utils
@@ -122,6 +150,10 @@ def main():
             output_bits=args.pwl_output_bits)
         logging.info("Replaced %d activations with PWL (%s, %d segments, hw_sim=%s)",
                      len(replaced), act_name, args.pwl_n_segments, hw_config is not None)
+        if getattr(args, 'realint', False):
+            for pwl_mod in pwl_utils.find_pwl_activations(model).values():
+                pwl_mod.input_quantizer.realint = True
+                pwl_mod.output_quantizer.realint = True
 
     _has_w_bits_map = bool(getattr(args, 'w_bits_map', None))
     if args.w_bits < 16 or _has_w_bits_map:
@@ -193,15 +225,19 @@ def main():
 
                 # Auto-save AdaQuant checkpoint
                 if _adaquant_ckpt:
-                    os.makedirs(_adaquant_ckpt, exist_ok=True)
-                    logging.info("Saving AdaQuant checkpoint to: {}".format(_adaquant_ckpt))
-                    utils.save_model_in_parts(model, _adaquant_ckpt,
-                                              prefix=f'{model.model_name}_part')
-                    if x_scales:
-                        torch.save(x_scales, os.path.join(_adaquant_ckpt, '_adaquant_x_scales.pt'))
-                    if args.w_asym and args.int_gemm:
-                        from int_acc_gemm import save_gptq_w_params
-                        save_gptq_w_params(model, _adaquant_ckpt)
+                    if os.path.isdir(_adaquant_ckpt) and any(
+                            f.endswith('.pth') for f in os.listdir(_adaquant_ckpt)):
+                        logging.info("AdaQuant checkpoint already exists (written by another run) – skipping save: %s", _adaquant_ckpt)
+                    else:
+                        os.makedirs(_adaquant_ckpt, exist_ok=True)
+                        logging.info("Saving AdaQuant checkpoint to: {}".format(_adaquant_ckpt))
+                        utils.save_model_in_parts(model, _adaquant_ckpt,
+                                                  prefix=f'{model.model_name}_part')
+                        if x_scales:
+                            torch.save(x_scales, os.path.join(_adaquant_ckpt, '_adaquant_x_scales.pt'))
+                        if args.w_asym and args.int_gemm:
+                            from int_acc_gemm import save_gptq_w_params
+                            save_gptq_w_params(model, _adaquant_ckpt)
 
         elif gptq_strength > 0.0 and _gptq_ckpt and os.path.isdir(_gptq_ckpt) and any(
                 f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
@@ -229,14 +265,21 @@ def main():
 
             # Auto-save GPTQ checkpoint
             if _gptq_ckpt:
-                os.makedirs(_gptq_ckpt, exist_ok=True)
-                logging.info("Saving GPTQ checkpoint to: {}".format(_gptq_ckpt))
-                utils.save_model_in_parts(model, _gptq_ckpt,
-                                          prefix=f'{model.model_name}_part')
-                # Save per-group GPTQ scale/zero for w_asym + int_gemm
-                if args.w_asym and args.int_gemm:
-                    from int_acc_gemm import save_gptq_w_params
-                    save_gptq_w_params(model, _gptq_ckpt)
+                # Guard against parallel runs with the same tag: if another
+                # process already wrote the checkpoint while we were running,
+                # skip saving to avoid partial-overwrite collisions.
+                if os.path.isdir(_gptq_ckpt) and any(
+                        f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
+                    logging.info("GPTQ checkpoint already exists (written by another run) – skipping save: %s", _gptq_ckpt)
+                else:
+                    os.makedirs(_gptq_ckpt, exist_ok=True)
+                    logging.info("Saving GPTQ checkpoint to: {}".format(_gptq_ckpt))
+                    utils.save_model_in_parts(model, _gptq_ckpt,
+                                              prefix=f'{model.model_name}_part')
+                    # Save per-group GPTQ scale/zero for w_asym + int_gemm
+                    if args.w_asym and args.int_gemm:
+                        from int_acc_gemm import save_gptq_w_params
+                        save_gptq_w_params(model, _gptq_ckpt)
 
         else:  # RTN Weight Quantization (also used when gptq_strength=0.0)
 
@@ -332,7 +375,7 @@ def main():
                      args.weights_stats, effective_sparsity)
 
     # Add Input Quantization
-    if args.a_bits < 16 or args.v_bits < 16:
+    if args.a_bits < 16 or args.v_bits < 16 or getattr(args, 'realint', False):
         logging.info("Add v quantization: v_bits={}, v_groupsize={}, v_sym={}, v_clip_ratio={}".format(
             args.v_bits, args.v_groupsize, not (args.v_asym), args.v_clip_ratio))
 
@@ -348,7 +391,7 @@ def main():
             layer_a_clip = args.a_clip_ratio
             residual = args.a_residual
 
-            if 'v_proj' in name and args.v_bits < 16:  # Set the v_proj precision
+            if 'v_proj' in name and (args.v_bits < 16 or getattr(args, 'realint', False)):  # Set the v_proj precision
                 qlayers[name].out_quantizer.configure(bits=args.v_bits,
                                                       groupsize=args.v_groupsize,
                                                       sym=not (args.v_asym),
@@ -363,9 +406,7 @@ def main():
                 layer_groupsize = model_dim // num_heads
 
             if 'down_proj' in name:  # Set the down_proj precision
-                if args.proj_ex != 0:
-                    layer_input_bits = args.proj_ex
-                elif args.a_bits_down_proj is not None:
+                if args.a_bits_down_proj is not None:
                     layer_input_bits = args.a_bits_down_proj
                 layer_groupsize = down_proj_groupsize
 
@@ -374,6 +415,12 @@ def main():
                                               sym=layer_a_sym,
                                               clip_ratio=layer_a_clip,
                                               residual=residual)
+
+            if getattr(args, 'realint', False):
+                qlayers[name].quantizer.realint = True
+                # Only set realint on out_quantizer if it was already configured (bits < 16)
+                if qlayers[name].out_quantizer.maxq != 0:
+                    qlayers[name].out_quantizer.realint = True
 
     # --- Prepare integer GEMM with capped accumulator ---
     if args.int_gemm:
@@ -385,13 +432,9 @@ def main():
         for name, qlayer in qlayers_ig.items():
             if 'lm_head' in name:
                 continue
-            if qlayer.quantizer.bits > 8:
-                # Undo use_int_gemm that GPTQ propagation may have set
-                # before the quantizer was reconfigured to >8 bits.
+            if qlayer.quantizer.bits > 16:
+                # Too wide for int GEMM — use fake-quant path
                 qlayer.use_int_gemm = False
-                if qlayer.quantizer.bits < 16:
-                    logging.info("  skipping int_gemm for %s (act_bits=%d > 8, falling back to fake-quant)",
-                                 name, qlayer.quantizer.bits)
                 continue
             if getattr(qlayer.quantizer, 'groupsize', -1) > 0:
                 # Grouped activation quantization (e.g. o_per_head) is
@@ -431,7 +474,7 @@ def main():
                     qlayer.quantizer._sd_logged_first = False
             logging.info("ig_compare enabled: will compare int_gemm vs float GEMM per layer")
 
-    if args.k_bits < 16:
+    if args.k_bits < 16 or getattr(args, 'realint', False):
         logging.info("Add k quantization: k_bits={}, k_groupsize={}, k_sym={}, k_clip_ratio={}".format(
             args.k_bits, args.k_groupsize, not (args.k_asym), args.k_clip_ratio))
 
@@ -449,6 +492,11 @@ def main():
                     rope_function_name,
                     config=model.config,
                     **k_quant_config)
+            if getattr(args, 'realint', False):
+                for layer in layers:
+                    wrapper_attr = f'{rope_function_name}_qk_rotation_wrapper'
+                    if hasattr(layer.self_attn, wrapper_attr):
+                        getattr(layer.self_attn, wrapper_attr).k_quantizer.realint = True
 
     # Load pre-calibrated static activation scales
     if args.act_scales_path:
@@ -459,13 +507,13 @@ def main():
         qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
         for name, qlayer in qlayers.items():
             q_key = f'{name}.quantizer'
-            if q_key in act_scales and qlayer.quantizer.bits < 16:
+            if q_key in act_scales and (qlayer.quantizer.bits < 16 or qlayer.quantizer.realint):
                 qlayer.quantizer.scale = act_scales[q_key]['scale']
                 qlayer.quantizer.zero = act_scales[q_key]['zero']
                 qlayer.quantizer.static = True
 
             oq_key = f'{name}.out_quantizer'
-            if oq_key in act_scales and qlayer.out_quantizer.bits < 16:
+            if oq_key in act_scales and (qlayer.out_quantizer.bits < 16 or qlayer.out_quantizer.realint):
                 qlayer.out_quantizer.scale = act_scales[oq_key]['scale']
                 qlayer.out_quantizer.zero = act_scales[oq_key]['zero']
                 qlayer.out_quantizer.static = True
@@ -478,7 +526,7 @@ def main():
             if hasattr(layer.self_attn, wrapper_attr):
                 wrapper = getattr(layer.self_attn, wrapper_attr)
                 kq_key = f'layer.{i}.k_quantizer'
-                if kq_key in act_scales and wrapper.k_quantizer.bits < 16:
+                if kq_key in act_scales and (wrapper.k_quantizer.bits < 16 or wrapper.k_quantizer.realint):
                     wrapper.k_quantizer.scale = act_scales[kq_key]['scale']
                     wrapper.k_quantizer.zero = act_scales[kq_key]['zero']
                     wrapper.k_quantizer.static = True
@@ -489,12 +537,12 @@ def main():
             pwl_modules = pwl_utils.find_pwl_activations(model)
             for name, pwl_mod in pwl_modules.items():
                 iq_key = f'{name}.input_quantizer'
-                if iq_key in act_scales and pwl_mod.input_quantizer.bits < 16:
+                if iq_key in act_scales and (pwl_mod.input_quantizer.bits < 16 or pwl_mod.input_quantizer.realint):
                     pwl_mod.input_quantizer.scale = act_scales[iq_key]['scale']
                     pwl_mod.input_quantizer.zero = act_scales[iq_key]['zero']
                     pwl_mod.input_quantizer.static = True
                 oq_key = f'{name}.output_quantizer'
-                if oq_key in act_scales and pwl_mod.output_quantizer.bits < 16:
+                if oq_key in act_scales and (pwl_mod.output_quantizer.bits < 16 or pwl_mod.output_quantizer.realint):
                     pwl_mod.output_quantizer.scale = act_scales[oq_key]['scale']
                     pwl_mod.output_quantizer.zero = act_scales[oq_key]['zero']
                     pwl_mod.output_quantizer.static = True
@@ -504,12 +552,14 @@ def main():
     # Convert per-column static scales to per-group for int_gemm layers.
     # Per-column scales can't factor out of a dot product.  Per-group scales
     # (one per acc_block_k columns) can — each K-block gets its own scale.
-    # Skip when acc_dtype is non-float32: we need per-token scales so the
-    # activation scale is applied after the tier-2 accumulator, not inside it.
+    # Applies to float32 and integer tier-2 accumulators.  Skipped for fp16/bf16
+    # tier-2 where per-token scales are needed (applied after the accumulator).
     from int_acc_gemm import parse_acc_dtype
-    _acc_kind, _acc_type_bits = parse_acc_dtype(getattr(args, 'acc_dtype', 'float'))
+    _acc_kind, _acc_type_bits, _acc_frac_bits = parse_acc_dtype(getattr(args, 'acc_dtype', 'float'))
     _acc_dtype_is_fp32 = (_acc_kind == 'float' and _acc_type_bits == 32)
-    if args.int_gemm and args.act_scales_path and _acc_dtype_is_fp32:
+    _acc_dtype_is_int = (_acc_kind == 'int')
+    _acc_dtype_needs_pergroup = _acc_dtype_is_fp32 or _acc_dtype_is_int
+    if args.int_gemm and args.act_scales_path and _acc_dtype_needs_pergroup:
         G = args.acc_block_k
         qlayers_pg = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
         n_converted = 0
@@ -525,7 +575,7 @@ def main():
             assert K % G == 0, (
                 f"K={K} not divisible by acc_block_k={G} for {name}")
             n_groups = K // G
-            maxq = q.maxq.float()
+            maxq = q.maxq
 
             if q.sym:
                 # Symmetric: group scale = max of column scales within group
@@ -617,10 +667,6 @@ def main():
 
         qlayers_sd = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
         for name, qlayer in qlayers_sd.items():
-            # Skip proj_ex quantizers: they use a different bit-width to bypass
-            # int_gemm, so per-column vs per-token is not a valid comparison.
-            if 'down_proj' in name and args.proj_ex != 0:
-                continue
             if qlayer.quantizer.static:
                 _setup_sd(qlayer.quantizer, f'{name}.quantizer')
             if qlayer.out_quantizer.static:
