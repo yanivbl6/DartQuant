@@ -211,6 +211,16 @@ def add_quant_args(parser):
     parser.add_argument('--realint', action='store_true',
                         help='Force real integer quantize/dequantize even at 16 bits')
 
+    # Output quantization
+    parser.add_argument('--quant_out', type=str, default='none',
+                        choices=['none', 'up', 'mlp', 'spec', 'speco', 'all', 'r4', 'res', 'mm', 'ex'],
+                        help='Output quantization: none (default), up (up_proj only), '
+                             'mlp (gate+up+down_proj), spec (all except q/k/v_proj), '
+                             'speco (all except q/k/v/o_proj), all (all layers), '
+                             'r4 (pre-rotation on down_proj), res (residual adds), '
+                             'mm (Q in attention), ex (all+res+mm). '
+                             'Configures 16-bit symmetric quantizer on matching layers.')
+
 
 def resolve_v_bits(args):
     """Default v_bits to k_bits when not explicitly given."""
@@ -320,6 +330,10 @@ def build_quant_tag(args, for_gptq_cache=False):
     # Real integer quantization tag
     if getattr(args, 'realint', False):
         tag += "_RINT"
+    # Output quantization tag (activation-side, not relevant for GPTQ cache)
+    _qo = getattr(args, 'quant_out', 'none')
+    if _qo != 'none' and not for_gptq_cache:
+        tag += f"_qout-{_qo}"
     return tag
 
 
@@ -415,6 +429,9 @@ def build_quant_args(args):
         cmd.append('--fp32')
     if getattr(args, 'realint', False):
         cmd.append('--realint')
+    _qo = getattr(args, 'quant_out', 'none')
+    if _qo != 'none':
+        cmd += ['--quant_out', _qo]
     return cmd
 
 

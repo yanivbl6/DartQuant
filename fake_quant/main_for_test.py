@@ -422,6 +422,37 @@ def main():
                 if qlayers[name].out_quantizer.maxq != 0:
                     qlayers[name].out_quantizer.realint = True
 
+            # Configure output quantization (--quant_out)
+            quant_out = getattr(args, 'quant_out', 'none')
+            if quant_out != 'none' and quant_utils.should_quant_out(name, quant_out):
+                # Don't override existing out_quantizer (e.g. v_proj V-cache)
+                if qlayers[name].out_quantizer.maxq == 0:
+                    qlayers[name].out_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+                    qlayers[name].out_quantizer.realint = True  # Force actual quant at 16 bits
+            if quant_out != 'none' and quant_utils.should_quant_pre(name, quant_out):
+                qlayers[name].pre_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+                qlayers[name].pre_quantizer.realint = True
+
+    # Link quantizer→quantizer chains (no-op for Llama, future-ready)
+    if getattr(args, 'quant_out', 'none') != 'none':
+        quant_utils.link_adjacent_quantizers(model)
+
+    # Setup residual quantizers (--quant_out res/ex)
+    quant_out = getattr(args, 'quant_out', 'none')
+    if quant_utils.needs_residual_quant(quant_out):
+        quant_utils.setup_residual_quantizers(model)
+
+    # Setup Q quantizer in attention (--quant_out mm/ex)
+    if quant_utils.needs_mm_quant(quant_out):
+        layers = model_utils.get_layers(model)
+        rope_fn = model_utils.get_rope_function_name(model)
+        for layer in layers:
+            wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
+            if hasattr(layer.self_attn, wrapper_attr):
+                wrapper = getattr(layer.self_attn, wrapper_attr)
+                wrapper.q_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+                wrapper.q_quantizer.realint = True
+
     # --- Prepare integer GEMM with capped accumulator ---
     if args.int_gemm:
         logging.info("Preparing integer GEMM: acc_bits=%d, acc_block_k=%d, use_triton=%s, acc_wrap=%s",
@@ -518,6 +549,12 @@ def main():
                 qlayer.out_quantizer.zero = act_scales[oq_key]['zero']
                 qlayer.out_quantizer.static = True
 
+            pq_key = f'{name}.pre_quantizer'
+            if pq_key in act_scales and (qlayer.pre_quantizer.bits < 16 or qlayer.pre_quantizer.realint):
+                qlayer.pre_quantizer.scale = act_scales[pq_key]['scale']
+                qlayer.pre_quantizer.zero = act_scales[pq_key]['zero']
+                qlayer.pre_quantizer.static = True
+
         # Apply to QKRotationWrapper k_quantizers
         layers = model_utils.get_layers(model)
         for i, layer in enumerate(layers):
@@ -530,6 +567,22 @@ def main():
                     wrapper.k_quantizer.scale = act_scales[kq_key]['scale']
                     wrapper.k_quantizer.zero = act_scales[kq_key]['zero']
                     wrapper.k_quantizer.static = True
+                qq_key = f'layer.{i}.q_quantizer'
+                if qq_key in act_scales and (wrapper.q_quantizer.bits < 16 or wrapper.q_quantizer.realint):
+                    wrapper.q_quantizer.scale = act_scales[qq_key]['scale']
+                    wrapper.q_quantizer.zero = act_scales[qq_key]['zero']
+                    wrapper.q_quantizer.static = True
+
+        # Apply to residual quantizers
+        for i, layer in enumerate(layers):
+            for tag in ('_attn_res_quantizer', '_mlp_res_quantizer'):
+                rq = getattr(layer, tag, None)
+                if rq is not None:
+                    rq_key = f'layer.{i}.{tag}'
+                    if rq_key in act_scales and (rq.bits < 16 or rq.realint):
+                        rq.scale = act_scales[rq_key]['scale']
+                        rq.zero = act_scales[rq_key]['zero']
+                        rq.static = True
 
         # Apply to PWLActivation quantizers (if PWL is enabled)
         if args.pwl_act:

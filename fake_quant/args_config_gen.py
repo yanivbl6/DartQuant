@@ -46,6 +46,9 @@ def parser_gen():
                         help='Override down_proj input activation bits (without disabling R4)')
     parser.add_argument('--eq', action='store_true',
                         help='Enable per-channel equalization on down_proj inputs')
+    parser.add_argument('--quant_out', type=str, default='none',
+                        choices=['none', 'up', 'mlp', 'spec', 'speco', 'all', 'r4', 'res', 'mm', 'ex'],
+                        help='Output quantization: none, up, mlp, spec, speco, all, r4, res (residuals), mm (Q in attn), ex (all+res+mm)')
     parser.add_argument('--rotate_mode', type=str, default='hadamard', choices=['hadamard', 'random'])
     # parser.add_argument('--rotation_seed', type=int, default=-1,
     #                     help='Random Seed for generating random matrix!!')

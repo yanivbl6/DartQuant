@@ -54,6 +54,7 @@ Options:
   --acc_block_k N      K-block size for accumulator capping          (default: 32)
   --acc_wrap           Use wrap-around instead of saturation on overflow
   --acc_dtype S        Tier-2 accumulator dtype (e.g. fp16, int24)     (default: float)
+  --quant_out MODE Output quantization: none, up, mlp, spec, speco, all, r4, res, mm, ex
   --smq N              Softmax output quantization bits (0=disabled, default: 0)
   --sd_check T         Compare static vs dynamic quantization per-layer (threshold T, 0=off)
   --sd_check_norm N    Norm for sd_check: 1, 2, or inf                   (default: inf)
@@ -146,6 +147,7 @@ MAX_USED_MB=200
 SIM_VERSION=0
 FP32=0
 REALINT=0
+QUANT_OUT="none"
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -191,6 +193,7 @@ while [[ $# -gt 0 ]]; do
         --sim_version) SIM_VERSION="$2";   shift 2 ;;
         --fp32)        FP32=1;             shift   ;;
         --realint)     REALINT=1;          shift   ;;
+        --quant_out)   QUANT_OUT="$2";     shift 2 ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
@@ -364,6 +367,11 @@ if [ "$REALINT" == "1" ]; then
     REALINT_FLAG="--realint"
 fi
 
+QUANT_OUT_FLAG=""
+if [ "$QUANT_OUT" != "none" ]; then
+    QUANT_OUT_FLAG="--quant_out ${QUANT_OUT}"
+fi
+
 GGUF_FLAG=""
 GGUF_TAG_FLAG=""
 QUANT_WARN_FLAG=""
@@ -411,6 +419,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ "$SIM_VERSION" != "0" ] && TAG_ARGS="${TAG_ARGS} --sim_version ${SIM_VERSION}"
 [ "$FP32" == "1" ] && TAG_ARGS="${TAG_ARGS} --fp32"
 [ "$REALINT" == "1" ] && TAG_ARGS="${TAG_ARGS} --realint"
+[ "$QUANT_OUT" != "none" ] && TAG_ARGS="${TAG_ARGS} --quant_out ${QUANT_OUT}"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
 QUANT_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS})
@@ -544,6 +553,7 @@ python main_for_test.py \
     ${GPTQ_STRENGTH_FLAG} \
     ${FP32_FLAG} \
     ${REALINT_FLAG} \
+    ${QUANT_OUT_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     $([ "$NO_R4" == "1" ] && echo "--no_r4") \

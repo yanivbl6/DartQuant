@@ -192,6 +192,8 @@ class ActQuantizer(torch.nn.Module):
         self.clip_ratio = 1.0
         self.residual = False
         self.static = False
+        # Link to upstream out_quantizer for quantizer→quantizer chain detection
+        self.shared_scale_source = None
         # sd_check: compare static vs dynamic quantization
         self._sd_check = 0        # threshold (0 = disabled)
         self._sd_norm = float('inf')
@@ -259,6 +261,11 @@ class ActQuantizer(torch.nn.Module):
 
         if not self.static:
             self.find_params(x)  # dynamic: recompute every forward
+        elif self.shared_scale_source is not None:
+            # Quantizer→quantizer chain: use upstream scale to avoid double quantization loss
+            self.scale = self.shared_scale_source.scale.to(x.device)
+            if not self.sym and not self.shared_scale_source.sym:
+                self.zero = self.shared_scale_source.zero.to(x.device)
         # else: use pre-loaded self.scale / self.zero
 
         if self.residual:
@@ -521,6 +528,7 @@ class ActQuantWrapper(torch.nn.Module):
         self.bias = module.bias
         self.quantizer = ActQuantizer()
         self.out_quantizer = ActQuantizer()
+        self.pre_quantizer = ActQuantizer()  # quantize before rotation (e.g. before R4)
         self.register_buffer('had_K', torch.tensor(0))
         self._buffers['had_K'] = None
         self.K = 1
@@ -701,6 +709,11 @@ class ActQuantWrapper(torch.nn.Module):
     def forward(self, x):
         x_dtype = x.dtype
 
+        # Pre-rotation quantization (e.g. quantize input before R4 Hadamard)
+        if self.pre_quantizer.bits < 16 or self.pre_quantizer.realint:
+            x = self.pre_quantizer(x).to(x_dtype)
+            self.pre_quantizer.free()
+
         # Rotate, if needed
         if self.online_full_had:
 
@@ -832,6 +845,141 @@ class ActQuantWrapper(torch.nn.Module):
             self.out_quantizer.free()
 
         return x
+
+
+_ATTN_PROJS = ('q_proj', 'k_proj', 'v_proj')
+_ATTN_PROJS_O = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
+_MLP_PROJS = ('gate_proj', 'up_proj', 'down_proj')
+
+
+def should_quant_out(name, mode):
+    """Return True if layer *name* should get output quantization under *mode*.
+
+    Modes:
+        none   – nothing
+        up     – up_proj only
+        mlp    – gate_proj, up_proj, down_proj
+        spec   – all except q/k/v_proj
+        speco  – all except q/k/v/o_proj
+        all    – every layer (except lm_head)
+        r4     – pre-rotation quantizer on down_proj (uses pre_quantizer, not out_quantizer)
+        res    – residual quantizers only (no out_quantizer)
+        mm     – Q quantizer in attention only (no out_quantizer)
+        ex     – all + res + mm
+    """
+    if mode in ('none', 'r4', 'res', 'mm'):
+        return False  # these modes don't use out_quantizer
+    if 'lm_head' in name:
+        return False
+    if mode == 'up':
+        return 'up_proj' in name
+    if mode == 'mlp':
+        return any(p in name for p in _MLP_PROJS)
+    if mode == 'spec':
+        return not any(p in name for p in _ATTN_PROJS)
+    if mode == 'speco':
+        return not any(p in name for p in _ATTN_PROJS_O)
+    if mode in ('all', 'ex'):
+        return True
+    return False
+
+
+def should_quant_pre(name, mode):
+    """Return True if layer *name* should get pre-rotation quantization under *mode*."""
+    if mode in ('r4', 'ex') and 'down_proj' in name:
+        return True
+    return False
+
+
+def needs_residual_quant(mode):
+    """Return True if mode requires residual add quantizers."""
+    return mode in ('res', 'ex')
+
+
+def needs_mm_quant(mode):
+    """Return True if mode requires Q quantizer in attention."""
+    return mode in ('mm', 'ex')
+
+
+def setup_residual_quantizers(model):
+    """Patch each decoder layer to quantize the result of each residual add.
+
+    Adds two ActQuantizer instances per layer:
+      layer._attn_res_quantizer  – after attention residual add
+      layer._mlp_res_quantizer   – after MLP residual add
+
+    The patched forward applies quantization at both residual points.
+    """
+    from model_utils import get_layers
+    layers = get_layers(model)
+    for layer in layers:
+        attn_rq = ActQuantizer()
+        attn_rq.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+        attn_rq.realint = True
+        mlp_rq = ActQuantizer()
+        mlp_rq.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+        mlp_rq.realint = True
+        # Store as plain attributes to avoid accelerate dispatch issues
+        object.__setattr__(layer, '_attn_res_quantizer', attn_rq)
+        object.__setattr__(layer, '_mlp_res_quantizer', mlp_rq)
+
+        orig_forward = layer.forward
+
+        def make_patched_forward(lay, arq, mrq):
+            def patched_forward(hidden_states, *args, **kwargs):
+                # Ensure residual quantizers are on the correct device
+                dev = hidden_states.device
+                for _rq in (arq, mrq):
+                    if _rq.maxq.device != dev:
+                        _rq.maxq = _rq.maxq.to(dev)
+                        if _rq.scale is not None:
+                            _rq.scale = _rq.scale.to(dev)
+                        if _rq.zero is not None:
+                            _rq.zero = _rq.zero.to(dev)
+
+                residual = hidden_states
+                hidden_states = lay.input_layernorm(hidden_states)
+                attn_out = lay.self_attn(
+                    hidden_states=hidden_states, **kwargs)
+                hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
+                hidden_states = residual + hidden_states
+                # Quantize after attention residual add
+                if arq.bits < 16 or arq.realint:
+                    lay._attn_res_pre = hidden_states  # for calibration collection
+                    if not arq.static:
+                        arq.find_params(hidden_states)
+                    hidden_states = arq(hidden_states).to(hidden_states.dtype)
+                    arq.free()
+
+                residual = hidden_states
+                hidden_states = lay.post_attention_layernorm(hidden_states)
+                hidden_states = lay.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+                # Quantize after MLP residual add
+                if mrq.bits < 16 or mrq.realint:
+                    lay._mlp_res_pre = hidden_states  # for calibration collection
+                    if not mrq.static:
+                        mrq.find_params(hidden_states)
+                    hidden_states = mrq(hidden_states).to(hidden_states.dtype)
+                    mrq.free()
+
+                return hidden_states
+            return patched_forward
+
+        layer.forward = make_patched_forward(layer, attn_rq, mlp_rq)
+
+
+def link_adjacent_quantizers(model):
+    """Detect quantizer→quantizer chains and link scales.
+
+    For Llama: no direct adjacencies exist (residual, LN, SiLU, eltwise-mul
+    always intervene). This is a no-op placeholder for future architectures
+    where layer outputs may feed directly into another layer's input.
+    """
+    # Future: walk model graph or use a predefined adjacency map
+    # to find (layer_A.out_quantizer → layer_B.quantizer) pairs
+    # and set layer_B.quantizer.shared_scale_source = layer_A.out_quantizer
+    pass
 
 
 class WeightQuantizer(torch.nn.Module):

@@ -370,6 +370,7 @@ class QKRotationWrapper(torch.nn.Module):
         # Its buffers (scale, zero) are dynamically reshaped each forward call,
         # which conflicts with accelerate's shape-tracking hooks.
         object.__setattr__(self, 'k_quantizer', quant_utils.ActQuantizer())
+        object.__setattr__(self, 'q_quantizer', quant_utils.ActQuantizer())
         self.k_bits = 16
         if kwargs is not None:
             # Clamp k_groupsize to a valid divisor of head_dim
@@ -433,6 +434,24 @@ class QKRotationWrapper(torch.nn.Module):
             k = self.k_quantizer(per_group_k).reshape((bsz, num_heads, seq_len, head_dim)).to(q)
 
         self.k_quantizer.free()
+
+        # Quantize Q (for --quant_out mm/ex: simulate integer Q@K^T input)
+        if self.q_quantizer.bits < 16 or self.q_quantizer.realint:
+            if self.q_quantizer.maxq.device != dev:
+                from quant_utils import get_minq_maxq
+                _, qmaxq = get_minq_maxq(self.q_quantizer.bits, self.q_quantizer.sym)
+                self.q_quantizer.maxq = qmaxq.to(dev)
+                if self.q_quantizer.static:
+                    self.q_quantizer.scale = self.q_quantizer.scale.to(dev)
+                    self.q_quantizer.zero = self.q_quantizer.zero.to(dev)
+            # Token-wise quantization (same layout as K)
+            (bsz_q, num_heads_q, seq_len_q, head_dim_q) = q.shape
+            token_wise_q = q.transpose(1, 2).reshape(-1, num_heads_q * head_dim_q)
+            if not self.q_quantizer.static:
+                self.q_quantizer.find_params(token_wise_q)
+            q = self.q_quantizer(token_wise_q).reshape(
+                (bsz_q, seq_len_q, num_heads_q, head_dim_q)).transpose(1, 2).to(dtype)
+            self.q_quantizer.free()
 
         return q, k
 

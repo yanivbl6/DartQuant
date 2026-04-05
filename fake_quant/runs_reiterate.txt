@@ -1,0 +1,73 @@
+# Usage: python run_experiments.py --runfile runs_byow.txt -g 2,3,4
+
+# --- Baseline: Quarot runs without activation quantization and different group size
+##t2fp32_b10_eq_quarot: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --gscaler M8S0b10 --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --eq --sim_version 34
+
+[DONE] baseline: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341
+[DONE] baseline_wsym: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341
+[DONE] baseline_eq: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq 
+[DONE] baseline_eq_wsym: baseline -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq
+
+[DONE] quarot: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --no_r4
+[DONE] quarot_wsym: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --no_r4
+[DONE] quarot_eq: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --no_r4 
+[DONE] quarot_eq_wsym: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --no_r4
+
+[DONE] quarot_r4: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 
+[DONE] quarot_wsym_r4: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341
+[DONE] quarot_eq_r4: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq 
+[DONE] quarot_eq_wsym_r4: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq 
+
+# --- quant_out bisection (increasing coverage) ---
+[DONE] quarot_eq_wsym_qout_up: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --no_r4 --quant_out up
+[DONE] quarot_eq_wsym_qout_mlp: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --no_r4 --quant_out mlp
+# quarot_eq_wsym_qout_speco: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --no_r4 --quant_out speco
+[DONE] quarot_eq_wsym_qout_spec: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --no_r4 --quant_out spec
+[DONE] quarot_eq_wsym_qout_all: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --no_r4 --quant_out all
+
+# --- quant_out with R4 (down_proj gets 8-bit input via Hadamard, so quant_out matters more) ---
+[DONE] quarot_eq_wsym_r4_qout_up: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --quant_out up
+[DONE] quarot_eq_wsym_r4_qout_mlp: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --quant_out mlp
+[DONE] quarot_eq_wsym_r4_qout_spec: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --quant_out spec
+[DONE] quarot_eq_wsym_r4_qout_all: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 341 --eq --quant_out all
+
+[DONE] quarot_eq_wsym_r4_qout_up: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 3411 --eq --quant_out up
+[DONE] quarot_eq_wsym_r4_qout_up6: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 3412 --eq --quant_out up
+[DONE] quarot_eq_wsym_r4_qout_up6: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 3412 --eq --quant_out all
+
+# --- v342: quant_out all comparison, w_asym, {eq,no-eq} x {R4,no-R4} ---
+# no-R4, no-eq
+[DONE] quarot_v342: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --no_r4
+[DONE] quarot_v342_qout: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --no_r4 --quant_out all
+# no-R4, eq
+[DONE] quarot_eq_v342: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq --no_r4
+[DONE] quarot_eq_v342_qout: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq --no_r4 --quant_out all
+# R4, no-eq
+[DONE] quarot_r4_v342: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342
+[DONE] quarot_r4_v342_qout: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --quant_out all
+# R4, eq
+[DONE] quarot_eq_r4_v342: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq
+[DONE] quarot_eq_r4_v342_qout: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq --quant_out all
+
+# --- quant_out r4: pre-rotation quantizer on down_proj (R4 only) ---
+# R4, no-eq
+quarot_r4_v342_qr4: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --quant_out r4
+# R4, eq
+quarot_eq_r4_v342_qr4: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq --quant_out r4
+
+# --- quant_out res/mm/ex: residual adds, Q quantizer, and full simulation ---
+# R4, eq — res only (residual adds)
+[DONE] quarot_eq_r4_v342_res: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq --quant_out res
+# R4, eq — mm only (Q quantizer in attention)
+[DONE] quarot_eq_r4_v342_mm: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq --quant_out mm
+# R4, eq — ex (all + res + mm + r4)
+[DONE] quarot_eq_r4_v342_ex: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq --quant_out ex
+# R4, no-eq — ex
+[DONE] quarot_r4_v342_ex: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --quant_out ex
+# no-R4, eq — res only (residual impact without R4)
+[DONE] quarot_eq_v342_res: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq --no_r4 --quant_out res
+# no-R4, eq — ex
+[DONE] quarot_eq_v342_ex: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq --no_r4 --quant_out ex
+# no-R4, no-eq — ex
+[DONE] quarot_v342_ex: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --no_r4 --quant_out ex
+

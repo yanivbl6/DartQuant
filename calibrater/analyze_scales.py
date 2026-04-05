@@ -114,9 +114,26 @@ def categorize_key(key):
     if m:
         return 'k_cache', int(m.group(1)), 'k_cache'
 
+    m = re.match(r'model\.layers\.(\d+)\.(.+?)\.pre_quantizer', key)
+    if m:
+        sublayer = m.group(2)
+        return 'pre_rotation', int(m.group(1)), sublayer
+
     m = re.match(r'model\.layers\.(\d+)\.(.+?)\.out_quantizer', key)
     if m:
-        return 'v_cache', int(m.group(1)), m.group(2)
+        sublayer = m.group(2)
+        if 'v_proj' in sublayer:
+            return 'v_cache', int(m.group(1)), sublayer
+        elif 'q_proj' in sublayer or 'k_proj' in sublayer:
+            return 'attn_qk_output', int(m.group(1)), sublayer
+        elif 'o_proj' in sublayer:
+            return 'attn_o_output', int(m.group(1)), sublayer
+        elif 'gate_proj' in sublayer or 'up_proj' in sublayer:
+            return 'mlp_gate_up_output', int(m.group(1)), sublayer
+        elif 'down_proj' in sublayer:
+            return 'mlp_down_output', int(m.group(1)), sublayer
+        else:
+            return 'other_output', int(m.group(1)), sublayer
 
     m = re.match(r'model\.layers\.(\d+)\.(.+?)\.quantizer', key)
     if m:
@@ -342,6 +359,8 @@ def main():
         cat_scales = {}
         cat_zeros = {}
         for key, entry in data.items():
+            if not isinstance(entry, dict) or 'scale' not in entry:
+                continue  # skip non-scale entries (e.g. __eq_factors__)
             cat, layer_idx, sublayer = categorize_key(key)
             scale = entry['scale'].numpy().flatten()
             zero = entry['zero'].numpy().flatten()

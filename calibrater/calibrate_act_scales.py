@@ -147,6 +147,21 @@ def calibrate_act_scales(model, dataloader, args):
                 hooks.append(
                     qlayer.register_forward_hook(
                         functools.partial(collect_output_hook, name=f'{full_name}.out_quantizer')))
+            if qlayer.pre_quantizer.bits < 16 or qlayer.pre_quantizer.realint:
+                def collect_pre_hook(module, inp, name):
+                    """Forward pre-hook to collect min/max of wrapper input (before pre_quantizer)."""
+                    x = inp[0] if isinstance(inp, tuple) else inp
+                    flat = x.reshape(-1, x.shape[-1]).float()
+                    cmin = flat.min(dim=0)[0]
+                    cmax = flat.max(dim=0)[0]
+                    if name not in collectors:
+                        collectors[name] = {'min': cmin, 'max': cmax}
+                    else:
+                        collectors[name]['min'] = torch.minimum(collectors[name]['min'], cmin)
+                        collectors[name]['max'] = torch.maximum(collectors[name]['max'], cmax)
+                hooks.append(
+                    qlayer.register_forward_pre_hook(
+                        functools.partial(collect_pre_hook, name=f'{full_name}.pre_quantizer')))
 
         # Register hooks on PWLActivation quantizers (if present)
         for name, module in layer.named_modules():
@@ -165,15 +180,17 @@ def calibrate_act_scales(model, dataloader, args):
             except ImportError:
                 break  # pwl_utils not available, skip
 
-        # Register hook on QKRotationWrapper for K-cache
+        # Register hook on QKRotationWrapper for K-cache and Q quantization
         rope_fn = model_utils.get_rope_function_name(model)
         wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
         if hasattr(layer.self_attn, wrapper_attr):
             wrapper = getattr(layer.self_attn, wrapper_attr)
-            if wrapper.k_quantizer.bits < 16 or wrapper.k_quantizer.realint:
+            _need_k = wrapper.k_quantizer.bits < 16 or wrapper.k_quantizer.realint
+            _need_q = wrapper.q_quantizer.bits < 16 or wrapper.q_quantizer.realint
+            if _need_k or _need_q:
                 original_forward = wrapper.forward
 
-                def make_k_hook(layer_idx, orig_fwd, wrap):
+                def make_qk_hook(layer_idx, orig_fwd, wrap, collect_k, collect_q):
                     def hooked_forward(*a, **kw):
                         q, k = wrap.func(*a, **kw)
                         d = q.dtype
@@ -181,32 +198,75 @@ def calibrate_act_scales(model, dataloader, args):
                             from fast_hadamard_transform import hadamard_transform
                             q = hadamard_transform(q.float(), scale=1/math.sqrt(q.shape[-1])).to(d)
                             k = hadamard_transform(k.float(), scale=1/math.sqrt(k.shape[-1])).to(d)
-                        (bsz, num_heads, seq_len, head_dim) = k.shape
-                        if wrap.k_groupsize == -1:
-                            flat_k = k.transpose(1, 2).reshape(-1, num_heads * head_dim)
-                        elif wrap.k_groupsize >= head_dim:
-                            flat_k = k.reshape(-1, head_dim)
-                        else:
-                            flat_k = k.reshape(-1, wrap.k_groupsize)
-                        cmin = flat_k.float().min(dim=0)[0]
-                        cmax = flat_k.float().max(dim=0)[0]
-                        cname = f'layer.{layer_idx}.k_quantizer'
+
+                        # Collect and quantize K
+                        if collect_k:
+                            (bsz, num_heads, seq_len, head_dim) = k.shape
+                            if wrap.k_groupsize == -1:
+                                flat_k = k.transpose(1, 2).reshape(-1, num_heads * head_dim)
+                            elif wrap.k_groupsize >= head_dim:
+                                flat_k = k.reshape(-1, head_dim)
+                            else:
+                                flat_k = k.reshape(-1, wrap.k_groupsize)
+                            cmin = flat_k.float().min(dim=0)[0]
+                            cmax = flat_k.float().max(dim=0)[0]
+                            cname = f'layer.{layer_idx}.k_quantizer'
+                            if cname not in collectors:
+                                collectors[cname] = {'min': cmin, 'max': cmax}
+                            else:
+                                collectors[cname]['min'] = torch.minimum(collectors[cname]['min'], cmin)
+                                collectors[cname]['max'] = torch.maximum(collectors[cname]['max'], cmax)
+                            wrap.k_quantizer.find_params(flat_k)
+                            if wrap.k_groupsize == -1:
+                                k = wrap.k_quantizer(flat_k).reshape((bsz, seq_len, num_heads, head_dim)).transpose(1, 2).to(q)
+                            else:
+                                k = wrap.k_quantizer(flat_k).reshape((bsz, num_heads, seq_len, head_dim)).to(q)
+                            wrap.k_quantizer.free()
+
+                        # Collect and quantize Q
+                        if collect_q:
+                            (bsz_q, num_heads_q, seq_len_q, head_dim_q) = q.shape
+                            flat_q = q.transpose(1, 2).reshape(-1, num_heads_q * head_dim_q)
+                            cmin_q = flat_q.float().min(dim=0)[0]
+                            cmax_q = flat_q.float().max(dim=0)[0]
+                            cname_q = f'layer.{layer_idx}.q_quantizer'
+                            if cname_q not in collectors:
+                                collectors[cname_q] = {'min': cmin_q, 'max': cmax_q}
+                            else:
+                                collectors[cname_q]['min'] = torch.minimum(collectors[cname_q]['min'], cmin_q)
+                                collectors[cname_q]['max'] = torch.maximum(collectors[cname_q]['max'], cmax_q)
+                            wrap.q_quantizer.find_params(flat_q)
+                            q = wrap.q_quantizer(flat_q).reshape(
+                                (bsz_q, seq_len_q, num_heads_q, head_dim_q)).transpose(1, 2).to(d)
+                            wrap.q_quantizer.free()
+
+                        return q, k
+                    return hooked_forward
+
+                wrapper.forward = make_qk_hook(i, original_forward, wrapper, _need_k, _need_q)
+
+        # Collect residual quantizer statistics via post-forward hook
+        _attn_rq = getattr(layer, '_attn_res_quantizer', None)
+        _mlp_rq = getattr(layer, '_mlp_res_quantizer', None)
+        if _attn_rq is not None or _mlp_rq is not None:
+            def make_res_hook(layer_idx, lay):
+                def collect_res(module, inp, out):
+                    for tag in ('_attn_res_pre', '_mlp_res_pre'):
+                        x = getattr(lay, tag, None)
+                        if x is None:
+                            continue
+                        flat = x.reshape(-1, x.shape[-1]).float()
+                        cmin = flat.min(dim=0)[0]
+                        cmax = flat.max(dim=0)[0]
+                        cname = f'layer.{layer_idx}.{tag.replace("_pre", "_quantizer")}'
                         if cname not in collectors:
                             collectors[cname] = {'min': cmin, 'max': cmax}
                         else:
                             collectors[cname]['min'] = torch.minimum(collectors[cname]['min'], cmin)
                             collectors[cname]['max'] = torch.maximum(collectors[cname]['max'], cmax)
-                        # Still quantize K for correct layer output propagation
-                        wrap.k_quantizer.find_params(flat_k)
-                        if wrap.k_groupsize == -1:
-                            k = wrap.k_quantizer(flat_k).reshape((bsz, seq_len, num_heads, head_dim)).transpose(1, 2).to(q)
-                        else:
-                            k = wrap.k_quantizer(flat_k).reshape((bsz, num_heads, seq_len, head_dim)).to(q)
-                        wrap.k_quantizer.free()
-                        return q, k
-                    return hooked_forward
-
-                wrapper.forward = make_k_hook(i, original_forward, wrapper)
+                        setattr(lay, tag, None)  # free memory
+                return collect_res
+            hooks.append(layer.register_forward_hook(make_res_hook(i, layer)))
 
         # Run all samples through this layer
         for j in range(nsamples):
@@ -214,6 +274,14 @@ def calibrate_act_scales(model, dataloader, args):
                             attention_mask=attention_mask,
                             position_ids=position_ids,
                             position_embeddings=position_embeddings)[0]
+            if j == 0 and outs[j].isnan().any():
+                print(f"  WARNING: NaN in layer {i} output after sample 0 "
+                      f"(nan={outs[j].isnan().sum()}/{outs[j].numel()})", flush=True)
+                for sname, ql in qlayers.items():
+                    co = ql._cal_output
+                    if co is not None and co.isnan().any():
+                        print(f"    {sname}: output NaN", flush=True)
+                break  # stop after first NaN sample
 
         # Remove hooks and clean up calibration state
         for h in hooks:
@@ -282,10 +350,30 @@ def _find_quantizer(layer, cname, layer_idx, model, rope_fn):
         if subname in qlayers:
             return qlayers[subname].out_quantizer
 
+    if cname.startswith(prefix) and cname.endswith('.pre_quantizer'):
+        subname = cname[len(prefix):-len('.pre_quantizer')]
+        if subname in qlayers:
+            return qlayers[subname].pre_quantizer
+
     if cname == f'layer.{layer_idx}.k_quantizer':
         wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
         if hasattr(layer.self_attn, wrapper_attr):
             return getattr(layer.self_attn, wrapper_attr).k_quantizer
+
+    if cname == f'layer.{layer_idx}.q_quantizer':
+        wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
+        if hasattr(layer.self_attn, wrapper_attr):
+            return getattr(layer.self_attn, wrapper_attr).q_quantizer
+
+    if cname == f'layer.{layer_idx}._attn_res_quantizer':
+        rq = getattr(layer, '_attn_res_quantizer', None)
+        if rq is not None:
+            return rq
+
+    if cname == f'layer.{layer_idx}._mlp_res_quantizer':
+        rq = getattr(layer, '_mlp_res_quantizer', None)
+        if rq is not None:
+            return rq
 
     # PWLActivation quantizers
     try:
@@ -465,6 +553,11 @@ Examples:
     # Real integer quantization (bypass the 16-bit passthrough)
     parser.add_argument('--realint', action='store_true',
                         help='Force real integer quantize/dequantize even at 16 bits')
+
+    # Output quantization
+    parser.add_argument('--quant_out', type=str, default='none',
+                        choices=['none', 'up', 'mlp', 'spec', 'speco', 'all', 'r4', 'res', 'mm', 'ex'],
+                        help='Output quantization: none, up, mlp, spec, speco, all, r4, res (residuals), mm (Q in attn), ex (all+res+mm)')
 
     return parser.parse_args()
 
@@ -916,6 +1009,36 @@ def main():
             for pwl_mod in pwl_utils.find_pwl_activations(model).values():
                 pwl_mod.input_quantizer.realint = True
                 pwl_mod.output_quantizer.realint = True
+
+    # --- Configure output quantization (--quant_out) ---
+    # Must happen AFTER GPTQ/checkpoint loading, which overwrites buffers via load_state_dict.
+    quant_out = getattr(args, 'quant_out', 'none')
+    if quant_out != 'none':
+        qlayers_qo = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        for name, qlayer in qlayers_qo.items():
+            if quant_utils.should_quant_out(name, quant_out):
+                if qlayer.out_quantizer.maxq == 0:
+                    qlayer.out_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+                    qlayer.out_quantizer.realint = True
+            if quant_utils.should_quant_pre(name, quant_out):
+                qlayer.pre_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+                qlayer.pre_quantizer.realint = True
+        quant_utils.link_adjacent_quantizers(model)
+
+    # Setup residual quantizers (--quant_out res/ex)
+    if quant_utils.needs_residual_quant(quant_out):
+        quant_utils.setup_residual_quantizers(model)
+
+    # Setup Q quantizer in attention (--quant_out mm/ex)
+    if quant_utils.needs_mm_quant(quant_out):
+        layers = model.model.layers
+        rope_fn = model_utils.get_rope_function_name(model)
+        for layer in layers:
+            wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
+            if hasattr(layer.self_attn, wrapper_attr):
+                wrapper = getattr(layer.self_attn, wrapper_attr)
+                wrapper.q_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+                wrapper.q_quantizer.realint = True
 
     # --- Enable integer GEMM on ActQuantWrappers ---
     if args.int_gemm:
