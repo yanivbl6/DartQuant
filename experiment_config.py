@@ -135,6 +135,9 @@ def add_quant_args(parser):
                         help='Down-proj input quant without R4 rotation (0=off). Shorthand for --no_r4 --down_bits X')
     parser.add_argument('--no_r4', action='store_true',
                         help='Disable R4 rotation on down_proj (without changing bits)')
+    parser.add_argument('--late_rot4', action='store_true', default=False,
+                        help='Quantize weights first, then apply R4 rotation: Q(W)@H instead of Q(W@H). '
+                             'Incompatible with --int_gemm on down_proj.')
     parser.add_argument('--down_bits', type=int, default=None,
                         help='Override down_proj input activation bits (without disabling R4)')
     parser.add_argument('--eq', action='store_true',
@@ -212,6 +215,10 @@ def add_quant_args(parser):
                         help='Force real integer quantize/dequantize even at 16 bits')
 
     # Output quantization
+    parser.add_argument('--stochastic_quant', action='store_true', default=False,
+                        help='Use stochastic rounding for all activation quantizers (unbiased)')
+    parser.add_argument('--ig_compare', action='store_true', default=False,
+                        help='Compare int_gemm vs fake-quant per layer (uses fake-quant for PPL)')
     parser.add_argument('--quant_out', type=str, default='none',
                         choices=['none', 'up', 'mlp', 'spec', 'speco', 'all', 'r4', 'res', 'mm', 'ex'],
                         help='Output quantization: none (default), up (up_proj only), '
@@ -230,7 +237,7 @@ def resolve_v_bits(args):
 
 # ── Quant-tag and path helpers ───────────────────────────────────────────────
 
-def build_quant_tag(args, for_gptq_cache=False):
+def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
     """Build the canonical quant-tag string from parsed args.
 
     This is the SINGLE SOURCE OF TRUTH for tag construction.
@@ -254,7 +261,15 @@ def build_quant_tag(args, for_gptq_cache=False):
     if args.proj_ex != 0:
         tag += f"_projex{args.proj_ex}"
     else:
-        if getattr(args, 'no_r4', False):
+        _late_r4 = getattr(args, 'late_rot4', False)
+        if _late_r4:
+            if for_cal_cache:
+                pass                 # reuse normal R4 calibration (and R4 GPTQ in cal context)
+            elif for_gptq_cache:
+                tag += "_noR4"       # reuse noR4 GPTQ checkpoint at runtime
+            else:
+                tag += "_lateR4"     # unique result tag
+        elif getattr(args, 'no_r4', False):
             tag += "_noR4"
         if getattr(args, 'down_bits', None) is not None:
             tag += f"_down{args.down_bits}"
@@ -334,6 +349,12 @@ def build_quant_tag(args, for_gptq_cache=False):
     _qo = getattr(args, 'quant_out', 'none')
     if _qo != 'none' and not for_gptq_cache:
         tag += f"_qout-{_qo}"
+    # Stochastic quantization tag (result-only, not relevant for GPTQ/calibration cache)
+    if getattr(args, 'stochastic_quant', False) and not (for_gptq_cache or for_cal_cache):
+        tag += "_stoch"
+    # ig_compare uses fake-quant path for PPL — different result, needs separate cache
+    if getattr(args, 'ig_compare', False) and not (for_gptq_cache or for_cal_cache):
+        tag += "_igcmp"
     return tag
 
 
@@ -432,6 +453,12 @@ def build_quant_args(args):
     _qo = getattr(args, 'quant_out', 'none')
     if _qo != 'none':
         cmd += ['--quant_out', _qo]
+    if getattr(args, 'late_rot4', False):
+        cmd.append('--late_rot4')
+    if getattr(args, 'stochastic_quant', False):
+        cmd.append('--stochastic_quant')
+    if getattr(args, 'ig_compare', False):
+        cmd.append('--ig_compare')
     return cmd
 
 
@@ -445,7 +472,10 @@ if __name__ == '__main__':
     add_quant_args(_parser)
     _parser.add_argument('--for_gptq_cache', action='store_true',
                          help='Omit gptq_strength from tag (for shared GPTQ cache)')
+    _parser.add_argument('--for_cal_cache', action='store_true',
+                         help='Tag for calibration cache (late_rot4 maps to normal R4 tag)')
     _args = _parser.parse_args()
     resolve_v_bits(_args)
     _args.model = resolve_model(_args.model)
-    print(build_quant_tag(_args, for_gptq_cache=_args.for_gptq_cache))
+    print(build_quant_tag(_args, for_gptq_cache=_args.for_gptq_cache,
+                          for_cal_cache=_args.for_cal_cache))

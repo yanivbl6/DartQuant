@@ -42,6 +42,8 @@ def parser_gen():
                         help='When non-zero, disable R4 and quantize down_proj input to N bits. Shorthand for --no_r4 --down_bits X.')
     parser.add_argument('--no_r4', action='store_true',
                         help='Disable R4 rotation on down_proj (without changing bits)')
+    parser.add_argument('--late_rot4', action='store_true', default=False,
+                        help='Quantize weights first, then apply R4 rotation: Q(W)@H instead of Q(W@H)')
     parser.add_argument('--down_bits', type=int, default=None,
                         help='Override down_proj input activation bits (without disabling R4)')
     parser.add_argument('--eq', action='store_true',
@@ -137,6 +139,16 @@ def parser_gen():
     parser.add_argument('--sd_check_norm', type=str, default='inf',
                         choices=['1', '2', 'inf'],
                         help='Norm for sd_check relative error (default: inf/max)')
+
+    # Stochastic quantization
+    parser.add_argument('--stochastic_quant', action='store_true', default=False,
+                        help='Use stochastic rounding for all activation quantizers (unbiased)')
+
+    # R4 diagnostic stats
+    parser.add_argument('--r4_stats', type=str, default=None,
+                        help='Collect R4 diagnostic stats on down_proj and save JSON to this path')
+    parser.add_argument('--r4_stats_batches', type=int, default=0,
+                        help='Limit stats collection to first N eval batches (0=all)')
 
     # Weight Quantization Arguments
     parser.add_argument('--w_bits', type=int, default=16,

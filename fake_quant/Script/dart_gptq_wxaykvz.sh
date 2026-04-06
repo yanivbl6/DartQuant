@@ -148,6 +148,10 @@ SIM_VERSION=0
 FP32=0
 REALINT=0
 QUANT_OUT="none"
+LATE_ROT4=0
+R4_STATS=""
+R4_STATS_BATCHES=0
+STOCHASTIC_QUANT=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -194,6 +198,10 @@ while [[ $# -gt 0 ]]; do
         --fp32)        FP32=1;             shift   ;;
         --realint)     REALINT=1;          shift   ;;
         --quant_out)   QUANT_OUT="$2";     shift 2 ;;
+        --late_rot4)   LATE_ROT4=1;        shift   ;;
+        --r4_stats)    R4_STATS="$2";      shift 2 ;;
+        --r4_stats_batches) R4_STATS_BATCHES="$2"; shift 2 ;;
+        --stochastic_quant) STOCHASTIC_QUANT=1; shift ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
@@ -372,6 +380,25 @@ if [ "$QUANT_OUT" != "none" ]; then
     QUANT_OUT_FLAG="--quant_out ${QUANT_OUT}"
 fi
 
+LATE_ROT4_FLAG=""
+if [ "$LATE_ROT4" == "1" ]; then
+    LATE_ROT4_FLAG="--late_rot4"
+fi
+
+STOCHASTIC_QUANT_FLAG=""
+if [ "$STOCHASTIC_QUANT" == "1" ]; then
+    STOCHASTIC_QUANT_FLAG="--stochastic_quant"
+fi
+
+R4_STATS_FLAG=""
+if [ -n "$R4_STATS" ]; then
+    mkdir -p "$(dirname "$R4_STATS")"
+    R4_STATS_FLAG="--r4_stats ${R4_STATS}"
+    if [ "$R4_STATS_BATCHES" != "0" ]; then
+        R4_STATS_FLAG="${R4_STATS_FLAG} --r4_stats_batches ${R4_STATS_BATCHES}"
+    fi
+fi
+
 GGUF_FLAG=""
 GGUF_TAG_FLAG=""
 QUANT_WARN_FLAG=""
@@ -420,6 +447,9 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ "$FP32" == "1" ] && TAG_ARGS="${TAG_ARGS} --fp32"
 [ "$REALINT" == "1" ] && TAG_ARGS="${TAG_ARGS} --realint"
 [ "$QUANT_OUT" != "none" ] && TAG_ARGS="${TAG_ARGS} --quant_out ${QUANT_OUT}"
+[ "$LATE_ROT4" == "1" ] && TAG_ARGS="${TAG_ARGS} --late_rot4"
+[ "$STOCHASTIC_QUANT" == "1" ] && TAG_ARGS="${TAG_ARGS} --stochastic_quant"
+[ "$IG_COMPARE" == "1" ] && TAG_ARGS="${TAG_ARGS} --ig_compare"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
 QUANT_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS})
@@ -433,6 +463,12 @@ fi
 GPTQ_CACHE_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS} --for_gptq_cache)
 if [ $? -ne 0 ] || [ -z "$GPTQ_CACHE_TAG" ]; then
     GPTQ_CACHE_TAG="$QUANT_TAG"  # fallback
+fi
+
+# Build calibration cache tag (late_rot4 reuses normal R4 calibration scales)
+CAL_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS} --for_cal_cache)
+if [ $? -ne 0 ] || [ -z "$CAL_TAG" ]; then
+    CAL_TAG="$QUANT_TAG"  # fallback
 fi
 
 # --- Static vs Dynamic check flags ---
@@ -470,7 +506,7 @@ STATIC_ACT_FLAG=""
 STATIC_TAG=""
 if [ "$STATIC_ACT" == "1" ]; then
     ACT_SCALES_DIR="../data/act_scales/${MODEL_NAME}"
-    ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${QUANT_TAG}.pt"
+    ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${CAL_TAG}.pt"
     if [ ! -f "$ACT_SCALES_FILE" ]; then
         echo "Static act scales not found at ${ACT_SCALES_FILE}"
         echo "Run calibration first:"
@@ -554,6 +590,9 @@ python main_for_test.py \
     ${FP32_FLAG} \
     ${REALINT_FLAG} \
     ${QUANT_OUT_FLAG} \
+    ${LATE_ROT4_FLAG} \
+    ${R4_STATS_FLAG} \
+    ${STOCHASTIC_QUANT_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     $([ "$NO_R4" == "1" ] && echo "--no_r4") \

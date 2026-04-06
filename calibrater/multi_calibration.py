@@ -217,7 +217,27 @@ def _parse_runfile_line_args(tokens):
 
 
 # Flags from the shell script that are irrelevant to calibration
-_IGNORE_FLAGS = {'--static-act', '--fast', '-F', '--very-fast', '--overwrite'}
+_IGNORE_FLAGS = {'--static-act', '--fast', '-F', '--very-fast', '--overwrite',
+                 '--stochastic_quant', '--ig_compare'}
+# Flags with a value argument that should be stripped for calibration
+_IGNORE_FLAGS_WITH_VALUE = {'--r4_stats', '--r4_stats_batches'}
+
+
+def _filter_runtime_flags(tokens):
+    """Remove runtime-only flags (with and without values) from token list."""
+    filtered = []
+    skip_next = False
+    for t in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if t in _IGNORE_FLAGS:
+            continue
+        if t in _IGNORE_FLAGS_WITH_VALUE:
+            skip_next = True
+            continue
+        filtered.append(t)
+    return filtered
 
 
 def parse_runfile_for_calibration(path):
@@ -244,7 +264,7 @@ def parse_runfile_for_calibration(path):
         rest = tokens[1:]
 
         # Filter out ignored flags
-        filtered = [t for t in rest if t not in _IGNORE_FLAGS]
+        filtered = _filter_runtime_flags(rest)
 
         # Parse through experiment_config to get structured args
         line_args, extra = _parse_runfile_line_args(filtered)

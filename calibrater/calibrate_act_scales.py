@@ -611,8 +611,8 @@ def main():
     args.w_clip = True
 
     # --- Build quant tag (centralized in experiment_config) ---
-    quant_tag = cfg.build_quant_tag(args)
-    gptq_cache_tag = cfg.build_quant_tag(args, for_gptq_cache=True)
+    quant_tag = cfg.build_quant_tag(args, for_cal_cache=True)
+    gptq_cache_tag = cfg.build_quant_tag(args, for_gptq_cache=True, for_cal_cache=True)
 
     # Resolve GGUF path (needed for weight loading, separate from tag)
     gguf_path = None

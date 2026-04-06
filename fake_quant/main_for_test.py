@@ -72,6 +72,10 @@ def main():
             args.down_bits = args.proj_ex
         logging.info("proj_ex=%d: setting no_r4=True, down_bits=%d", args.proj_ex, args.down_bits)
 
+    if getattr(args, 'late_rot4', False):
+        logging.info("late_rot4: disabling R4 for rotation phase (will apply post-GPTQ)")
+        args.use_r4 = False
+
     if getattr(args, 'no_r4', False):
         logging.info("no_r4: disabling R4 rotation on down_proj")
         args.use_r4 = False
@@ -100,7 +104,7 @@ def main():
         quant_utils.add_actquant(model)  # Add Activation Wrapper to the model
         qlayers = quant_utils.find_qlayers(model)
         for name in qlayers:
-            if args.use_r4 and 'down_proj' in name:
+            if (args.use_r4 or getattr(args, 'late_rot4', False)) and 'down_proj' in name:
                 had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
                 qlayers[name].online_full_had = True
                 qlayers[name].had_K = had_K
@@ -248,6 +252,14 @@ def main():
                 from int_acc_gemm import load_gptq_w_params
                 load_gptq_w_params(model, _gptq_ckpt)
             logging.info("GPTQ checkpoint loaded – skipping quantization.")
+
+            # late_rot4: apply R4 rotation to already-quantized down_proj weights
+            if getattr(args, 'late_rot4', False):
+                logging.info("late_rot4: applying R4 rotation to GPTQ-quantized down_proj weights")
+                for _name, _module in model.named_modules():
+                    if 'down_proj' in _name and isinstance(_module, torch.nn.Linear):
+                        hadamard_utils.apply_exact_had_to_linear(_module, had_dim=-1, output=False)
+                logging.info("late_rot4: R4 rotation applied post-quantization")
 
         elif gptq_strength > 0.0 and not args.w_rtn:  # GPTQ Weight Quantization
             assert "llama" in args.model, "Only llama is supported for GPTQ!"
@@ -453,6 +465,14 @@ def main():
                 wrapper.q_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
                 wrapper.q_quantizer.realint = True
 
+    # --- Stochastic quantization ---
+    if getattr(args, 'stochastic_quant', False):
+        logging.info("Enabling stochastic rounding on all activation quantizers")
+        for name in qlayers:
+            qlayers[name].quantizer.stochastic = True
+            qlayers[name].out_quantizer.stochastic = True
+            qlayers[name].pre_quantizer.stochastic = True
+
     # --- Prepare integer GEMM with capped accumulator ---
     if args.int_gemm:
         logging.info("Preparing integer GEMM: acc_bits=%d, acc_block_k=%d, use_triton=%s, acc_wrap=%s",
@@ -462,6 +482,10 @@ def main():
         n_int_gemm = 0
         for name, qlayer in qlayers_ig.items():
             if 'lm_head' in name:
+                continue
+            if getattr(args, 'late_rot4', False) and 'down_proj' in name:
+                logging.warning("late_rot4: skipping int_gemm for %s (post-rotation breaks integer grid)", name)
+                qlayer.use_int_gemm = False
                 continue
             if qlayer.quantizer.bits > 16:
                 # Too wide for int GEMM — use fake-quant path
@@ -750,6 +774,13 @@ def main():
     else:
         model.to(utils.DEV)
 
+    # ---------- R4 stats setup ----------
+    r4_collectors = None
+    if getattr(args, 'r4_stats', None):
+        import r4_stats
+        r4_collectors = r4_stats.setup_r4_stats(
+            model, max_batches=getattr(args, 'r4_stats_batches', 0))
+
     # ---------- Result cache ----------
     cache = None
     if args.cache_path:
@@ -759,7 +790,7 @@ def main():
         logging.info("Evaluating PPL on datasets: {}".format(args.ppl_eval_dataset))
         for dataset in args.ppl_eval_dataset:
             cache_key = f'ppl/{dataset}'
-            if cache and cache.has(cache_key):
+            if cache and cache.has(cache_key) and r4_collectors is None:
                 dataset_ppl = cache.get(cache_key)
                 logging.info(f'{dataset.upper()} PPL: {dataset_ppl:.2f} (cached)')
             else:
@@ -781,6 +812,11 @@ def main():
 
             if args.wandb:
                 wandb.log({'ppl/{}'.format(dataset.upper()): dataset_ppl})
+
+    # ---------- R4 stats save ----------
+    if r4_collectors is not None:
+        import r4_stats
+        r4_stats.save_r4_stats(r4_collectors, args.r4_stats, args)
 
     if args.lm_eval:
         logging.info("Evaluating on downstream tasks: {}".format(args.tasks))

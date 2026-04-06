@@ -191,6 +191,7 @@ class ActQuantizer(torch.nn.Module):
         self.sym = False
         self.clip_ratio = 1.0
         self.residual = False
+        self.stochastic = False
         self.static = False
         # Link to upstream out_quantizer for quantizer→quantizer chain detection
         self.shared_scale_source = None
@@ -270,21 +271,21 @@ class ActQuantizer(torch.nn.Module):
 
         if self.residual:
             if self.sym:
-                tmp_q = sym_quant_dequant(x, self.scale, self.maxq).to(x_dtype)
+                tmp_q = sym_quant_dequant(x, self.scale, self.maxq, stochastic=self.stochastic).to(x_dtype)
 
                 self.find_params(x - tmp_q)  # 为残差重新计算参数
-                residual_q = sym_quant_dequant(x - tmp_q, self.scale, self.maxq).to(x_dtype)
+                residual_q = sym_quant_dequant(x - tmp_q, self.scale, self.maxq, stochastic=self.stochastic).to(x_dtype)
                 result = tmp_q + residual_q
             else:
-                tmp_q = asym_quant_dequant(x, self.scale, self.zero, self.maxq).to(x_dtype)
+                tmp_q = asym_quant_dequant(x, self.scale, self.zero, self.maxq, stochastic=self.stochastic).to(x_dtype)
 
                 self.find_params(x - tmp_q)  # 为残差重新计算参数
-                residual_q = asym_quant_dequant(x - tmp_q, self.scale, self.zero, self.maxq).to(x_dtype)
+                residual_q = asym_quant_dequant(x - tmp_q, self.scale, self.zero, self.maxq, stochastic=self.stochastic).to(x_dtype)
                 result = tmp_q + residual_q
         elif self.sym:
-            result = sym_quant_dequant(x, self.scale, self.maxq).to(x_dtype)
+            result = sym_quant_dequant(x, self.scale, self.maxq, stochastic=self.stochastic).to(x_dtype)
         else:
-            result = asym_quant_dequant(x, self.scale, self.zero, self.maxq).to(x_dtype)
+            result = asym_quant_dequant(x, self.scale, self.zero, self.maxq, stochastic=self.stochastic).to(x_dtype)
 
         if self._sd_check > 0 and self.static and not self._in_sd_check:
             self._compare_sd(x, result)
@@ -562,6 +563,8 @@ class ActQuantWrapper(torch.nn.Module):
         self._calibrating = False
         self._cal_input = None     # post-rotation, pre-quantization
         self._cal_output = None    # post-matmul, pre-output-quantization
+        # R4 stats collector (set by r4_stats.setup_r4_stats())
+        self._r4_collector = None
 
     def prepare_int_gemm(self, w_bits, w_sym=True, w_group_size=-1,
                          acc_bits=32, acc_block_k=32, use_triton=True,
@@ -708,6 +711,11 @@ class ActQuantWrapper(torch.nn.Module):
 
     def forward(self, x):
         x_dtype = x.dtype
+        _r4c = self._r4_collector
+
+        # Point A: raw input (before pre_quantizer/rotation)
+        if _r4c is not None and _r4c.active:
+            _r4c.point_a.update(x)
 
         # Pre-rotation quantization (e.g. quantize input before R4 Hadamard)
         if self.pre_quantizer.bits < 16 or self.pre_quantizer.realint:
@@ -743,6 +751,11 @@ class ActQuantWrapper(torch.nn.Module):
         # Equalization: per-channel scaling (after rotation, before quantization)
         if self.eq_factors is not None:
             x = x / self.eq_factors.to(device=x.device, dtype=x.dtype)
+
+        # Point B: after rotation/equalization, before input quantizer
+        if _r4c is not None and _r4c.active:
+            _r4c.point_b.update(x)
+            _x_pre_quant = x
 
         if self._calibrating:
             self._cal_input = x  # post-rotation/eq, pre-quantization
@@ -834,7 +847,22 @@ class ActQuantWrapper(torch.nn.Module):
                 x = self.quantizer(x).to(x_dtype)
                 self.quantizer.free()
 
+            # Point C: after input quantization, before linear
+            if _r4c is not None and _r4c.active:
+                _r4c.point_c.update(x)
+                _r4c.cross_bc.update(_x_pre_quant, x)
+
             x = self.module(x).to(x_dtype)
+
+        # Point D: output of linear layer + end-to-end SQNR
+        if _r4c is not None and _r4c.active:
+            _r4c.point_d.update(x)
+            # End-to-end SQNR: compare quantized output vs unquantized reference
+            with torch.no_grad():
+                _x_ref = self.module(_x_pre_quant).to(x_dtype)
+            _r4c.cross_ref.update(_x_ref, x)
+            _r4c.batch_count += 1
+            _r4c.check_budget()
 
         if self._calibrating:
             self._cal_output = x  # post-matmul, pre-output-quantization
