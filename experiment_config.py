@@ -219,6 +219,8 @@ def add_quant_args(parser):
                         help='Use stochastic rounding for all activation quantizers (unbiased)')
     parser.add_argument('--ig_compare', action='store_true', default=False,
                         help='Compare int_gemm vs fake-quant per layer (uses fake-quant for PPL)')
+    parser.add_argument('--semi_int_gemm', type=str, default=None,
+                        help='Diagnostic GEMM with toggleable precision stages (bitmask or keyword)')
     parser.add_argument('--quant_out', type=str, default='none',
                         choices=['none', 'up', 'mlp', 'spec', 'speco', 'all', 'r4', 'res', 'mm', 'ex'],
                         help='Output quantization: none (default), up (up_proj only), '
@@ -355,6 +357,10 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
     # ig_compare uses fake-quant path for PPL — different result, needs separate cache
     if getattr(args, 'ig_compare', False) and not (for_gptq_cache or for_cal_cache):
         tag += "_igcmp"
+    # Semi-int GEMM diagnostic (result-only)
+    _sig = getattr(args, 'semi_int_gemm', None)
+    if _sig and not (for_gptq_cache or for_cal_cache):
+        tag += f"_semi-{_sig}"
     return tag
 
 
@@ -459,6 +465,8 @@ def build_quant_args(args):
         cmd.append('--stochastic_quant')
     if getattr(args, 'ig_compare', False):
         cmd.append('--ig_compare')
+    if getattr(args, 'semi_int_gemm', None):
+        cmd += ['--semi_int_gemm', args.semi_int_gemm]
     return cmd
 
 

@@ -543,8 +543,8 @@ def _normalize_bk(tag):
             tag = tag.replace(bk_match.group(1), '').replace('__', '_').strip('_')
         # else bk != g -> keep it (interesting case)
     else:
-        # No bk token -> insert default bk32 after the g token
-        if g_val != "32":
+        # No bk token -> insert default bk32 after the g token (only for intgemm runs)
+        if g_val != "32" and 'intgemm' in tag:
             tag = tag.replace(g_match.group(1), f'{g_match.group(1)}_bk32')
     return tag
 
@@ -674,7 +674,8 @@ def hline(widths, char="─", left="├", mid="┼", right="┤"):
     return left + mid.join(char * w for w in widths) + right
 
 
-def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None):
+def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None,
+                   fast=False):
     """Print a pretty summary table."""
     if not runs:
         print("No result files found.")
@@ -739,6 +740,13 @@ def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None):
         if len(is_ppl) < len(cols):
             is_ppl.append(False)
         matrix.append(row)
+
+    # --fast: keep only PPL columns
+    if fast:
+        n_ppl = len(ppl_datasets)
+        cols = cols[:n_ppl]
+        is_ppl = is_ppl[:n_ppl]
+        matrix = [row[:n_ppl] for row in matrix]
 
     n_cols = len(cols)
     n_runs = len(runs)
@@ -963,6 +971,8 @@ def main():
     parser.add_argument("--draw", type=str, default=None, metavar="METRICS",
                         help="Comma-separated metrics to plot (requires -c). "
                              "E.g.: C4,MMLU,avg")
+    parser.add_argument("-F", "--fast", action="store_true",
+                        help="Show only PPL columns (hide accuracy columns)")
     parser.add_argument("--nbl", "--no-baseline", action="store_true",
                         dest="no_baseline",
                         help="Exclude the FP16 full-precision baseline")
@@ -1037,7 +1047,7 @@ def main():
         runs = [r for r in runs if r[2] != "full"]
 
     print_summary(runs, show_delta=args.delta, compare_expr=args.compare,
-                  draw_metrics=draw_metrics)
+                  draw_metrics=draw_metrics, fast=args.fast)
 
 
 if __name__ == "__main__":

@@ -176,3 +176,21 @@
 [DONE] quarot_eq_r4_v342_ex_down8: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 8 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --eq --quant_out ex
 # noR4, eq
 [DONE] quarot_eq_v342_ex_down8: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 8 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --no_r4 --eq --quant_out ex
+
+# --- semi_int_gemm: isolate precision stages on noR4 (biggest int_gemm gap) ---
+# full (should match int_gemm = INVALID)
+##quarot_v342_ex_semi_full: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --no_r4 --quant_out ex --semi_int_gemm full
+# none (should match no-intgemm = 14.85)
+##quarot_v342_ex_semi_none: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --no_r4 --quant_out ex --semi_int_gemm none
+# only act quantization (bit 0)
+##quarot_v342_ex_semi_100000: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --no_r4 --quant_out ex --semi_int_gemm 100000
+# act quant + int16 decomp (bits 0-1)
+##quarot_v342_ex_semi_110000: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --no_r4 --quant_out ex --semi_int_gemm 110000
+
+# --- semi_int_gemm validation: R4 configs where int_gemm works ---
+# R4 full (should match int_gemm R4 = 14.40)
+quarot_r4_v342_ex_semi_full: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --quant_out ex --semi_int_gemm full
+# R4 none (should match no-intgemm R4 = 14.03)
+[DONE] quarot_r4_v342_ex_semi_none: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --quant_out ex --semi_int_gemm none
+[DONE] quarot_r4_v342_ex_semi_100000: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --quant_out ex --semi_int_gemm 100000
+[DONE] quarot_r4_v342_ex_semi_110000: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 342 --quant_out ex --semi_int_gemm 110000

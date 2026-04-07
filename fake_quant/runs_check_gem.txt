@@ -1,0 +1,29 @@
+# Usage: python run_experiments.py --runfile runs_byow.txt -g 2,3,4
+
+
+[DONE] quarot_ex_gemmint_r4: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --no_r4 --quant_out ex
+[DONE] quarot_ex_fake_r4: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 35 --no_r4 --quant_out ex
+[DONE] quarot_ex_gemmint: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --quant_out ex
+[DONE] quarot_ex_fake: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 35 --quant_out ex
+
+# R4 semi-runs
+[DONE] quarot_r4_ex_semi_full: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --quant_out ex --semi_int_gemm full
+[DONE] quarot_r4_ex_semi_none: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --quant_out ex --semi_int_gemm none
+[DONE] quarot_r4_ex_semi_100000: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --quant_out ex --semi_int_gemm 100000
+[DONE] quarot_r4_ex_semi_110000: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --quant_out ex --semi_int_gemm 110000
+
+# --- semi_int_gemm: isolate precision stages on noR4 (biggest int_gemm gap) ---
+# full (should match int_gemm = INVALID)
+[DONE] quarot_ex_semi_100000: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --no_r4 --quant_out ex --semi_int_gemm 100000
+[DONE] quarot_ex_semi_110000: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --no_r4 --quant_out ex --semi_int_gemm 110000
+[DONE] quarot_ex_semi_full: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --no_r4 --quant_out ex --semi_int_gemm full
+#quarot_ex_semi_111000: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --no_r4 --quant_out ex --semi_int_gemm 111000
+
+# --- block_k sweep: test if smaller act group size closes the fake_quant gap ---
+# noR4: int_gemm with block_k=64,32 (baseline block_k=128 is quarot_ex_gemmint_r4 above)
+[DONE] quarot_ex_gemmint_r4_bk64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 64 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --no_r4 --quant_out ex
+[DONE] quarot_ex_gemmint_r4_bk32: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 32 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --no_r4 --quant_out ex
+# R4: int_gemm with block_k=64,32 (baseline block_k=128 is quarot_ex_gemmint above)
+[DONE] quarot_ex_gemmint_bk64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 64 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --quant_out ex
+[DONE] quarot_ex_gemmint_bk32: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 32 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 35 --quant_out ex
+

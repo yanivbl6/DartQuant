@@ -144,6 +144,13 @@ def parser_gen():
     parser.add_argument('--stochastic_quant', action='store_true', default=False,
                         help='Use stochastic rounding for all activation quantizers (unbiased)')
 
+    # Semi-int GEMM diagnostic kernel
+    parser.add_argument('--semi_int_gemm', type=str, default=None,
+                        help='Diagnostic GEMM with toggleable precision stages. '
+                             'Bitmask string (e.g. "111111"=int_gemm, "000000"=float) '
+                             'or keywords: full, none. '
+                             'Bits: act_quant|int16_decomp|dot_round|acc_cap|wzp_round|t2_int')
+
     # R4 diagnostic stats
     parser.add_argument('--r4_stats', type=str, default=None,
                         help='Collect R4 diagnostic stats on down_proj and save JSON to this path')

@@ -152,6 +152,7 @@ LATE_ROT4=0
 R4_STATS=""
 R4_STATS_BATCHES=0
 STOCHASTIC_QUANT=0
+SEMI_INT_GEMM=""
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -202,6 +203,7 @@ while [[ $# -gt 0 ]]; do
         --r4_stats)    R4_STATS="$2";      shift 2 ;;
         --r4_stats_batches) R4_STATS_BATCHES="$2"; shift 2 ;;
         --stochastic_quant) STOCHASTIC_QUANT=1; shift ;;
+        --semi_int_gemm) SEMI_INT_GEMM="$2"; shift 2 ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
@@ -390,6 +392,11 @@ if [ "$STOCHASTIC_QUANT" == "1" ]; then
     STOCHASTIC_QUANT_FLAG="--stochastic_quant"
 fi
 
+SEMI_INT_GEMM_FLAG=""
+if [ -n "$SEMI_INT_GEMM" ]; then
+    SEMI_INT_GEMM_FLAG="--semi_int_gemm ${SEMI_INT_GEMM}"
+fi
+
 R4_STATS_FLAG=""
 if [ -n "$R4_STATS" ]; then
     mkdir -p "$(dirname "$R4_STATS")"
@@ -450,6 +457,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ "$LATE_ROT4" == "1" ] && TAG_ARGS="${TAG_ARGS} --late_rot4"
 [ "$STOCHASTIC_QUANT" == "1" ] && TAG_ARGS="${TAG_ARGS} --stochastic_quant"
 [ "$IG_COMPARE" == "1" ] && TAG_ARGS="${TAG_ARGS} --ig_compare"
+[ -n "$SEMI_INT_GEMM" ] && TAG_ARGS="${TAG_ARGS} --semi_int_gemm ${SEMI_INT_GEMM}"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
 QUANT_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS})
@@ -593,6 +601,7 @@ python main_for_test.py \
     ${LATE_ROT4_FLAG} \
     ${R4_STATS_FLAG} \
     ${STOCHASTIC_QUANT_FLAG} \
+    ${SEMI_INT_GEMM_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     $([ "$NO_R4" == "1" ] && echo "--no_r4") \

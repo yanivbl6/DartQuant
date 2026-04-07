@@ -540,6 +540,9 @@ class ActQuantWrapper(torch.nn.Module):
         # Integer GEMM with capped accumulator
         self.use_int_gemm = False
         self._ig_compare = False  # compare int_gemm vs float GEMM
+        # Semi-int GEMM diagnostic kernel
+        self.use_semi_int_gemm = False
+        self.semi_int_mask = '111111'
         self.acc_bits = 32
         self.acc_block_k = 32
         self.acc_wrap = False
@@ -840,6 +843,22 @@ class ActQuantWrapper(torch.nn.Module):
                         print(f"[ig_cmp] {q._sd_name}: err={full_err:.2e}  (no w_zp)", flush=True)
 
                 x = x_fq  # use float path for correct PPL
+        elif self.use_semi_int_gemm:
+            # Semi-int GEMM diagnostic path
+            from semi_int_gemm import semi_int_gemm
+            x = semi_int_gemm(
+                x, self.w_int, self.w_scale,
+                self.quantizer, self.semi_int_mask,
+                acc_bits=self.acc_bits, block_k=self.acc_block_k,
+                w_group_size=self.w_group_size, bias=self.bias,
+                acc_wrap=self.acc_wrap, w_zp=self.w_zp,
+                acc_dtype=getattr(self, 'acc_dtype', 'float'),
+                w_shift_bias=getattr(self, 'w_shift_bias', 0),
+                w_zp_correction=self.w_zp_correction,
+                w_zp_cross=self.w_zp_cross,
+            ).to(x_dtype)
+            if self.quantizer.static and self.static_zp_bias is not None:
+                x = x + self.static_zp_bias.to(device=x.device, dtype=x.dtype)
         else:
             # Original fake-quant path
             if self.quantizer.bits < 16 or self.quantizer.realint:  # Quantize, if needed

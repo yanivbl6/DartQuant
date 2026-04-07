@@ -220,7 +220,7 @@ def _parse_runfile_line_args(tokens):
 _IGNORE_FLAGS = {'--static-act', '--fast', '-F', '--very-fast', '--overwrite',
                  '--stochastic_quant', '--ig_compare'}
 # Flags with a value argument that should be stripped for calibration
-_IGNORE_FLAGS_WITH_VALUE = {'--r4_stats', '--r4_stats_batches'}
+_IGNORE_FLAGS_WITH_VALUE = {'--r4_stats', '--r4_stats_batches', '--semi_int_gemm'}
 
 
 def _filter_runtime_flags(tokens):

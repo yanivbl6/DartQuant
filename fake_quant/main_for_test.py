@@ -529,6 +529,16 @@ def main():
                     qlayer.quantizer._sd_logged_first = False
             logging.info("ig_compare enabled: will compare int_gemm vs float GEMM per layer")
 
+        if getattr(args, 'semi_int_gemm', None):
+            from semi_int_gemm import parse_mask, describe_mask
+            _semi_mask = parse_mask(args.semi_int_gemm)
+            logging.info("Semi-int GEMM enabled: mask=%s (%s)", _semi_mask, describe_mask(_semi_mask))
+            for name, qlayer in qlayers_ig.items():
+                if qlayer.use_int_gemm:
+                    qlayer.use_int_gemm = False
+                    qlayer.use_semi_int_gemm = True
+                    qlayer.semi_int_mask = _semi_mask
+
     if args.k_bits < 16 or getattr(args, 'realint', False):
         logging.info("Add k quantization: k_bits={}, k_groupsize={}, k_sym={}, k_clip_ratio={}".format(
             args.k_bits, args.k_groupsize, not (args.k_asym), args.k_clip_ratio))
@@ -641,7 +651,7 @@ def main():
         qlayers_pg = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
         n_converted = 0
         for name, qlayer in qlayers_pg.items():
-            if not getattr(qlayer, 'use_int_gemm', False):
+            if not (getattr(qlayer, 'use_int_gemm', False) or getattr(qlayer, 'use_semi_int_gemm', False)):
                 continue
             q = qlayer.quantizer
             if not q.static:
@@ -675,11 +685,11 @@ def main():
             q.groupsize = G
             n_converted += 1
         if n_converted:
-            logging.info("Converted %d int_gemm quantizers to per-group scales "
+            logging.info("Converted %d int_gemm/semi_int_gemm quantizers to per-group scales "
                          "(group_size=%d)", n_converted, G)
             # Precompute static zero-point correction for asymmetric per-group mode
             for name, qlayer in qlayers_pg.items():
-                if getattr(qlayer, 'use_int_gemm', False) and qlayer.quantizer.static:
+                if (getattr(qlayer, 'use_int_gemm', False) or getattr(qlayer, 'use_semi_int_gemm', False)) and qlayer.quantizer.static:
                     qlayer.compute_static_zp_bias()
 
     # --- Selective dynamic: revert matching layers from static to dynamic ---

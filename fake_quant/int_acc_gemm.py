@@ -251,7 +251,7 @@ def _t2_acc_dtype_info(acc_dtype_str):
     For float types: returns (torch_dtype, None, None).
     For int types: returns (torch.int64, max_val, min_val) — int64 storage with clamping.
     """
-    kind, bits, _frac, _mode = parse_acc_dtype(acc_dtype_str)
+    kind, bits, _frac = parse_acc_dtype(acc_dtype_str)
     if kind == 'int':
         max_val = 2 ** (bits - 1) - 1
         min_val = -max_val - 1
