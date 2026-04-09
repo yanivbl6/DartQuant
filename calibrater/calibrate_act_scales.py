@@ -554,6 +554,10 @@ Examples:
     parser.add_argument('--realint', action='store_true',
                         help='Force real integer quantize/dequantize even at 16 bits')
 
+    # Hardware-aligned activation scales
+    parser.add_argument('--hw_align', action='store_true', default=False,
+                        help='Tag calibration for hardware-aligned per-group scales')
+
     # Output quantization
     parser.add_argument('--quant_out', type=str, default='none',
                         choices=['none', 'up', 'mlp', 'spec', 'speco', 'all', 'r4', 'res', 'mm', 'ex'],

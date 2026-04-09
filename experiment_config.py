@@ -221,6 +221,8 @@ def add_quant_args(parser):
                         help='Compare int_gemm vs fake-quant per layer (uses fake-quant for PPL)')
     parser.add_argument('--semi_int_gemm', type=str, default=None,
                         help='Diagnostic GEMM with toggleable precision stages (bitmask or keyword)')
+    parser.add_argument('--hw_align', action='store_true', default=False,
+                        help='Hardware-aligned activation scales (per-group instead of per-column)')
     parser.add_argument('--quant_out', type=str, default='none',
                         choices=['none', 'up', 'mlp', 'spec', 'speco', 'all', 'r4', 'res', 'mm', 'ex'],
                         help='Output quantization: none (default), up (up_proj only), '
@@ -347,6 +349,9 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
     # Real integer quantization tag
     if getattr(args, 'realint', False):
         tag += "_RINT"
+    # Hardware-aligned activation scales (affects calibration + result, not GPTQ)
+    if getattr(args, 'hw_align', False) and not for_gptq_cache:
+        tag += "_aligned"
     # Output quantization tag (activation-side, not relevant for GPTQ cache)
     _qo = getattr(args, 'quant_out', 'none')
     if _qo != 'none' and not for_gptq_cache:
@@ -467,6 +472,8 @@ def build_quant_args(args):
         cmd.append('--ig_compare')
     if getattr(args, 'semi_int_gemm', None):
         cmd += ['--semi_int_gemm', args.semi_int_gemm]
+    if getattr(args, 'hw_align', False):
+        cmd.append('--hw_align')
     return cmd
 
 

@@ -563,6 +563,42 @@ def main():
                     if hasattr(layer.self_attn, wrapper_attr):
                         getattr(layer.self_attn, wrapper_attr).k_quantizer.realint = True
 
+    # --- Override calibration path when semi_int_gemm bit 8 (fq_cal) is set ---
+    if getattr(args, 'semi_int_gemm', None) and args.act_scales_path:
+        from semi_int_gemm import parse_mask as _parse_semi_mask, MASK_FQ_CAL, _bit as _semi_bit
+        _semi_mask_check = _parse_semi_mask(args.semi_int_gemm)
+        if _semi_bit(_semi_mask_check, MASK_FQ_CAL):
+            # Strip _intgemm... segment from the calibration filename to get
+            # the fake-quant calibration path.  The int_gemm segment matches:
+            #   _intgemm[_acc\d+][_bk\d+][_wrap][_t2...]
+            # and sits between the base tag and subsequent suffixes like _v35, _RINT, etc.
+            import re
+            _orig_cal = args.act_scales_path
+            _fqcal_path = re.sub(r'_intgemm(?:_acc\d+)?(?:_bk\d+)?(?:_wrap)?(?:_t2[A-Za-z0-9]+)?', '', _orig_cal)
+            if _fqcal_path != _orig_cal and os.path.isfile(_fqcal_path):
+                logging.warning("fq_cal: overriding calibration from int_gemm to fake_quant")
+                logging.warning("  int_gemm cal: %s", _orig_cal)
+                logging.warning("  fake_quant cal: %s", _fqcal_path)
+                # Compare keys between the two calibration files
+                _ig_scales = torch.load(_orig_cal, map_location='cpu', weights_only=True)
+                _fq_scales = torch.load(_fqcal_path, map_location='cpu', weights_only=True)
+                _ig_keys = set(_ig_scales.keys())
+                _fq_keys = set(_fq_scales.keys())
+                if _ig_keys != _fq_keys:
+                    _only_ig = _ig_keys - _fq_keys
+                    _only_fq = _fq_keys - _ig_keys
+                    logging.warning("  KEY MISMATCH: only in int_gemm cal: %s", _only_ig or '(none)')
+                    logging.warning("  KEY MISMATCH: only in fake_quant cal: %s", _only_fq or '(none)')
+                else:
+                    logging.info("  calibration keys match (%d entries)", len(_fq_keys))
+                del _ig_scales
+                args.act_scales_path = _fqcal_path
+            elif _fqcal_path == _orig_cal:
+                logging.warning("fq_cal: no _intgemm segment found in cal path, using as-is: %s", _orig_cal)
+            else:
+                logging.error("fq_cal: fake_quant calibration not found: %s", _fqcal_path)
+                logging.error("  falling back to int_gemm calibration: %s", _orig_cal)
+
     # Load pre-calibrated static activation scales
     if args.act_scales_path:
         logging.info("Loading static activation scales from: {}".format(args.act_scales_path))
@@ -635,6 +671,57 @@ def main():
                     pwl_mod.output_quantizer.static = True
 
         logging.info("Static activation scales applied to all quantizers.")
+
+    # --- Hardware-aligned activation scales: convert ALL static quantizers to per-group ---
+    if getattr(args, 'hw_align', False) and args.act_scales_path:
+        _hw_G = args.w_groupsize if args.w_groupsize > 0 else 128
+        n_hw_aligned = 0
+
+        def _try_align(q, label):
+            """Align a single quantizer's scales if it's static and active."""
+            nonlocal n_hw_aligned
+            if not q.static or (q.bits >= 16 and not q.realint):
+                return
+            s, z = quant_utils.align_scales_to_groups(
+                q.scale, q.zero, q.maxq, _hw_G, q.sym)
+            q.scale = s
+            q.zero = z
+            n_hw_aligned += 1
+
+        # 1. ActQuantWrapper quantizers (input, output, pre-R4)
+        qlayers_hw = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        for name, qlayer in qlayers_hw.items():
+            _try_align(qlayer.quantizer, f'{name}.quantizer')
+            _try_align(qlayer.out_quantizer, f'{name}.out_quantizer')
+            _try_align(qlayer.pre_quantizer, f'{name}.pre_quantizer')
+
+        # 2. QKRotationWrapper quantizers (K-cache, Q)
+        layers_hw = model_utils.get_layers(model)
+        for i, layer in enumerate(layers_hw):
+            rope_fn = model_utils.get_rope_function_name(model)
+            wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
+            if hasattr(layer.self_attn, wrapper_attr):
+                wrapper = getattr(layer.self_attn, wrapper_attr)
+                _try_align(wrapper.k_quantizer, f'layer.{i}.k_quantizer')
+                if hasattr(wrapper, 'q_quantizer'):
+                    _try_align(wrapper.q_quantizer, f'layer.{i}.q_quantizer')
+
+        # 3. Residual quantizers
+        for i, layer in enumerate(layers_hw):
+            for tag in ('_attn_res_quantizer', '_mlp_res_quantizer'):
+                rq = getattr(layer, tag, None)
+                if rq is not None:
+                    _try_align(rq, f'layer.{i}.{tag}')
+
+        # 4. PWL quantizers
+        if getattr(args, 'pwl_act', False):
+            import pwl_utils
+            for name, pwl_mod in pwl_utils.find_pwl_activations(model).items():
+                _try_align(pwl_mod.input_quantizer, f'{name}.input_quantizer')
+                _try_align(pwl_mod.output_quantizer, f'{name}.output_quantizer')
+
+        logging.info("hw_align: converted %d static quantizers to per-group scales "
+                     "(group_size=%d)", n_hw_aligned, _hw_G)
 
     # Convert per-column static scales to per-group for int_gemm layers.
     # Per-column scales can't factor out of a dot product.  Per-group scales

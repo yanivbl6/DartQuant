@@ -151,6 +151,13 @@ def parser_gen():
                              'or keywords: full, none. '
                              'Bits: act_quant|int16_decomp|dot_round|acc_cap|wzp_round|t2_int')
 
+    # Hardware-aligned activation scales
+    parser.add_argument('--hw_align', action='store_true', default=False,
+                        help='Convert all static activation scales to per-group '
+                             '(aligned with --w_groupsize). Makes fake_quant '
+                             'hardware-accurate by ensuring scales factor out of '
+                             'dot products.')
+
     # R4 diagnostic stats
     parser.add_argument('--r4_stats', type=str, default=None,
                         help='Collect R4 diagnostic stats on down_proj and save JSON to this path')
