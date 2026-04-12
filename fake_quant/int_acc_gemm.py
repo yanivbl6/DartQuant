@@ -194,9 +194,11 @@ if _HAS_TRITON:
             # Accumulate in tier-2 dtype
             if T2_IS_INT:
                 if T2_FRAC_BITS > 0:
-                    acc += (contrib * T2_FRAC_SCALE).to(tl.int32)
+                    scaled = contrib * T2_FRAC_SCALE
                 else:
-                    acc += contrib.to(tl.int32)
+                    scaled = contrib
+                # Round-to-nearest (not truncate) for faithful fixed-point
+                acc += (scaled + tl.where(scaled >= 0, 0.5, -0.5)).to(tl.int32)
                 # Clamp to tier-2 accumulator range
                 acc = tl.minimum(tl.maximum(acc, T2_MIN), T2_MAX)
             elif T2_IS_FP16:

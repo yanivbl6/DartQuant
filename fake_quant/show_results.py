@@ -898,6 +898,27 @@ def _find_best_baseline(model_name, matched_paths):
     return [c for s, c in scored if s == best_score]
 
 
+def _split_respecting_brackets(s, delim):
+    """Split string on *delim*, but not inside ``[...]`` brackets."""
+    parts = []
+    depth = 0
+    current = []
+    for ch in s:
+        if ch == '[':
+            depth += 1
+            current.append(ch)
+        elif ch == ']':
+            depth -= 1
+            current.append(ch)
+        elif ch == delim and depth == 0:
+            parts.append(''.join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append(''.join(current))
+    return parts
+
+
 def _match_filter(filename, expr):
     """Test whether *filename* matches a filter expression.
 
@@ -906,8 +927,13 @@ def _match_filter(filename, expr):
         a*b              glob-style wildcard within a term
         a,b              AND  (all terms must match)
         a|b              NOT  (b must NOT match)
+        [a,b|c]          OR-group  (at least one condition must hold)
 
-    Example: "static,pwl|w8"  means  must contain 'static' AND 'pwl' but NOT 'w8'
+    Inside brackets, ``,`` means OR and ``|`` means OR-NOT:
+        [t2int32,t2int24|t2]  →  t2int32 OR t2int24 OR (NOT t2)
+
+    Example: "g128,[t2int32,t2int24|t2]"
+        must contain 'g128' AND (contain 't2int32' OR 't2int24' OR NOT 't2')
 
     Multiple CLI arguments are joined with AND automatically.
     """
@@ -923,19 +949,45 @@ def _match_filter(filename, expr):
             return fnmatch.fnmatch(name, f'*{term}*')
         return term in name
 
-    # Split on | first to separate include terms from exclude terms
-    parts = expr.lower().split('|')
+    def _eval_bracket_group(content):
+        """Evaluate ``[a,b|c]`` → True if any include matches OR any exclude
+        does NOT match."""
+        parts = content.split('|')
+        inc_terms = [t.strip() for t in parts[0].split(',') if t.strip()]
+        exc_parts = parts[1:]
+
+        # Any include term matching is enough
+        if any(_term_matches(t) for t in inc_terms):
+            return True
+
+        # Any exclude term NOT present counts as a pass
+        for exc in exc_parts:
+            for t in exc.split(','):
+                t = t.strip()
+                if t and not _term_matches(t):
+                    return True
+
+        return False
+
+    # Split on | first (respecting brackets) to separate include/exclude
+    parts = _split_respecting_brackets(expr.lower(), '|')
     include_expr = parts[0]           # everything before the first |
     exclude_terms = parts[1:]         # everything after each |
 
-    # Include: split on commas for AND
-    include_terms = [t.strip() for t in include_expr.split(',') if t.strip()]
-    if not include_terms:
+    # Include: split on commas (respecting brackets) for AND
+    and_terms = [t.strip() for t in _split_respecting_brackets(include_expr, ',')
+                 if t.strip()]
+    if not and_terms:
         return True
 
-    # All include terms must match
-    if not all(_term_matches(t) for t in include_terms):
-        return False
+    # All AND terms must match; bracket groups use OR semantics internally
+    for term in and_terms:
+        if term.startswith('[') and term.endswith(']'):
+            if not _eval_bracket_group(term[1:-1]):
+                return False
+        else:
+            if not _term_matches(term):
+                return False
 
     # No exclude term may match
     for exc in exclude_terms:
@@ -958,6 +1010,7 @@ def main():
   python show_results.py "static,pwl"              # AND: *static* AND *pwl*
   python show_results.py "dart|static"             # NOT: *dart* but NOT *static*
   python show_results.py "static,pwl|w8"           # AND+NOT: *static* AND *pwl* but NOT *w8*
+  python show_results.py "g128,[t2int32,t2int24|t2]"  # OR-group: g128 AND (t2int32 OR t2int24 OR NOT t2)
   python show_results.py "static*pwl"              # glob: *static*pwl*
   python show_results.py --nbl                     # exclude FP16 baseline
   python show_results.py -d                        # show delta vs FP16 baseline

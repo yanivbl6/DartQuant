@@ -147,9 +147,6 @@ def _dequant_weights(w_int, w_scale, w_group_size, w_zp, K):
 # Main kernel
 # ---------------------------------------------------------------------------
 
-_recon_logged = set()  # track which layers have been logged
-
-
 def semi_int_gemm(
     x_float: torch.Tensor,
     w_int: torch.Tensor,
@@ -194,43 +191,11 @@ def semi_int_gemm(
 
         x_dtype = x_float.dtype
         x_out = x_float
-
-        # --- Diagnostic: log state on first call per layer shape ---
-        _sanity_key = (N, K)
-        if _sanity_key not in _recon_logged:
-            _recon_logged.add(_sanity_key)
-            logging.warning(
-                "[SANITY] shape=[%d,%d] x_dtype=%s q.bits=%d q.realint=%s "
-                "q.static=%s q.groupsize=%d q.scale=%s(%s) "
-                "module.weight=%s(%s) x_in: mean=%.4e max=%.4e",
-                N, K, x_dtype, q.bits, q.realint,
-                q.static, q.groupsize,
-                list(q.scale.shape) if q.scale is not None else 'None',
-                q.scale.dtype if q.scale is not None else '-',
-                list(module.weight.shape), module.weight.dtype,
-                x_float.float().abs().mean().item(),
-                x_float.float().abs().max().item())
-
         if q.bits < 16 or q.realint:
             x_out = q(x_out).to(x_dtype)
             q.free()
-
         assert module is not None, "sanity mode requires module= to be passed"
-
-        # --- Diagnostic: check for NaN/Inf after quantizer ---
-        if _sanity_key in _recon_logged and x_out.isnan().any():
-            logging.error("[SANITY] NaN AFTER quantizer! shape=[%d,%d]", N, K)
-        if _sanity_key in _recon_logged and x_out.isinf().any():
-            logging.error("[SANITY] Inf AFTER quantizer! shape=[%d,%d]", N, K)
-
         x_out = module(x_out).to(x_dtype)
-
-        # --- Diagnostic: check output ---
-        if (N, K) in _recon_logged:
-            _mn = x_out.float().abs().mean().item()
-            _mx = x_out.float().abs().max().item()
-            if _mn != _mn or _mx > 1e6:  # NaN or huge
-                logging.error("[SANITY] BAD output! shape=[%d,%d] mean=%.4e max=%.4e", N, K, _mn, _mx)
 
         # Restore quantizer state
         q.groupsize = _saved_gs
@@ -334,105 +299,6 @@ def semi_int_gemm(
 
         # Dequant weights
         w_float = _dequant_weights(w_int, w_scale, w_group_size, w_zp, K)
-
-        # --- A/B diagnostic (once per layer shape) ---
-        _layer_key = (N, K)
-        if _layer_key not in _recon_logged:
-            _recon_logged.add(_layer_key)
-            # Weight reconstruction check
-            if module_weight is not None:
-                W_ref = module_weight.float()
-                w_err = (w_float - W_ref).abs()
-                print(f"[DIAG w] shape=[{N},{K}]  w_err_max={w_err.max().item():.4e}  "
-                      f"w_err_mean={w_err.mean().item():.4e}  w_ref={W_ref.abs().mean().item():.4e}  "
-                      f"w_scale={w_scale.dtype}  w_zp={w_zp.dtype if w_zp is not None else None}",
-                      flush=True)
-
-            # Activation quantization check: compare quantize_to_int vs quantizer.forward()
-            q = act_quantizer
-            _saved_gs = getattr(q, 'groupsize', -1)
-            _saved_sc = q.scale.clone() if q.scale is not None else None
-            _saved_zr = q.zero.clone() if q.zero is not None else None
-
-            # Print scales BEFORE restoring
-            _q2i_scale = q.scale.to(x_2d.device).float()
-            print(f"[DIAG s] shape=[{M},{K}]  bits={q.bits}  gs={_saved_gs}  "
-                  f"q2i_scale: shape={list(_q2i_scale.shape)}  "
-                  f"min={_q2i_scale.min().item():.6e}  max={_q2i_scale.max().item():.6e}  "
-                  f"mean={_q2i_scale.mean().item():.6e}",
-                  flush=True)
-
-            if _saved_gs > 0 and q.static:
-                q.scale = q.scale.to(x_2d.device).repeat_interleave(_saved_gs)[:K]
-                if q.zero is not None and q.zero.numel() > 0:
-                    q.zero = q.zero.to(x_2d.device).repeat_interleave(_saved_gs)[:K]
-                q.groupsize = -1
-
-            # Print scales AFTER restoring
-            _fq_scale = q.scale.to(x_2d.device).float()
-            print(f"[DIAG s] shape=[{M},{K}]  bits={q.bits}  gs={q.groupsize}  "
-                  f"fq_scale:  shape={list(_fq_scale.shape)}  "
-                  f"min={_fq_scale.min().item():.6e}  max={_fq_scale.max().item():.6e}  "
-                  f"mean={_fq_scale.mean().item():.6e}",
-                  flush=True)
-
-            # Run forward in float32
-            if q.bits < 16 or q.realint:
-                a_ref_f32 = q(x_float.float()).float()
-                q.free()
-            else:
-                a_ref_f32 = x_float.float()
-            q.groupsize = _saved_gs
-            q.scale = _saved_sc
-            q.zero = _saved_zr
-            a_ref_2d = a_ref_f32.reshape(-1, K)
-
-            # Also compute quantize_to_int result in float32 for comparison
-            a_q2i_f32 = a_work.clone()  # int values as float
-            if use_act_groups and a_group_scale is not None:
-                _G = a_group_size
-                a_q2i_dq = a_q2i_f32.reshape(M, -1, _G) * a_group_scale[None, :, None]
-                a_q2i_dq = a_q2i_dq.reshape(M, K)
-            else:
-                a_q2i_dq = a_q2i_f32 * a_token_scale.unsqueeze(1) if a_token_scale.numel() > 0 else a_q2i_f32
-
-            a_err = (a_q2i_dq - a_ref_2d).abs()
-            # Find worst element
-            _worst_idx = a_err.argmax().item()
-            _wm, _wk = _worst_idx // K, _worst_idx % K
-            _wg = _wk // a_group_size if (use_act_groups and a_group_size > 0) else -1
-            _wi = _wk % a_group_size if (use_act_groups and a_group_size > 0) else _wk
-            # Manual replication of quantize_to_int for this one element
-            _x_val = x_2d[_wm, _wk].float()
-            _s_val = a_group_scale[_wg].float()
-            _manual_div = _x_val / _s_val
-            _manual_round = torch.round(_manual_div)
-            # Also check what quantize_to_int ACTUALLY computed via the grouped path
-            _x_grouped_check = x_2d.reshape(M, -1, a_group_size)
-            _x_at_pos = _x_grouped_check[_wm, _wg, _wi].float()
-            _div_at_pos = _x_at_pos / _s_val
-            print(f"[DIAG a] shape=[{M},{K}]  bits={q.bits}  "
-                  f"act_err_max={a_err.max().item():.4e}  "
-                  f"worst@[{_wm},{_wk}](g={_wg},i={_wi}): "
-                  f"a_int={a_work[_wm,_wk].item():.0f}  "
-                  f"scale={_s_val.item():.6e}  "
-                  f"x={_x_val.item():.6e}  "
-                  f"x_grouped={_x_at_pos.item():.6e}  "
-                  f"div={_manual_div.item():.6f}  "
-                  f"round={_manual_round.item():.0f}  "
-                  f"div_grouped={_div_at_pos.item():.6f}  "
-                  f"fq={a_ref_2d[_wm,_wk].item():.6e}",
-                  flush=True)
-
-            # Also compare full outputs (both float32, using module.weight for both)
-            if module is not None and module_weight is not None:
-                W_f32 = module_weight.float()
-                out_ref = (a_ref_2d @ W_f32.t())
-                out_q2i = (a_q2i_dq @ W_f32.t())
-                o_err = (out_q2i - out_ref).abs()
-                print(f"[DIAG o] shape=[{M},{N}]  out_err_max={o_err.max().item():.4e}  "
-                      f"out_err_mean={o_err.mean().item():.4e}  out_ref={out_ref.abs().mean().item():.4e}",
-                      flush=True)
 
         output = a_fq @ w_float.t()
         if bias is not None:

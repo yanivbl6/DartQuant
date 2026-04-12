@@ -273,7 +273,7 @@ def parse_runfile(path):
     with open(path) as f:
         for i, raw in enumerate(f):
             line = raw.strip()
-            if not line or line.startswith('#'):
+            if not line or line.startswith('#') or line.startswith(';'):
                 continue
             if line.startswith('[DONE]') or line.startswith('[ERROR]'):
                 continue

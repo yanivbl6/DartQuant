@@ -55,3 +55,47 @@
 # acc16 wrap (existing = INVALID, for reference)
 # acc24 wrap: bigger accumulator with wrapping
 [DONE] quarot_ex_gemmint_r4_acc24_wrap: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 24 --acc_dtype fp32 --acc_wrap --realint --sim_version 36 --no_r4 --quant_out ex
+
+# === acc_block_k=64 sweep: smaller blocks to reduce overflow ===
+# noR4, hw_align
+[DONE] quarot_ex_fake_r4_aligned_bk64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 36 --no_r4 --quant_out ex --hw_align
+[DONE] quarot_ex_gemmint_r4_aligned_bk64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 64 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 36 --no_r4 --quant_out ex --hw_align
+# R4, hw_align
+[DONE] quarot_ex_fake_aligned_bk64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 36 --quant_out ex --hw_align
+[DONE] quarot_ex_gemmint_aligned_bk64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 64 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 36 --quant_out ex --hw_align
+# noR4 + eq, hw_align
+[DONE] quarot_ex_eq_fake_r4_aligned_bk64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 36 --no_r4 --quant_out ex --hw_align --eq
+[DONE] quarot_ex_eq_gemmint_r4_aligned_bk64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 64 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 36 --no_r4 --quant_out ex --hw_align --eq
+# R4 + eq, hw_align
+[DONE] quarot_ex_eq_fake_aligned_bk64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 36 --quant_out ex --hw_align --eq
+[DONE] quarot_ex_eq_gemmint_aligned_bk64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 64 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 36 --quant_out ex --hw_align --eq
+
+# === v361: in-kernel activation ZP correction ===
+# noR4 acc16 wrap (was INVALID, main target)
+[DONE] quarot_ex_gemmint_r4_v361: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 361 --no_r4 --quant_out ex
+# noR4 acc16 saturate (was INVALID)
+[DONE] quarot_ex_gemmint_r4_acc16sat_v361: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --realint --sim_version 361 --no_r4 --quant_out ex
+# noR4 acc32 (was 14.04, should stay same — regression check)
+[DONE] quarot_ex_gemmint_r4_acc32_v361: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 32 --acc_dtype fp32 --realint --sim_version 361 --no_r4 --quant_out ex
+# noR4 semi full (was INVALID)
+[DONE] quarot_ex_semi_full_r4_v361: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 361 --no_r4 --quant_out ex --semi_int_gemm full
+# R4 acc16 wrap (was 14.39, should stay same — regression check)
+[DONE] quarot_ex_gemmint_v361: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 361 --quant_out ex
+# noR4 fake_quant baseline (no int_gemm, for comparison)
+[DONE] quarot_ex_fake_r4_v361: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 361 --no_r4 --quant_out ex
+# noR4 + eq acc16 wrap (was 15.21, should stay or improve)
+[DONE] quarot_ex_eq_gemmint_r4_v361: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 128 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 128 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 361 --no_r4 --quant_out ex --eq
+
+# === G=64 sweep: smaller blocks to reduce overflow ===
+# noR4, hw_align
+[DONE] quarot_ex_fake_r4_aligned_G64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 64 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 36 --no_r4 --quant_out ex --hw_align
+[DONE] quarot_ex_gemmint_r4_aligned_G64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 64 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 64 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 36 --no_r4 --quant_out ex --hw_align
+# R4, hw_align
+[DONE] quarot_ex_fake_aligned_G64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 64 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 36 --quant_out ex --hw_align
+[DONE] quarot_ex_gemmint_aligned_G64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 64 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 64 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 36 --quant_out ex --hw_align
+# noR4 + eq, hw_align
+[DONE] quarot_ex_eq_fake_r4_aligned_G64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 64 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 36 --no_r4 --quant_out ex --hw_align --eq
+[DONE] quarot_ex_eq_gemmint_r4_aligned_G64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 64 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 64 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 36 --no_r4 --quant_out ex --hw_align --eq
+# R4 + eq, hw_align
+[DONE] quarot_ex_eq_fake_aligned_G64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 64 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --realint --sim_version 36 --quant_out ex --hw_align --eq
+[DONE] quarot_ex_eq_gemmint_aligned_G64: quarot -m 1b --static-act -w 4 -a 8 -k 8 -v 8 -G 64 --w_asym --kv_ex 8 --down_bits 16 --imitate_gguf Q4_K_S --int_gemm --acc_block_k 64 --acc_bits 16 --acc_dtype fp32 --acc_wrap --realint --sim_version 36 --quant_out ex --hw_align --eq

@@ -338,11 +338,6 @@ class ActQuantizer(torch.nn.Module):
         if self.static and self.groupsize > 0:
             # Per-group static scales, pre-derived from per-column calibration.
             # self.scale is [n_groups] (set during setup in main_for_test.py).
-            if not hasattr(self, '_q2i_path_logged'):
-                self._q2i_path_logged = True
-                print(f"[Q2I PATH] per-group: K={K} bits={self.bits} gs={self.groupsize} "
-                      f"scale.shape={list(self.scale.shape)} scale.dtype={self.scale.dtype}",
-                      flush=True)
             G = self.groupsize
             n_groups = K // G
             group_scale = self.scale.to(dev)  # [n_groups]
@@ -356,32 +351,6 @@ class ActQuantizer(torch.nn.Module):
                     torch.round(x_grouped / group_scale[None, :, None]),
                     -(self.maxq + 1), self.maxq)
                 q_int = q_grouped.reshape(M, K).to(_int_dtype)
-                # --- Debug: check round-trip integrity ---
-                if not hasattr(self, '_q2i_cast_checked'):
-                    self._q2i_cast_checked = True
-                    import sys; print(f"[Q2I ENTERING CAST CHECK] K={K} bits={self.bits}", file=sys.stderr, flush=True)
-                    _q_f32 = q_grouped.reshape(M, K)
-                    _q_back = q_int.float()
-                    _rt_err = (_q_back - _q_f32).abs()
-                    _rt_max = _rt_err.max().item()
-                    import sys
-                    if _rt_max > 0:
-                        _wi2 = _rt_err.argmax().item()
-                        _wm2, _wk2 = _wi2 // K, _wi2 % K
-                        print(f"[Q2I CAST ERR] K={K} bits={self.bits} "
-                              f"maxq={self.maxq.item()} "
-                              f"q_range=[{_q_f32.min().item():.0f},{_q_f32.max().item():.0f}] "
-                              f"int_range=[{q_int.min().item()},{q_int.max().item()}] "
-                              f"cast_err={_rt_max:.1f} "
-                              f"worst@[{_wm2},{_wk2}]: "
-                              f"pre_cast={_q_f32[_wm2,_wk2].item():.1f} "
-                              f"post_cast={_q_back[_wm2,_wk2].item():.1f}",
-                              file=sys.stderr, flush=True)
-                    else:
-                        print(f"[Q2I OK] K={K} bits={self.bits} "
-                              f"q_range=[{_q_f32.min().item():.0f},{_q_f32.max().item():.0f}] "
-                              f"cast_err=0",
-                              file=sys.stderr, flush=True)
             else:
                 # Asymmetric: quantize to [0, maxq], shift to signed range
                 q_grouped = torch.clamp(
@@ -398,11 +367,6 @@ class ActQuantizer(torch.nn.Module):
         if self.static:
             # Per-tensor static scale (groupsize <= 0 fallback).
             # Collapse per-column scales to a single scalar = max over columns.
-            if not hasattr(self, '_q2i_path_logged'):
-                self._q2i_path_logged = True
-                print(f"[Q2I PATH] per-tensor FALLBACK: K={K} bits={self.bits} gs={self.groupsize} "
-                      f"scale.shape={list(self.scale.shape)} scale.dtype={self.scale.dtype}",
-                      flush=True)
             col_scale = self.scale.to(dev).flatten()
 
             if self.sym:
@@ -438,11 +402,6 @@ class ActQuantizer(torch.nn.Module):
             return q_int, per_token_scale, zp_correction
 
         # Dynamic: compute per-token scales from x at runtime.
-        if not hasattr(self, '_q2i_path_logged'):
-            self._q2i_path_logged = True
-            print(f"[Q2I PATH] DYNAMIC: K={K} bits={self.bits} gs={self.groupsize} "
-                  f"scale.shape={list(self.scale.shape) if self.scale is not None else 'None'}",
-                  flush=True)
         assert self.groupsize <= 0, \
             "quantize_to_int with groupsize > 0 requires static mode"
         # find_params skips bits=16 without realint (fake-quant no-op), but
@@ -804,66 +763,7 @@ class ActQuantWrapper(torch.nn.Module):
         if self._calibrating:
             self._cal_input = x  # post-rotation/eq, pre-quantization
 
-        # --- Sanity: run BOTH paths and compare ---
-        _sanity_done = False
-        if self.use_semi_int_gemm:
-            from semi_int_gemm import _bit as _sbit, MASK_SANITY
-            if _sbit(self.semi_int_mask, MASK_SANITY):
-                _sanity_done = True
-                # Path A: the working bypass (inline fake_quant)
-                _sq = self.quantizer
-                _K = x.shape[-1]
-                _saved_gs_a = getattr(_sq, 'groupsize', -1)
-                _saved_scale_a = _sq.scale.clone() if _sq.scale is not None else None
-                _saved_zero_a = _sq.zero.clone() if _sq.zero is not None else None
-                if _saved_gs_a > 0 and _sq.static and _sq.scale is not None:
-                    _sq.scale = _sq.scale.to(x.device).repeat_interleave(_sq.groupsize)[:_K]
-                    if _sq.zero is not None and _sq.zero.numel() > 0:
-                        _sq.zero = _sq.zero.to(x.device).repeat_interleave(_saved_gs_a)[:_K]
-                    _sq.groupsize = -1
-                x_a = x
-                if _sq.bits < 16 or _sq.realint:
-                    x_a = _sq(x_a).to(x_dtype)
-                    _sq.free()
-                x_a = self.module(x_a).to(x_dtype)
-                # Restore for path B
-                _sq.groupsize = _saved_gs_a
-                _sq.scale = _saved_scale_a
-                _sq.zero = _saved_zero_a
-
-                # Path B: through semi_int_gemm
-                from semi_int_gemm import semi_int_gemm
-                x_b = semi_int_gemm(
-                    x, self.w_int, self.w_scale,
-                    self.quantizer, self.semi_int_mask,
-                    acc_bits=self.acc_bits, block_k=self.acc_block_k,
-                    w_group_size=self.w_group_size, bias=self.bias,
-                    acc_wrap=self.acc_wrap, w_zp=self.w_zp,
-                    acc_dtype=getattr(self, 'acc_dtype', 'float'),
-                    w_shift_bias=getattr(self, 'w_shift_bias', 0),
-                    w_zp_correction=self.w_zp_correction,
-                    w_zp_cross=self.w_zp_cross,
-                    module_weight=self.module.weight.data,
-                    module=self.module,
-                ).to(x_dtype)
-
-                # Compare
-                if not hasattr(self, '_sanity_compared'):
-                    self._sanity_compared = True
-                    err = (x_a.float() - x_b.float()).abs()
-                    ref = x_a.float().abs().mean().item()
-                    print(
-                        f"[SANITY CMP] shape={list(x_a.shape)}  max_err={err.max().item():.4e}  "
-                        f"mean_err={err.mean().item():.4e}  ref={ref:.4e}  "
-                        f"a_nan={x_a.isnan().any().item()}  b_nan={x_b.isnan().any().item()}  "
-                        f"a_inf={x_a.isinf().any().item()}  b_inf={x_b.isinf().any().item()}",
-                        flush=True)
-
-                x = x_a  # use the working path for correct PPL
-
-        if _sanity_done:
-            pass
-        elif self.use_int_gemm and self.quantizer.bits <= 16:
+        if self.use_int_gemm and self.quantizer.bits <= 16:
             # Integer GEMM path: quantize activations to int8/int16 inside the kernel
             from int_acc_gemm import int_gemm_capped
             _ig_kwargs = dict(
@@ -962,8 +862,13 @@ class ActQuantWrapper(torch.nn.Module):
                 module=self.module,
             )
             # Static asymmetric per-group zero-point correction (precomputed bias)
-            # Must be added BEFORE bf16 cast to avoid catastrophic cancellation
-            if self.quantizer.static and self.static_zp_bias is not None:
+            # Must be added BEFORE bf16 cast to avoid catastrophic cancellation.
+            # Skip for int8 layers where the in-kernel a_zp correction handles this.
+            _skip_static_zp = (self.quantizer.static
+                               and getattr(self.quantizer, 'groupsize', -1) > 0
+                               and not self.quantizer.sym
+                               and self.quantizer.bits <= 8)
+            if self.quantizer.static and self.static_zp_bias is not None and not _skip_static_zp:
                 x = x + self.static_zp_bias.to(device=x.device, dtype=x.dtype)
             x = x.to(x_dtype)
         else:
