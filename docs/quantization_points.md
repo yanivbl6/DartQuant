@@ -28,7 +28,7 @@ documented separately at the end.
            │       │   │       │   │       │
            │ Q_IN  │   │ Q_IN  │   │ Q_IN  │  ── input quantizer (--a_bits)
            │ matmul│   │ matmul│   │ matmul│
-           │ Q_OUT │   │ Q_OUT │   │ V_OUT │  ── --quant_out all/mm/ex (16-bit)
+           │ Q_OUT │   │ Q_OUT │   │ V_OUT │  ── --quant_out all/ex (16-bit)
            └───┬───┘   └───┬───┘   └───┬───┘     v_proj uses --v_bits for V-cache
                |            |            |
                v            v            |
@@ -37,7 +37,7 @@ documented separately at the end.
         │                      │         |
         │  (R3 Hadamard Q,K)   │         |
         │                      │         |
-        │  [Q_QUANT] Q quant   │  ── --quant_out mm/ex (16-bit)
+        │  [Q_QUANT] Q quant   │  ── --quant_out mm/ex only (16-bit)
         │  [K_QUANT] K quant   │  ── --k_bits, --k_groupsize (K-cache)
         └──────┬───────────────┘         |
                |                         |
@@ -60,7 +60,7 @@ documented separately at the end.
                  │  (R2)      │  (rotation, not a quantization point)
                  │  Q_IN      │  ── input quantizer (--a_bits, or --o_per_head groupsize)
                  │  matmul    │
-                 │  Q_OUT     │  ── --quant_out all/mm/ex (16-bit)
+                 │  Q_OUT     │  ── --quant_out all/ex (16-bit)
                  └─────┬──────┘
                        |
                        + ─── residual add (skip connection)
@@ -76,7 +76,7 @@ documented separately at the end.
     │            │            │            │
     │  Q_IN      │            │  Q_IN      │  ── input quantizer (--a_bits)
     │  matmul    │            │  matmul    │
-    │  Q_OUT     │            │  Q_OUT     │  ── --quant_out all/mm/ex (16-bit)
+    │  Q_OUT     │            │  Q_OUT     │  ── --quant_out all/ex (16-bit)
     └─────┬──────┘            └─────┬──────┘
           |                         |
         SiLU / [PWL]                |     ── --pwl_act (piecewise-linear approx)
@@ -92,7 +92,7 @@ documented separately at the end.
                │  (eq scaling) │  (linear rescaling, not a quantization point)
                │  Q_IN         │  ── input quantizer (--down_bits or --a_bits)
                │  matmul       │
-               │  Q_OUT        │  ── --quant_out all/mm/ex (16-bit)
+               │  Q_OUT        │  ── --quant_out all/ex (16-bit)
                └───────┬───────┘
                        |
                        + ─── residual add (skip connection)
@@ -142,7 +142,7 @@ leaves the wrapper.
 | `spec`  | all except q/k/v_proj | |
 | `speco` | all except q/k/v/o_proj | |
 | `all`   | all layers (except lm_head) | |
-| `mm`    | all layers + Q quantizer in attention | |
+| `mm`    | (none -- uses Q quantizer in attention only) | |
 | `r4`    | (none -- uses pre_quantizer on down_proj instead) | |
 | `res`   | (none -- uses residual quantizers instead) | |
 | `ex`    | all layers + Q quantizer + residual + pre-R4 | Full HW simulation |

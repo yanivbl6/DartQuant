@@ -161,10 +161,28 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
     cmp_lower = compare_expr.lower()
 
     # ── Parse compare value ────────────────────────────────────────────
-    m_numeric = re.match(r'^([a-zA-Z_-]+?)(\d+)$', compare_expr)
-    if m_numeric:
+    if '*' in compare_expr:
+        # Explicit wildcard: t2int* → ^t2int[^_]*$, G-scaler-M* → ^g\-scaler\-m[^_]*$
+        if compare_expr.count('*') > 1:
+            print(f"\n  {YELLOW}Compare: only a single '*' wildcard is supported "
+                  f"(got: {compare_expr!r}){RESET}")
+            return None
+        parts = compare_expr.split('*')
+        pattern_str = '[^_]*'.join(re.escape(p) for p in parts)
+        key_pattern = re.compile(f'^{pattern_str}$', re.IGNORECASE)
+        # Capture-group version to extract the wildcard-matched segment
+        capture_str = '([^_]*)'.join(re.escape(p) for p in parts)
+        wildcard_capture = re.compile(f'^{capture_str}$', re.IGNORECASE)
+        mode = "wildcard"
+    elif m_numeric := re.match(r'^([a-zA-Z_-]+?)(\d+)$', compare_expr):
         # Numeric suffix: g128 → key prefix "g", pattern g\d+
         key_prefix = m_numeric.group(1).lower()
+        key_pattern = re.compile(f'^{re.escape(key_prefix)}\\d+$', re.IGNORECASE)
+        mode = "numeric"
+    elif re.search(r'\d', compare_expr) and re.match(r'^[a-zA-Z0-9_]+$', compare_expr):
+        # Numeric prefix: t2int32p → prefix "t2int32p", pattern t2int32p\d+
+        # (contains digits but ends with alpha — use as prefix expecting digits)
+        key_prefix = compare_expr.lower()
         key_pattern = re.compile(f'^{re.escape(key_prefix)}\\d+$', re.IGNORECASE)
         mode = "numeric"
     elif '-' in compare_expr:
@@ -197,17 +215,28 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
         token = _get_key_token(path)
         if mode == "binary":
             groups[cmp_lower if token else None].append(i)
+        elif mode == "wildcard":
+            # Track both matched tokens and vanilla (no-match) runs
+            groups[token].append(i)
         else:
             if token is not None:
                 groups[token].append(i)
 
-    if cmp_lower not in groups:
-        print(f"\n  {YELLOW}Compare: no runs found with baseline value "
-              f"'{compare_expr}'{RESET}")
-        avail = [k for k in groups if k is not None]
-        if avail:
-            print(f"  {DIM}Available values: {', '.join(sorted(avail))}{RESET}")
-        return None
+    # For wildcard mode, baseline = vanilla (None); for others, baseline = cmp_lower
+    baseline_key = None if mode == "wildcard" else cmp_lower
+
+    if baseline_key not in groups:
+        matched = sorted(k for k in groups if k is not None)
+        if matched and mode in ("wildcard", "numeric", "variant"):
+            # Baseline value not found — pick the first matched value instead
+            baseline_key = matched[0]
+            print(f"\n  {DIM}Compare: using '{baseline_key}' as baseline{RESET}")
+        else:
+            print(f"\n  {YELLOW}Compare: no runs found with baseline value "
+                  f"'{compare_expr}'{RESET}")
+            if matched:
+                print(f"  {DIM}Available values: {', '.join(matched)}{RESET}")
+            return None
 
     # ── Build strip patterns for pairing key ───────────────────────────
     # Always strip the key token.  In binary mode, also strip tokens that
@@ -220,18 +249,17 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
         other_indices = [idx for g, idxs in groups.items()
                          if g != cmp_lower for idx in idxs]
         if baseline_indices and other_indices:
-            # Tokens present in ALL baseline runs but NONE of the other runs
+            # Tokens present in ALL of one side and NONE of the other are
+            # stripped so pair keys line up (handled symmetrically).
             bl_token_sets = [set(_norm_base(runs[i][3]).split('_'))
                              for i in baseline_indices]
             ot_token_sets = [set(_norm_base(runs[i][3]).split('_'))
                              for i in other_indices]
-            bl_common = bl_token_sets[0]
-            for ts in bl_token_sets[1:]:
-                bl_common &= ts
-            ot_all = set()
-            for ts in ot_token_sets:
-                ot_all |= ts
-            exclusive = bl_common - ot_all
+            bl_common = set.intersection(*bl_token_sets)
+            ot_common = set.intersection(*ot_token_sets)
+            bl_all = set().union(*bl_token_sets)
+            ot_all = set().union(*ot_token_sets)
+            exclusive = (bl_common - ot_all) | (ot_common - bl_all)
             for tok in exclusive:
                 strip_patterns.append(
                     re.compile(f'^{re.escape(tok)}$', re.IGNORECASE))
@@ -242,14 +270,14 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
                         if not any(p.match(t) for p in strip_patterns))
 
     baseline_by_key = {_pair_key(runs[idx][3]): idx
-                       for idx in groups[cmp_lower]}
+                       for idx in groups[baseline_key]}
 
     # ── Collect pairs grouped by base config ───────────────────────────
     config_groups = defaultdict(list)
     for gval in sorted(groups, key=lambda v: (v is None, v or "")):
-        if gval == cmp_lower:
+        if gval == baseline_key:
             continue
-        key_label = gval if gval is not None else f"no {compare_expr}"
+        key_label = gval if gval is not None else "vanilla"
         for idx in groups[gval]:
             pk = _pair_key(runs[idx][3])
             if pk in baseline_by_key:
@@ -260,7 +288,7 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
               f"'{compare_expr}'{RESET}")
         for gval, indices in sorted(groups.items(),
                                     key=lambda x: (x[0] is None, x[0] or "")):
-            gl = gval if gval is not None else f"no {compare_expr}"
+            gl = gval if gval is not None else "vanilla"
             print(f"  {DIM}{gl}: {len(indices)} runs{RESET}")
         return None
 
@@ -272,7 +300,7 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
                             key=lambda item: labels[item[1][0][1]])
 
     # Build key_values list with display names (convert None → "no <expr>")
-    no_label = f"no {compare_expr}"
+    no_label = "vanilla"
     all_key_values = sorted(groups.keys(), key=lambda v: (v is None, _pad_key(v or "")))
     display_key_values = [no_label if v is None else v for v in all_key_values]
     result_configs = []
@@ -294,11 +322,17 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
                        for ri, bi, kl in cfg_pairs],
         })
 
+    # baseline_key may have been updated (fallback to first matched value)
+    bl_display = no_label if baseline_key is None else baseline_key
+    # File-safe version of the expression (replace * with ____ for filenames)
+    file_label = cmp_lower.replace('*', '____')
     return {
-        "baseline_value": cmp_lower,
+        "baseline_value": bl_display,
+        "file_label": file_label,
         "key_values": display_key_values,
         "configs": result_configs,
         "mode": mode,
+        "wildcard_capture": wildcard_capture if mode == "wildcard" else None,
     }
 
 
@@ -332,14 +366,26 @@ def _collect_metric_values(configs, matrix, col_idx):
 
 
 def _set_focused_ylim(ax, vals, ppl_col):
-    """Set y-axis limits focused on the actual data range."""
+    """Set y-axis limits focused on the actual data range.
+
+    For PPL columns, the range is fixed to [floor(min, 2 decimals),
+    floor(min, 2 decimals) + 10], with the axis inverted so lower (better)
+    sits at the top.
+    """
     if not vals:
         return
     vmin, vmax = min(vals), max(vals)
-    margin = max((vmax - vmin) * 0.3, 0.01)
     if ppl_col:
-        ax.set_ylim(vmax + margin, vmin - margin)
+        import math
+        floored = math.floor(vmin/5)*5
+        floored2 = math.floor(vmax/5+1)*5
+        if (floored2 > floored + 20):
+            floored2 = floored + 10
+        
+
+        ax.set_ylim(floored2, floored)
     else:
+        margin = max((vmax - vmin) * 0.3, 0.01)
         ax.set_ylim(vmin - margin, vmax + margin)
 
 
@@ -363,7 +409,7 @@ def _save_fig(fig, fig_dir, metric_kw, baseline_value, chart_type):
 
 def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
                     baseline_value, key_colors, col_header, common_sub,
-                    short_labels, fig_dir, metric_kw):
+                    short_labels, fig_dir, metric_kw, file_label=None):
     """Draw and save a clustered bar chart for one metric."""
     import matplotlib.pyplot as plt
 
@@ -371,23 +417,39 @@ def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
     n_keys = len(key_values)
     bar_width = 0.8 / n_keys
 
+    seen_labels = set()
+
+    def _emit_label(kl):
+        if kl in seen_labels:
+            return ""
+        seen_labels.add(kl)
+        return kl
+
+    bars = []  # (x, val) for value labels
     for ci, cfg in enumerate(configs):
         bl_val = matrix[cfg["baseline_idx"]][col_idx]
         if bl_val is not None:
-            ax.bar(ci + key_values.index(baseline_value) * bar_width,
-                   bl_val, bar_width, color=key_colors[baseline_value],
-                   label=baseline_value if ci == 0 else "")
+            x = ci + key_values.index(baseline_value) * bar_width
+            ax.bar(x, bl_val, bar_width, color=key_colors[baseline_value],
+                   label=_emit_label(baseline_value))
+            bars.append((x, bl_val))
         for pair in cfg["pairs"]:
             kl = pair["key_label"]
             val = matrix[pair["run_idx"]][col_idx]
             if val is not None and kl in key_colors:
                 ki = key_values.index(kl)
-                ax.bar(ci + ki * bar_width, val, bar_width,
-                       color=key_colors[kl],
-                       label=kl if ci == 0 else "")
+                x = ci + ki * bar_width
+                ax.bar(x, val, bar_width, color=key_colors[kl],
+                       label=_emit_label(kl))
+                bars.append((x, val))
 
     _set_focused_ylim(ax, _collect_metric_values(configs, matrix, col_idx),
                       ppl_col)
+
+    # Value labels on bars
+    for x, val in bars:
+        ax.text(x, val, f'{val:.2f}', ha='center', va='bottom',
+                fontsize=9)
 
     wrapped = [_wrap_label(l) for l in short_labels]
     ax.set_xticks([ci + bar_width * (n_keys - 1) / 2
@@ -398,19 +460,33 @@ def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
                  fontsize=10)
     ax.legend(fontsize=8)
     fig.tight_layout()
-    _save_fig(fig, fig_dir, metric_kw, baseline_value, "bar")
+    _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value, "bar")
 
 
 def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
                      baseline_value, col_header, common_sub, short_labels,
-                     fig_dir, metric_kw):
+                     fig_dir, metric_kw, fp16_val=None, file_label=None,
+                     wildcard_capture=None):
     """Draw and save a line chart for one metric (numeric compare, ≥3 values)."""
     import matplotlib.pyplot as plt
 
+    # Extract numeric x-values.  When a wildcard capture regex is available,
+    # use the *-matched segment; otherwise fall back to last digit group.
     x_nums = []
     for kv in key_values:
-        m = re.search(r'(\d+)', kv)
-        x_nums.append(int(m.group(1)) if m else 0)
+        val = None
+        if wildcard_capture:
+            m = wildcard_capture.match(kv)
+            if m and m.group(1).isdigit():
+                val = int(m.group(1))
+        if val is None:
+            digits = re.findall(r'\d+', kv)
+            val = int(digits[-1]) if digits else None
+        x_nums.append(val)
+
+    # Skip line chart if wildcard-matched parts aren't all numeric
+    if any(v is None for v in x_nums):
+        return
 
     fig, ax = plt.subplots(figsize=(max(6, len(key_values) + 2), 5))
     cmap = plt.cm.get_cmap("tab10", max(len(configs), 3))
@@ -429,17 +505,34 @@ def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
             lbl = short_labels[ci] if ci < len(short_labels) else cfg["baseline_label"]
             ax.plot(xs, ys, marker='o', label=lbl, color=cmap(ci))
 
+    if fp16_val is not None:
+        ax.axhline(fp16_val, color='black', linestyle='--', linewidth=1,
+                   label='FP16')
+
     ax.set_xlabel(re.sub(r'\d+', '*', baseline_value))
     ax.set_ylabel(col_header)
     ax.set_title(_make_title(col_header, baseline_value, common_sub),
                  fontsize=10)
     ax.set_xticks(x_nums)
     ax.set_xticklabels(key_values, fontsize=8)
-    if ppl_col:
-        ax.invert_yaxis()
+    ax.grid(True, linestyle=':', linewidth=0.5, alpha=0.6)
+    ax.set_axisbelow(True)
+    _set_focused_ylim(ax, _collect_metric_values(configs, matrix, col_idx),
+                      ppl_col)
+    # Extend the ylim to make the FP16 reference line visible.
+    if fp16_val is not None:
+        y0, y1 = ax.get_ylim()
+        lo, hi = min(y0, y1), max(y0, y1)
+        if fp16_val < lo or fp16_val > hi:
+            pad = 0.5
+            new_lo = min(lo, fp16_val - pad)
+            new_hi = max(hi, fp16_val + pad)
+            # Preserve inversion (PPL axis has y0 > y1).
+            ax.set_ylim(new_hi if y0 > y1 else new_lo,
+                        new_lo if y0 > y1 else new_hi)
     ax.legend(fontsize=7)
     fig.tight_layout()
-    _save_fig(fig, fig_dir, metric_kw, baseline_value, "line")
+    _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value, "line")
 
 
 def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
@@ -452,9 +545,11 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
     os.makedirs(fig_dir, exist_ok=True)
 
     baseline_value = compare_data["baseline_value"]
+    file_label = compare_data.get("file_label", baseline_value)
     key_values = compare_data["key_values"]
     configs = compare_data["configs"]
     cmp_mode = compare_data["mode"]
+    wildcard_capture = compare_data.get("wildcard_capture")
 
     # Resolve metric keywords to column indices
     metric_indices = []
@@ -474,26 +569,45 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
     if not metric_indices:
         return
 
-    # Build a color map for key values
+    # Build a color map for key values — stride through palette so neighbours
+    # never share a colour even when there are more keys than palette entries.
     import matplotlib.pyplot as plt
-    cmap = plt.cm.get_cmap("tab10", max(len(key_values), 3))
-    key_colors = {kv: cmap(i) for i, kv in enumerate(key_values)}
+    _PALETTE_N = 10
+    cmap = plt.cm.get_cmap("tab10")
+    _stride = 3  # coprime with 10 → hits all 10 colours before repeating
+    key_colors = {kv: cmap((i * _stride) % _PALETTE_N)
+                  for i, kv in enumerate(key_values)}
 
     # Factor out common tags from config labels
     config_labels = [cfg["baseline_label"] for cfg in configs]
     common_sub, short_labels = _factor_labels(config_labels)
+    # Empty short labels (config whose tokens are entirely factored into the
+    # common subtitle) would render as a blank x-tick and be dropped from the
+    # line legend; surface them as "vanilla" instead.
+    short_labels = [l if l else "vanilla" for l in short_labels]
+
+    # Locate the FP16 baseline row (full mode, no gguf tag) so line charts
+    # can draw it as a reference line.
+    fp16_idx = None
+    for i, (_, _, rmode, path) in enumerate(runs):
+        if rmode == "full" and not _extract_gguf_tag(path):
+            fp16_idx = i
+            break
 
     for metric_kw, col_header, col_idx in metric_indices:
         ppl_col = is_ppl[col_idx]
 
         _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
                         baseline_value, key_colors, col_header, common_sub,
-                        short_labels, fig_dir, metric_kw)
+                        short_labels, fig_dir, metric_kw, file_label=file_label)
 
-        if cmp_mode == "numeric" and len(key_values) >= 3:
+        if cmp_mode in ("numeric", "wildcard") and len(key_values) >= 3:
+            fp16_val = matrix[fp16_idx][col_idx] if fp16_idx is not None else None
             _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
                              baseline_value, col_header, common_sub,
-                             short_labels, fig_dir, metric_kw)
+                             short_labels, fig_dir, metric_kw,
+                             fp16_val=fp16_val, file_label=file_label,
+                             wildcard_capture=wildcard_capture)
 
 
 def _extract_model_name(path):
@@ -1015,12 +1129,15 @@ def main():
   python show_results.py --nbl                     # exclude FP16 baseline
   python show_results.py -d                        # show delta vs FP16 baseline
   python show_results.py -c pwl                    # compare runs with/without 'pwl'
+  python show_results.py -c 't2int*'               # wildcard: compare all t2int variants vs vanilla
+  python show_results.py -c 'G-scaler-M*'          # wildcard: compare all G-scaler M-variants
   python show_results.py data/cached_results/quarot*.pb  # literal paths (shell glob)""",
     )
     parser.add_argument("-d", "--delta", action="store_true",
                         help="Show delta table vs FP16 baseline")
     parser.add_argument("-c", "--compare", type=str, default=None, metavar="EXPR",
-                        help="Compare runs matching EXPR vs runs not matching it (delta table)")
+                        help="Compare runs matching EXPR vs runs not matching it (delta table). "
+                         "Supports one '*' wildcard (matches within a token, e.g. 't2int*').")
     parser.add_argument("--draw", type=str, default=None, metavar="METRICS",
                         help="Comma-separated metrics to plot (requires -c). "
                              "E.g.: C4,MMLU,avg")

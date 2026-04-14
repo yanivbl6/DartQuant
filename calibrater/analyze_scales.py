@@ -27,8 +27,11 @@ import experiment_config as cfg
 def _resolve_paths(args, mode):
     """Return (act_scales_path, gptq_checkpoint_dir, quant_tag)."""
     quant_tag = cfg.build_quant_tag(args)
+    gptq_tag = cfg.build_quant_tag(args, for_gptq_cache=True)
     act_path = cfg.resolve_act_scales_path(args.model, mode, quant_tag)
-    gptq_dir = cfg.resolve_gptq_checkpoint_dir(args.model, mode, quant_tag, args.w_bits)
+    imitate_gguf = bool(getattr(args, 'imitate_gguf', None))
+    gptq_dir = cfg.resolve_gptq_checkpoint_dir(
+        args.model, mode, gptq_tag, args.w_bits, imitate_gguf=imitate_gguf)
     return act_path, gptq_dir, quant_tag
 
 
@@ -56,13 +59,29 @@ def _recover_group_scales(W_fq, maxq):
     return scale.squeeze(1)  # [N_groups]
 
 
+def _recover_group_scales_asym(W_fq, maxq_unsigned):
+    """Recover per-row scales from fake-quantized weights (asymmetric).
+
+    Mirrors int_acc_gemm._recover_int_and_scale_asym: scale = (max - min) / maxq_unsigned.
+    maxq_unsigned is the unsigned range (e.g. 15 for 4-bit).
+    """
+    w_min = W_fq.amin(dim=1, keepdim=True)
+    w_max = W_fq.amax(dim=1, keepdim=True)
+    scale = ((w_max - w_min) / maxq_unsigned).clamp(min=1e-10)
+    return scale.squeeze(1)  # [N_groups]
+
+
 def extract_weight_scales(checkpoint_dir, w_bits, w_groupsize, w_sym):
     """Load GPTQ checkpoint and extract per-group weight scales.
 
     Returns dict {category: numpy array of scale values}.
     """
-    assert w_sym, "Weight scale analysis currently requires symmetric quantization"
-    maxq = 2 ** (w_bits - 1) - 1
+    if w_sym:
+        maxq = 2 ** (w_bits - 1) - 1
+        recover = lambda w: _recover_group_scales(w, maxq)
+    else:
+        maxq_unsigned = 2 ** w_bits - 1
+        recover = lambda w: _recover_group_scales_asym(w, maxq_unsigned)
 
     # Load all .pth parts into a single state_dict
     pth_files = sorted(f for f in os.listdir(checkpoint_dir) if f.endswith('.pth'))
@@ -96,10 +115,10 @@ def extract_weight_scales(checkpoint_dir, w_bits, w_groupsize, w_sym):
             if padded_K > K:
                 W = torch.nn.functional.pad(W, (0, padded_K - K))
             W_grouped = W.reshape(N * n_groups, w_groupsize)
-            scales = _recover_group_scales(W_grouped, maxq).numpy()
+            scales = recover(W_grouped).numpy()
         else:
             # Per-channel
-            scales = _recover_group_scales(W, maxq).numpy()
+            scales = recover(W).numpy()
 
         cat_scales.setdefault(cat, []).extend(scales.tolist())
 

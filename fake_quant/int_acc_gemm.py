@@ -112,6 +112,7 @@ if _HAS_TRITON:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        ACC_BLOCK_K: tl.constexpr,  # logical accumulation block size (may be < BLOCK_K for padding)
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -134,8 +135,8 @@ if _HAS_TRITON:
         else:
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        for k_start in range(0, K, BLOCK_K):
-            k_mask = (k_start + offs_k) < K
+        for k_start in range(0, K, ACC_BLOCK_K):
+            k_mask = (offs_k < ACC_BLOCK_K) & ((k_start + offs_k) < K)
 
             # Load int8 tiles
             a_mask = (offs_m[:, None] < M) & (k_mask[None, :])
@@ -209,8 +210,8 @@ if _HAS_TRITON:
                 acc += contrib
 
             # Advance pointers
-            a_ptrs += BLOCK_K * stride_ak
-            b_ptrs += BLOCK_K * stride_bk
+            a_ptrs += ACC_BLOCK_K * stride_ak
+            b_ptrs += ACC_BLOCK_K * stride_bk
 
         # Convert to float, then undo frac bits and gscaler prescaling together
         acc = acc.to(tl.float32)
@@ -677,7 +678,8 @@ def _triton_int_gemm(
 
     BLOCK_M = 32
     BLOCK_N = 64
-    BLOCK_K = block_k
+    ACC_BLOCK_K = block_k
+    BLOCK_K = max(32, block_k)  # Triton tl.dot requires K >= 32; pad if needed
 
     # float32 can't represent INT32_MAX (2^31-1) exactly — it rounds up to
     # 2^31 which overflows int32.  Cap clamp boundaries at 2^30 so
@@ -771,6 +773,7 @@ def _triton_int_gemm(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        ACC_BLOCK_K=ACC_BLOCK_K,
     )
 
     return output
