@@ -610,6 +610,107 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
                              wildcard_capture=wildcard_capture)
 
 
+def _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl, draw_metrics,
+                       fp16_idx):
+    """Draw a bar chart with one bar per non-FP16 run, for each --draw metric.
+
+    Triggered by ``--compare *``.  Shows every quantized run side-by-side with
+    the FP16 baseline as a dashed reference line.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig_dir = os.path.join(SCRIPT_DIR, "..", "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    # Indices of all non-FP16 runs (keep GGUF baselines too — they're
+    # non-FP16 quantized runs worth comparing against).
+    run_indices = [i for i, (_, _, rmode, path) in enumerate(runs)
+                   if not (rmode == "full" and not _extract_gguf_tag(path))]
+    if not run_indices:
+        print(f"  {YELLOW}--compare *: no non-FP16 runs to plot{RESET}")
+        return
+
+    # Resolve metrics
+    metric_indices = []
+    for kw in draw_metrics:
+        col_header = _METRIC_ALIASES.get(kw.lower())
+        if col_header is None:
+            print(f"  {YELLOW}--draw: unknown metric '{kw}'. "
+                  f"Available: {', '.join(sorted(_METRIC_ALIASES.keys()))}{RESET}")
+            continue
+        try:
+            col_idx = cols.index(col_header)
+        except ValueError:
+            print(f"  {YELLOW}--draw: column '{col_header}' not found in table{RESET}")
+            continue
+        metric_indices.append((kw, col_header, col_idx))
+
+    if not metric_indices:
+        return
+
+    # Factor out tokens common to all run labels for a cleaner x-axis
+    run_labels = [labels[i] for i in run_indices]
+    common_sub, short_labels = _factor_labels(run_labels)
+    short_labels = [l if l else "vanilla" for l in short_labels]
+
+    cmap = plt.cm.get_cmap("tab10")
+    colors = [cmap((i * 3) % 10) for i in range(len(run_indices))]
+
+    for metric_kw, col_header, col_idx in metric_indices:
+        ppl_col = is_ppl[col_idx]
+        fp16_val = (matrix[fp16_idx][col_idx] if fp16_idx is not None
+                    else None)
+
+        fig, ax = plt.subplots(
+            figsize=(max(8, len(run_indices) * 0.7 + 2), 5))
+
+        xs = list(range(len(run_indices)))
+        bar_vals = []
+        for x, ri in zip(xs, run_indices):
+            v = matrix[ri][col_idx]
+            bar_vals.append(v)
+            if v is not None:
+                ax.bar(x, v, 0.8, color=colors[x])
+
+        if fp16_val is not None:
+            ax.axhline(fp16_val, color='black', linestyle='--',
+                       linewidth=1, label='FP16')
+            ax.legend(fontsize=8)
+
+        # Value labels
+        for x, v in zip(xs, bar_vals):
+            if v is not None:
+                ax.text(x, v, f'{v:.2f}', ha='center', va='bottom',
+                        fontsize=8)
+
+        wrapped = [_wrap_label(l, max_chars=12) for l in short_labels]
+        ax.set_xticks(xs)
+        ax.set_xticklabels(wrapped, rotation=45, ha='right', fontsize=7)
+        ax.set_ylabel(col_header)
+        ax.set_title(_make_title(col_header, "all runs", common_sub),
+                     fontsize=10)
+        ax.grid(True, axis='y', linestyle=':', linewidth=0.5, alpha=0.6)
+        ax.set_axisbelow(True)
+
+        vals = [v for v in bar_vals if v is not None]
+        _set_focused_ylim(ax, vals, ppl_col)
+        # Extend ylim to keep FP16 line visible
+        if fp16_val is not None:
+            y0, y1 = ax.get_ylim()
+            lo, hi = min(y0, y1), max(y0, y1)
+            if fp16_val < lo or fp16_val > hi:
+                pad = 0.5
+                new_lo = min(lo, fp16_val - pad)
+                new_hi = max(hi, fp16_val + pad)
+                ax.set_ylim(new_hi if y0 > y1 else new_lo,
+                            new_lo if y0 > y1 else new_hi)
+
+        fig.tight_layout()
+        _save_fig(fig, fig_dir, metric_kw, "all", "bar")
+
+
 def _extract_model_name(path):
     """Extract model name from a result .pb filename.
 
@@ -963,7 +1064,14 @@ def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None,
         _print_delta_table("Δ vs FP16", delta_rows, matrix, labels, runs,
                            cols, is_ppl, col_w, label_w=label_w)
 
-    if compare_expr:
+    if compare_expr == "*":
+        if draw_metrics:
+            _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl,
+                               draw_metrics, full_idx)
+        else:
+            print(f"\n  {YELLOW}--compare *: use --draw <metric> to produce "
+                  f"the all-runs bar chart{RESET}")
+    elif compare_expr:
         compare_data = _print_compare(runs, matrix, labels, cols, is_ppl, col_w,
                                       compare_expr, label_w=label_w)
         if draw_metrics and compare_data:
@@ -1131,6 +1239,7 @@ def main():
   python show_results.py -c pwl                    # compare runs with/without 'pwl'
   python show_results.py -c 't2int*'               # wildcard: compare all t2int variants vs vanilla
   python show_results.py -c 'G-scaler-M*'          # wildcard: compare all G-scaler M-variants
+  python show_results.py -c '*' --draw c4          # bar chart with every non-FP16 run
   python show_results.py data/cached_results/quarot*.pb  # literal paths (shell glob)""",
     )
     parser.add_argument("-d", "--delta", action="store_true",
