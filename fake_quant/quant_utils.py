@@ -9,16 +9,20 @@ import fast_hadamard_transform
 
 # ── Mantissa+Shift group-scale quantization ──────────────────────────────────
 
-_GSCALER_RE = re.compile(r'^M(\d+)[SE](\d+)(?:([bl])(\d+))?$')
+# Regex accepts either an integer bias (b/l<N>) or the literals 'min' / 'mid'
+# for hwscale's per-layer auto-bias modes.
+_GSCALER_RE = re.compile(r'^M(\d+)[SE](\d+)(?:([bl])(\d+|min|mid))?$')
 
 
 def parse_gscaler(spec):
-    """Parse a gscaler spec string into a config dict.
+    """Parse a gscaler / hwscale spec string into a config dict.
 
     Examples:
-        'M5S3'    -> {mantissa_bits: 5, shift_bits: 3, bias: 0}
-        'M6E4b2'  -> {mantissa_bits: 6, shift_bits: 4, bias: 2}
-        'M6S4l2'  -> {mantissa_bits: 6, shift_bits: 4, bias: -2}
+        'M5S3'     -> {mantissa_bits: 5, shift_bits: 3, bias: 0}
+        'M6E4b2'   -> {mantissa_bits: 6, shift_bits: 4, bias: 2}
+        'M6S4l2'   -> {mantissa_bits: 6, shift_bits: 4, bias: -2}
+        'M4S3bmin' -> {... bias_auto: 'min'}  (per-layer, anchor at min_nonzero)
+        'M4S3bmid' -> {... bias_auto: 'mid'}  (per-layer, anchor at median_abs)
 
     Returns None if spec is None.
     Raises ValueError on invalid format.
@@ -28,18 +32,25 @@ def parse_gscaler(spec):
     m = _GSCALER_RE.match(spec)
     if not m:
         raise ValueError(
-            f"Invalid --gscaler format: '{spec}'. "
-            f"Expected e.g. M5S3, M6E4b2, M6S4l2.")
+            f"Invalid --gscaler / --hwscale format: '{spec}'. "
+            f"Expected e.g. M5S3, M6E4b2, M6S4l2, M4S3bmin, M4S3bmid.")
     mantissa_bits = int(m.group(1))
     shift_bits = int(m.group(2))
     bias_dir = m.group(3)  # 'b', 'l', or None
-    bias_val = int(m.group(4)) if m.group(4) else 0
-    if bias_dir == 'l':
-        bias_val = -bias_val
+    bias_raw = m.group(4)
+    bias_auto = bias_raw if bias_raw in ('min', 'mid') else None
+    if bias_auto is not None:
+        bias_val = None  # computed per-layer at merge time
+    else:
+        bias_val = int(bias_raw) if bias_raw else 0
+        if bias_dir == 'l':
+            bias_val = -bias_val
     return {
         'mantissa_bits': mantissa_bits,
         'shift_bits': shift_bits,
         'bias': bias_val,
+        'bias_auto': bias_auto,
+        'bias_dir': bias_dir,
         'spec': spec,
     }
 
@@ -77,6 +88,93 @@ def snap_scale_to_gscaler(scale, gscaler):
         best_val = torch.where(better, candidate, best_val)
 
     return best_val.reshape(orig_shape).to(scale.dtype)
+
+
+def hwscale_global_from_spec(spec, raw_scale=None):
+    """Derive the per-layer FP32 global scale from a parsed hwscale spec.
+
+    MxSy (no bias suffix)          -> global = 1.0
+    MxSybz (positive bias)          -> global = 2^-z  (stored scales are larger)
+    MxSylz (negative bias via 'l')  -> global = 2^+z
+    MxSybmin (auto, anchor at min)  -> z = -floor(log2(min_nonzero(raw_scale)/2))
+                                       so 2*global < every nonzero scale
+                                       (i.e. stored_min ≥ 2, inside MxSy).
+    MxSybmid (auto, anchor at mid)  -> center the grid on log2(median(|raw|)).
+                                       g = floor(log2(median_abs)) - 1 + 2^(S-1),
+                                       z = -g.  Floor rounds toward "downward"
+                                       side of the asymmetric grid to reduce
+                                       clipping on that side.
+    """
+    if spec is None:
+        return 1.0
+    mode = spec.get('bias_auto')
+    if mode:
+        assert raw_scale is not None, \
+            "hwscale auto-bias requires raw_scale tensor for per-layer derivation"
+        if mode == 'min':
+            nonzero = raw_scale[raw_scale > 0]
+            if nonzero.numel() == 0:
+                z = 0
+            else:
+                min_nz = nonzero.min().item()
+                # floor(log2(min_nz / 2)) is strictly below log2(min_nz), so
+                # 2 * global = 2^(1-z) < min_nz for every nonzero entry (and
+                # stored_min = min_nz / global ≥ 2, inside MxSy's grid).
+                z = max(0, int(-math.floor(math.log2(min_nz / 2.0))))
+        elif mode == 'mid':
+            abs_nz = raw_scale.abs()
+            abs_nz = abs_nz[abs_nz > 0]
+            if abs_nz.numel() == 0:
+                z = 0
+            else:
+                median_abs = abs_nz.median().item()
+                # Floor log2(median_abs) to push the effective grid center
+                # slightly below the true median: the MxSy grid extends more
+                # upward than downward from its mantissa=2/shift=2^(S-1)
+                # center, so flooring compensates by adding headroom below.
+                median_log = int(math.floor(math.log2(median_abs)))
+                S = spec['shift_bits']
+                # Median shift index is 2^(S-1); degenerates to 0 when S=0
+                # (only one shift, so the grid is a pure integer mantissa grid).
+                half_shift = (1 << (S - 1)) if S >= 1 else 0
+                g = median_log - 1 + half_shift
+                z = -g
+        else:
+            raise ValueError(f"Unknown hwscale auto-bias mode: '{mode}'")
+        if spec.get('bias_dir') == 'l':
+            z = -z
+        return float(2.0 ** (-z))
+    return float(2.0 ** (-spec['bias']))
+
+
+def snap_to_hwscale(raw_scale, spec):
+    """Snap merged per-group scale tensor to MxSy + separate global FP32 scale.
+
+    Given the raw merged scale `raw_scale = a_gscale * w_gscale`, returns
+    `(stored, global_scalar)` such that `stored * global_scalar ≈ raw_scale`,
+    where `stored` is representable in MxSy (bias=0) form and `global_scalar`
+    is an FP32 multiplier applied once at T2.
+
+    For auto-bias specs (bmin/lmin), `global_scalar` is derived per-layer
+    from the minimum nonzero entry in `raw_scale`.
+
+    Parameters
+    ----------
+    raw_scale : positive float tensor
+    spec      : dict from `parse_gscaler()`
+    """
+    global_scalar = hwscale_global_from_spec(spec, raw_scale=raw_scale)
+    # Shift the raw values into the MxSy (bias=0) representable range, snap,
+    # leaving the residual `global_scalar` to be applied at T2.
+    bias0_spec = {
+        'mantissa_bits': spec['mantissa_bits'],
+        'shift_bits': spec['shift_bits'],
+        'bias': 0,
+        'spec': spec['spec'],
+    }
+    scaled = raw_scale / global_scalar
+    stored = snap_scale_to_gscaler(scaled, bias0_spec)
+    return stored, global_scalar
 
 
 def get_minq_maxq(bits, sym):
@@ -572,16 +670,19 @@ class ActQuantWrapper(torch.nn.Module):
     def prepare_int_gemm(self, w_bits, w_sym=True, w_group_size=-1,
                          acc_bits=32, acc_block_k=32, use_triton=True,
                          acc_wrap=False, acc_dtype='float',
-                         gscaler_parsed=None):
+                         gscaler_parsed=None, lsb_mac_shift=0,
+                         t1_msb_scan=False):
         """Pre-compute integer weight representation for capped-accumulator GEMM."""
         from int_acc_gemm import prepare_int_weights
         self.use_int_gemm = True
+        self.t1_msb_scan = t1_msb_scan
         self.acc_bits = acc_bits
         self.acc_block_k = acc_block_k
         self.acc_wrap = acc_wrap
         self.acc_dtype = acc_dtype
         self.int_gemm_use_triton = use_triton
         self.w_group_size = w_group_size
+        self.lsb_mac_shift = lsb_mac_shift
 
         w_int, w_scale, w_zp = prepare_int_weights(self.module, w_bits, w_sym, w_group_size)
         dev = self.module.weight.device
@@ -775,7 +876,11 @@ class ActQuantWrapper(torch.nn.Module):
                 w_zp=self.w_zp, w_zp_cross=self.w_zp_cross,
                 acc_dtype=getattr(self, 'acc_dtype', 'float'),
                 w_shift_bias=getattr(self, 'w_shift_bias', 0),
+                lsb_mac_shift=getattr(self, 'lsb_mac_shift', 0),
+                global_scale_fp32=float(getattr(self, 'hwscale_global', 1.0)),
             )
+            if getattr(self, 't1_msb_scan', False):
+                _ig_kwargs['_t1_scan_label'] = getattr(self.quantizer, '_sd_name', '??')
             x_pre = x  # save pre-quantization input for sd_check
             x = int_gemm_capped(x_float=x, **_ig_kwargs)
 
@@ -784,6 +889,33 @@ class ActQuantWrapper(torch.nn.Module):
             if self.quantizer.static and self.static_zp_bias is not None:
                 x = x + self.static_zp_bias.to(device=x.device, dtype=x.dtype)
             x = x.to(x_dtype)
+
+            # t1_msb_scan: detect tier-1 accumulator overflow
+            if getattr(self, 't1_msb_scan', False):
+                _ref_kwargs = dict(_ig_kwargs)
+                _ref_kwargs['acc_bits'] = 32
+                _ref_kwargs['acc_wrap'] = False
+                _ref_kwargs['lsb_mac_shift'] = 0
+                _ref_kwargs['_t1_scan_label'] = ''  # no sub-scan on reference call
+                x_ref = int_gemm_capped(x_float=x_pre, **_ref_kwargs)
+                if self.quantizer.static and self.static_zp_bias is not None:
+                    x_ref = x_ref + self.static_zp_bias.to(device=x_ref.device, dtype=x_ref.dtype)
+                x_ref = x_ref.to(x_dtype)
+                diff = (x.float() - x_ref.float())
+                rms_ref = (x_ref.float() ** 2).mean().sqrt().item() + 1e-12
+                rmse = (diff ** 2).mean().sqrt().item()
+                nrmse = rmse / rms_ref
+                max_abs = diff.abs().max().item()
+                layer_name = getattr(self.quantizer, '_sd_name', '??')
+                if max_abs > 1e-6:
+                    print(f"[t1_msb_scan] MISMATCH {layer_name}: "
+                          f"NRMSE={nrmse:.4e}, max_abs_diff={max_abs:.4e}, "
+                          f"rms_ref={rms_ref:.4e}, n_diff={int((diff.abs() > 1e-6).sum().item())}",
+                          flush=True)
+                    if nrmse > 1e-4:
+                        raise RuntimeError(
+                            f"[t1_msb_scan] Tier-1 overflow in {layer_name} "
+                            f"(NRMSE={nrmse:.4e})")
 
             # sd_check: compare static int_gemm vs dynamic int_gemm
             q = self.quantizer
@@ -805,23 +937,30 @@ class ActQuantWrapper(torch.nn.Module):
             # ig_compare: compare int_gemm vs normal fake-quant GEMM
             if self._ig_compare:
                 q = self.quantizer
-                # Switch to dynamic mode for fair comparison (static scales
-                # are shaped for int_gemm's per-group layout)
-                saved = (q.static, q.groupsize,
-                         q.scale.clone() if q.scale is not None else None,
-                         q.zero.clone() if q.zero is not None else None)
-                q.static = False
-                q.groupsize = -1
+                # Only switch to dynamic when static scales aren't broadcast-
+                # compatible with x [..., K] — specifically, per-group scales
+                # ([n_groups], hw_align) don't broadcast.  Per-tensor [1]
+                # (hw_accurate) and per-column [K] (down_proj path) do broadcast
+                # and should be used as-is for a true apples-to-apples comparison
+                # (same quantization as int_gemm, only GEMM path differs).
+                needs_dynamic = q.static and q.groupsize > 0
+                if needs_dynamic:
+                    saved = (q.static, q.groupsize,
+                             q.scale.clone() if q.scale is not None else None,
+                             q.zero.clone() if q.zero is not None else None)
+                    q.static = False
+                    q.groupsize = -1
                 x_fq = x_pre.clone()
-                if q.bits < 16:
+                if q.bits < 16 or q.realint:
                     x_fq = q(x_fq).to(x_dtype)
                     q.free()
                 x_fq = self.module(x_fq).to(x_dtype)
-                # Restore quantizer state
-                q.static, q.groupsize = saved[0], saved[1]
-                q.scale = saved[2]
-                if saved[3] is not None:
-                    q.zero = saved[3]
+                # Restore quantizer state (no-op when we didn't switch)
+                if needs_dynamic:
+                    q.static, q.groupsize = saved[0], saved[1]
+                    q.scale = saved[2]
+                    if saved[3] is not None:
+                        q.zero = saved[3]
 
                 # Check error and report midpoint for problematic layers
                 if not getattr(self, '_ig_logged', False):

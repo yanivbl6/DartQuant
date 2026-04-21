@@ -46,6 +46,8 @@ def parser_gen():
                         help='Quantize weights first, then apply R4 rotation: Q(W)@H instead of Q(W@H)')
     parser.add_argument('--down_bits', type=int, default=None,
                         help='Override down_proj input activation bits (without disabling R4)')
+    parser.add_argument('--oproj_bits', type=int, default=None,
+                        help='Override o_proj input activation bits (e.g. 16 for int16 decomposition)')
     parser.add_argument('--eq', action='store_true',
                         help='Enable per-channel equalization on down_proj inputs')
     parser.add_argument('--quant_out', type=str, default='none',
@@ -116,9 +118,13 @@ def parser_gen():
                         help='Tier-2 accumulator dtype for integer GEMM. '
                              'Accepts int<N> (e.g. int16, int24, int32), float/fp32, half/fp16, bfloat/bf16. '
                              'Non-float32 requires static activation scales or a16. (default: float)')
+    parser.add_argument('--lsb_mac_shift', type=int, default=0,
+                        help='Right-shift tl.dot by N bits in LSB int16 kernel (default: 0)')
     parser.add_argument('--int_gemm_use_triton', action=argparse.BooleanOptionalAction, default=True,
                         help='Use Triton kernel for integer GEMM (default: True). '
                              'Set --no-int_gemm_use_triton for pure-PyTorch reference.')
+    parser.add_argument('--t1_msb_scan', action='store_true',
+                        help='Diagnostic: detect tier-1 accumulator overflow per layer (aborts on mismatch)')
 
     parser.add_argument('--ig_compare', action=argparse.BooleanOptionalAction, default=False,
                         help='Compare int_gemm output vs normal fake-quant GEMM per layer. '
@@ -157,6 +163,10 @@ def parser_gen():
                              '(aligned with --w_groupsize). Makes fake_quant '
                              'hardware-accurate by ensuring scales factor out of '
                              'dot products.')
+    parser.add_argument('--hw_accurate', action='store_true', default=False,
+                        help='Hardware-accurate activation scales: collapse all static scales '
+                             'to per-tensor. Combine with --eq for per-channel down_proj '
+                             '(full hardware match). Mutually exclusive with --hw_align.')
 
     # R4 diagnostic stats
     parser.add_argument('--r4_stats', type=str, default=None,
@@ -195,6 +205,13 @@ def parser_gen():
     parser.add_argument('--gscaler', type=str, default=None,
                         help='Group scale format: M5S3, M6E4b2, M6S4l2, etc. '
                              '(default: None = FP32 scales)')
+    parser.add_argument('--hwscale', type=str, default=None,
+                        help='Merged (a_gscale * w_gscale) per-group scale snapped '
+                             'to M<m>S<s>[b<z>|l<z>] at model-load for inference only. '
+                             'Applied only on layers with per-group a+w scales '
+                             '(down_proj under hw_accurate; all matching layers under '
+                             'hw_align). Trailing bz sets a per-layer FP32 global '
+                             'scale = 2^-z applied at T2 (default: None).')
     parser.add_argument('--adaquant', type=str, nargs='?', const='default', default=None,
                         help='Use AdaQuant instead of GPTQ. No value = defaults. '
                              'Inline params string to customise '
@@ -324,6 +341,8 @@ def parser_gen():
     # Parse and validate --gscaler early so we fail fast on bad format
     from quant_utils import parse_gscaler
     args.gscaler_parsed = parse_gscaler(args.gscaler)
+    # --hwscale reuses the same grammar
+    args.hwscale_parsed = parse_gscaler(args.hwscale)
 
     if args.lm_eval:
         from lm_eval.tasks import TaskManager   # lm_eval==0.4.3

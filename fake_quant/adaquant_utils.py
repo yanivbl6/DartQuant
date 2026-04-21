@@ -707,6 +707,7 @@ def adaquant_fwrd(model, dataloader, dev, args, adaquant_params=None):
                             acc_wrap=getattr(args, 'acc_wrap', False),
                             acc_dtype=getattr(args, 'acc_dtype', 'float'),
                             gscaler_parsed=getattr(args, 'gscaler_parsed', None),
+                            lsb_mac_shift=getattr(args, 'lsb_mac_shift', 0),
                         )
 
         # Safety-net: enable int_gemm on remaining layers
@@ -736,6 +737,7 @@ def adaquant_fwrd(model, dataloader, dev, args, adaquant_params=None):
                         acc_wrap=getattr(args, 'acc_wrap', False),
                         acc_dtype=getattr(args, 'acc_dtype', 'float'),
                         gscaler_parsed=getattr(args, 'gscaler_parsed', None),
+                        lsb_mac_shift=getattr(args, 'lsb_mac_shift', 0),
                     )
 
         avg_loss = sum(layer_losses) / len(layer_losses) if layer_losses else 0.0

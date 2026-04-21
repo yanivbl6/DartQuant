@@ -54,6 +54,8 @@ Options:
   --acc_block_k N      K-block size for accumulator capping          (default: 32)
   --acc_wrap           Use wrap-around instead of saturation on overflow
   --acc_dtype S        Tier-2 accumulator dtype (e.g. fp16, int24)     (default: float)
+  --lsb_mac_shift N    Right-shift tl.dot by N bits in LSB int16 kernel (default: 0)
+  --t1_msb_scan        Diagnostic: detect tier-1 accumulator overflow per layer
   --quant_out MODE Output quantization: none, up, mlp, spec, speco, all, r4, res, mm, ex
   --smq N              Softmax output quantization bits (0=disabled, default: 0)
   --sd_check T         Compare static vs dynamic quantization per-layer (threshold T, 0=off)
@@ -120,6 +122,7 @@ KV_EX=0
 PROJ_EX=0
 NO_R4=0
 DOWN_BITS=""
+OPROJ_BITS=""
 EQ=0
 PWL_ACT=0
 PWL_N_SEGMENTS=9
@@ -131,6 +134,8 @@ ACC_BITS=32
 ACC_BLOCK_K=32
 ACC_WRAP=0
 ACC_DTYPE="float"
+LSB_MAC_SHIFT=0
+T1_MSB_SCAN=0
 SMQ=0
 SD_CHECK=0
 SD_CHECK_NORM="inf"
@@ -173,6 +178,7 @@ while [[ $# -gt 0 ]]; do
         --proj_ex) PROJ_EX="$2"; shift 2 ;;
         --no_r4)  NO_R4=1;     shift   ;;
         --down_bits) DOWN_BITS="$2"; shift 2 ;;
+        --oproj_bits) OPROJ_BITS="$2"; shift 2 ;;
         --eq)     EQ=1;        shift   ;;
         --pwl_act) PWL_ACT=1;    shift   ;;
         --pwl_n_segments) PWL_N_SEGMENTS="$2"; shift 2 ;;
@@ -184,6 +190,8 @@ while [[ $# -gt 0 ]]; do
         --acc_block_k) ACC_BLOCK_K="$2"; shift 2 ;;
         --acc_wrap)    ACC_WRAP=1;        shift   ;;
         --acc_dtype)   ACC_DTYPE="$2";   shift 2 ;;
+        --lsb_mac_shift) LSB_MAC_SHIFT="$2"; shift 2 ;;
+        --t1_msb_scan) T1_MSB_SCAN=1;   shift   ;;
         --smq)         SMQ="$2";         shift 2 ;;
         --sd_check)    SD_CHECK="$2";    shift 2 ;;
         --sd_check_norm) SD_CHECK_NORM="$2"; shift 2 ;;
@@ -193,6 +201,7 @@ while [[ $# -gt 0 ]]; do
         --gguf)        GGUF="$2";           shift 2 ;;
         --imitate_gguf) IMITATE_GGUF="$2"; shift 2 ;;
         --gscaler)     GSCALER="$2";        shift 2 ;;
+        --hwscale)     HWSCALE="$2";        shift 2 ;;
         --gptq_strength) GPTQ_STRENGTH="$2"; shift 2 ;;
         --quant_warnings) QUANT_WARNINGS=1; shift   ;;
         --sim_version) SIM_VERSION="$2";   shift 2 ;;
@@ -205,6 +214,7 @@ while [[ $# -gt 0 ]]; do
         --stochastic_quant) STOCHASTIC_QUANT=1; shift ;;
         --semi_int_gemm) SEMI_INT_GEMM="$2"; shift 2 ;;
         --hw_align)    HW_ALIGN=1;         shift   ;;
+        --hw_accurate) HW_ACCURATE=1;     shift   ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
@@ -351,6 +361,12 @@ if [ "$INT_GEMM" == "1" ]; then
     if [ "$ACC_DTYPE" != "float" ]; then
         INT_GEMM_FLAG="${INT_GEMM_FLAG} --acc_dtype ${ACC_DTYPE}"
     fi
+    if [ "$LSB_MAC_SHIFT" != "0" ]; then
+        INT_GEMM_FLAG="${INT_GEMM_FLAG} --lsb_mac_shift ${LSB_MAC_SHIFT}"
+    fi
+    if [ "$T1_MSB_SCAN" == "1" ]; then
+        INT_GEMM_FLAG="${INT_GEMM_FLAG} --t1_msb_scan"
+    fi
 fi
 
 SMQ_FLAG=""
@@ -361,6 +377,11 @@ fi
 GSCALER_FLAG=""
 if [ -n "$GSCALER" ]; then
     GSCALER_FLAG="--gscaler ${GSCALER}"
+fi
+
+HWSCALE_FLAG=""
+if [ -n "$HWSCALE" ]; then
+    HWSCALE_FLAG="--hwscale ${HWSCALE}"
 fi
 
 GPTQ_STRENGTH_FLAG=""
@@ -401,6 +422,9 @@ fi
 HW_ALIGN_FLAG=""
 if [ "$HW_ALIGN" == "1" ]; then
     HW_ALIGN_FLAG="--hw_align"
+fi
+if [ "$HW_ACCURATE" == "1" ]; then
+    HW_ALIGN_FLAG="--hw_accurate"
 fi
 
 R4_STATS_FLAG=""
@@ -448,6 +472,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ "$PROJ_EX" != "0" ] && TAG_ARGS="${TAG_ARGS} --proj_ex ${PROJ_EX}"
 [ "$PROJ_EX" == "0" ] && [ "$NO_R4" == "1" ] && TAG_ARGS="${TAG_ARGS} --no_r4"
 [ "$PROJ_EX" == "0" ] && [ -n "$DOWN_BITS" ] && TAG_ARGS="${TAG_ARGS} --down_bits ${DOWN_BITS}"
+[ -n "$OPROJ_BITS" ] && TAG_ARGS="${TAG_ARGS} --oproj_bits ${OPROJ_BITS}"
 [ "$EQ" == "1" ] && TAG_ARGS="${TAG_ARGS} --eq"
 [ -n "$PWL_ACT_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${PWL_ACT_FLAG}"
 [ -n "$INT_GEMM_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${INT_GEMM_FLAG}"
@@ -456,6 +481,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ -n "$IMITATE_GGUF_TAG_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${IMITATE_GGUF_TAG_FLAG}"
 [ -n "$GPTQ_STRENGTH_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GPTQ_STRENGTH_FLAG}"
 [ -n "$GSCALER_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GSCALER_FLAG}"
+[ -n "$HWSCALE_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${HWSCALE_FLAG}"
 [ "$SIM_VERSION" != "0" ] && TAG_ARGS="${TAG_ARGS} --sim_version ${SIM_VERSION}"
 [ "$FP32" == "1" ] && TAG_ARGS="${TAG_ARGS} --fp32"
 [ "$REALINT" == "1" ] && TAG_ARGS="${TAG_ARGS} --realint"
@@ -465,6 +491,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ "$IG_COMPARE" == "1" ] && TAG_ARGS="${TAG_ARGS} --ig_compare"
 [ -n "$SEMI_INT_GEMM" ] && TAG_ARGS="${TAG_ARGS} --semi_int_gemm ${SEMI_INT_GEMM}"
 [ "$HW_ALIGN" == "1" ] && TAG_ARGS="${TAG_ARGS} --hw_align"
+[ "$HW_ACCURATE" == "1" ] && TAG_ARGS="${TAG_ARGS} --hw_accurate"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
 QUANT_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS})
@@ -601,6 +628,7 @@ python main_for_test.py \
     ${IMITATE_GGUF_FLAG} \
     ${QUANT_WARN_FLAG} \
     ${GSCALER_FLAG} \
+    ${HWSCALE_FLAG} \
     ${GPTQ_STRENGTH_FLAG} \
     ${FP32_FLAG} \
     ${REALINT_FLAG} \
@@ -614,6 +642,7 @@ python main_for_test.py \
     --proj_ex ${PROJ_EX} \
     $([ "$NO_R4" == "1" ] && echo "--no_r4") \
     $([ -n "$DOWN_BITS" ] && echo "--down_bits ${DOWN_BITS}") \
+    $([ -n "$OPROJ_BITS" ] && echo "--oproj_bits ${OPROJ_BITS}") \
     $([ "$EQ" == "1" ] && echo "--eq") \
     --percdamp 0.1 \
     --no-w_ft \

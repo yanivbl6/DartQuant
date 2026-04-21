@@ -244,6 +244,12 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
     # accompanies "wAsym").
     strip_patterns = [key_pattern]
 
+    # Why: under --imitate_gguf the weight-bit prefix is forced to w0
+    # (experiment_config.build_quant_tag), so imitate runs never pair with
+    # their w4/w8 baseline. Neutralize the leading w{N} inside the compound
+    # w{N}a{N}k{N}v{N} token (and any bare w{N}) for imitate comparisons.
+    neutralize_w_bits = 'imitate' in cmp_lower
+
     if mode == "binary":
         baseline_indices = groups[cmp_lower]
         other_indices = [idx for g, idxs in groups.items()
@@ -266,8 +272,11 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
 
     def _pair_key(path):
         tokens = _norm_base(path).split('_')
-        return '_'.join(t for t in tokens
-                        if not any(p.match(t) for p in strip_patterns))
+        tokens = [t for t in tokens
+                  if not any(p.match(t) for p in strip_patterns)]
+        if neutralize_w_bits:
+            tokens = [re.sub(r'^w\d+', 'w', t) for t in tokens]
+        return '_'.join(tokens)
 
     baseline_by_key = {_pair_key(runs[idx][3]): idx
                        for idx in groups[baseline_key]}

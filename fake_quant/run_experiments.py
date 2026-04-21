@@ -15,10 +15,14 @@ Runfile mode — run diverse experiments from an external file:
 
   Runfile format (one run per line):
     name: MODE [args for dart_gptq_wxaykvz.sh, WITHOUT -g]
-    # lines starting with # are comments
-    # completed runs are marked automatically:
-    [DONE] name: MODE args...
-    [ERROR] name: MODE args...
+    # lines starting with # or ; are comments
+    # run state is tracked via a [FLAG] prefix, written automatically:
+    [CAL] name: ...             calibration done, inference pending
+    [FAST] name: ...            fast inference done (re-run if --fast not set)
+    [DONE] name: ...            thorough inference done; skipped
+    [ERROR] name: ...           inference failed (calibration OK) — retried
+    [ERROR-CALIBRATE] name: ... calibration failed — retried with --calibrate
+    Use --recalib to force a full re-run (calibration + inference) regardless.
 """
 
 import argparse
@@ -32,6 +36,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import experiment_config as cfg
+import runfile_flags as rf
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(SCRIPT_DIR, '..', 'data', 'cached_results')
@@ -120,6 +125,10 @@ Examples:
     parser.add_argument('--calibrate', action='store_true',
                         help='Run calibration before experiments (runfile mode: '
                              'static-act calibration; standard mode: R1/R2 training)')
+    parser.add_argument('--recalib', action='store_true',
+                        help='Force re-calibration AND re-inference for all selected '
+                             'runfile lines, ignoring existing [DONE]/[FAST]/[CAL] flags. '
+                             'Implies --calibrate in runfile mode.')
     parser.add_argument('--calibrate_gpu', type=int, default=None,
                         help='GPU for calibration (default: first of --gpus)')
     parser.add_argument('--overwrite', action='store_true',
@@ -198,9 +207,11 @@ CALIBRATER_DIR = os.path.join(SCRIPT_DIR, '..', 'calibrater')
 
 
 def run_calibration_for_runfile(args):
-    """Run static-act calibration for all relevant runfile lines, then return.
+    """Run static-act calibration for all runfile lines that need it.
 
-    Aborts (sys.exit) on any calibration failure.
+    Marks each runfile line with [CAL] on success or [ERROR-CALIBRATE] on
+    failure. Does NOT abort on calibration failure — the downstream
+    inference phase skips [ERROR-CALIBRATE] lines via needs_inference().
     """
     sys.path.insert(0, CALIBRATER_DIR)
     from multi_calibration import (
@@ -208,102 +219,67 @@ def run_calibration_for_runfile(args):
         run_batch,
     )
 
-    # Parse runfile for static-act lines (deduped by mode+quant_tag)
-    runs = parse_runfile_for_calibration(args.runfile)
-    if not runs:
-        print("No --static-act runs found in runfile; skipping calibration.")
+    # Returns list of group dicts with 'names' for per-line flag writeback.
+    groups = parse_runfile_for_calibration(args.runfile, recalib=args.recalib)
+    if not groups:
+        print("No calibration groups need running (all static-act lines already calibrated).")
         return
 
-    # Compute GPU list — expand scalar to len(runs) (not len(entries))
+    # Compute GPU list — expand scalar to len(groups)
     gpu_str = args.gpus
     parts = gpu_str.split(',')
     if len(parts) == 1:
         s = int(parts[0])
-        gpus = list(range(s, s + len(runs)))
+        gpus = list(range(s, s + len(groups)))
     else:
         gpus = [int(p) for p in parts]
 
-    print(f"\n=== Calibration: {len(runs)} static-act runs from {args.runfile} ===\n")
+    print(f"\n=== Calibration: {len(groups)} group(s) from {args.runfile} ===\n")
 
     # Ensure R1/R2 exist for dart models
     dart_models = set()
-    for name, mode, model_short, quant_args, line_extra, quant_tag in runs:
-        if mode == 'dart':
-            model_full = cfg.resolve_model(model_short)
+    for g in groups:
+        if g['mode'] == 'dart':
+            model_full = cfg.resolve_model(g['model_short'])
             dart_models.add(cfg.model_name_from_path(model_full))
     if dart_models:
         ensure_r1r2(dart_models, gpus, dry=args.dry, cwd=CALIBRATER_DIR)
 
-    # Build calibration commands (--gptq forwarded if set; experiment-only
-    # flags like --overwrite/--fast already stripped by _IGNORE_FLAGS)
+    # Build calibration commands; remember which runfile names each label covers.
     jobs = []
-    for name, mode, model_short, quant_args, line_extra, quant_tag in runs:
-        extra = list(line_extra)
+    label_to_names = {}
+    for g in groups:
+        extra = list(g['extra_args'])
         if args.gptq:
             extra.append('--gptq')
-        cmd = build_calibrate_cmd(mode, model_short, quant_args, extra)
-        label = f"cal:{mode}:{quant_tag}"
+        cmd = build_calibrate_cmd(g['mode'], g['model_short'], g['quant_args'], extra)
+        label = f"cal:{g['mode']}:{g['quant_tag']}"
         jobs.append((label, cmd))
+        label_to_names[label] = list(g['names'])
 
-    # Run calibration in batches (cwd=calibrater/ for relative paths)
     results = run_batch(jobs, gpus, dry=args.dry, cwd=CALIBRATER_DIR)
 
     if args.dry:
         return
 
-    # Abort on any failure
-    failed = [label for label, rc in results.items() if rc != 0]
-    if failed:
-        print(f"\n=== Calibration FAILED for: {', '.join(failed)} ===")
-        print("Aborting — will not run experiments.")
-        sys.exit(1)
+    # Mark each contributing runfile line with [CAL] or [ERROR-CALIBRATE].
+    failed_labels = []
+    for label, rc in results.items():
+        new_flag = rf.FLAG_CAL if rc == 0 else rf.FLAG_ERROR_CAL
+        for name in label_to_names.get(label, []):
+            rf.mark_runfile(args.runfile, name, new_flag)
+        if rc != 0:
+            failed_labels.append(label)
 
-    print(f"\n=== All {len(runs)} calibrations completed successfully ===\n")
+    if failed_labels:
+        print(f"\n=== Calibration FAILED for: {', '.join(failed_labels)} ===")
+        print("Affected lines marked [ERROR-CALIBRATE]; inference will skip them.")
+    else:
+        print(f"\n=== All {len(groups)} calibration group(s) completed successfully ===\n")
 
 
 # ── Runfile helpers ──────────────────────────────────────────────────────
-
-def parse_runfile(path):
-    """Parse a runfile, returning unmarked entries.
-
-    Returns list of (name, cmd_args_string) for lines that
-    don't start with [DONE] or [ERROR].
-    """
-    entries = []
-    with open(path) as f:
-        for i, raw in enumerate(f):
-            line = raw.strip()
-            if not line or line.startswith('#') or line.startswith(';'):
-                continue
-            if line.startswith('[DONE]') or line.startswith('[ERROR]'):
-                continue
-            colon = line.find(':')
-            if colon == -1:
-                print(f"Warning: skipping malformed line {i+1}: {line}")
-                continue
-            name = line[:colon].strip()
-            cmd_args = line[colon+1:].strip()
-            entries.append((name, cmd_args))
-    return entries
-
-
-def mark_runfile(path, name, status):
-    """Mark a run in the runfile by matching its name prefix.
-
-    Safe to call even if the file was edited (lines added/removed)
-    while runs were in progress.
-    """
-    with open(path) as f:
-        lines = f.readlines()
-    prefix = '[DONE] ' if status == 'done' else '[ERROR] '
-    target = name + ':'
-    for i, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped.startswith(target):
-            lines[i] = prefix + stripped if stripped.endswith('\n') else prefix + stripped + '\n'
-            break
-    with open(path, 'w') as f:
-        f.writelines(lines)
+# Flag parsing/writing lives in runfile_flags.py (shared with multi_calibration).
 
 
 def _run_parallel_batches(active_cmds, gpus, refresh, log_fn, on_complete=None):
@@ -374,39 +350,72 @@ def _run_parallel_batches(active_cmds, gpus, refresh, log_fn, on_complete=None):
 def run_from_file(args):
     """Run experiments defined in a runfile."""
     runfile = args.runfile
-    entries = parse_runfile(runfile)
+    fast_mode = bool(args.fast or args.very_fast)
+    calibrate_requested = bool(args.calibrate or args.recalib)
+
+    entries = rf.parse_runfile(runfile)
     if not entries:
-        print("No unmarked runs found in runfile.")
+        print("No runs found in runfile.")
         return
 
     # --- Optional calibration before experiments ---
-    if args.calibrate:
+    # Calibration phase marks each touched line with [CAL] / [ERROR-CALIBRATE].
+    if calibrate_requested:
         run_calibration_for_runfile(args)
         gptq_for_experiments = False   # consumed by calibration
+        # Re-parse to pick up freshly-written [CAL] / [ERROR-CALIBRATE] flags.
+        entries = rf.parse_runfile(runfile)
     else:
         gptq_for_experiments = args.gptq
+
+    # Filter inference-eligible entries based on flag + fast/recalib state.
+    inference_entries = []
+    cal_error_skipped = []
+    done_skipped = []
+    for flag, name, cmd_args in entries:
+        if rf.needs_inference(flag, fast=fast_mode, recalib=args.recalib):
+            inference_entries.append((flag, name, cmd_args))
+        elif flag == rf.FLAG_ERROR_CAL:
+            cal_error_skipped.append(name)
+        else:
+            done_skipped.append((flag, name))
+
+    if cal_error_skipped:
+        print(f"\nWARNING: {len(cal_error_skipped)} line(s) are [ERROR-CALIBRATE]; "
+              f"inference skipped. Re-run with --calibrate (or --recalib) to retry.")
+        for name in cal_error_skipped:
+            print(f"  - {name}")
+
+    if done_skipped:
+        print(f"\nSkipping {len(done_skipped)} already-completed line(s):")
+        for flag, name in done_skipped:
+            print(f"  - [{flag}] {name}")
+
+    if not inference_entries:
+        print("\nNo inference runs to execute.")
+        return
 
     # Parse GPUs
     gpu_str = args.gpus
     parts = gpu_str.split(',')
     if len(parts) == 1:
         s = int(parts[0])
-        gpus = list(range(s, s + len(entries)))
+        gpus = list(range(s, s + len(inference_entries)))
     else:
         gpus = [int(p) for p in parts]
 
-    # Parse skip set (1-indexed)
+    # Parse skip set (1-indexed over inference_entries)
     skip_set = set()
     if args.skip:
         skip_set = {int(x) for x in args.skip.split(',')}
 
     script = os.path.join(SCRIPT_DIR, 'Script', 'dart_gptq_wxaykvz.sh')
 
-    print(f"=== {len(entries)} runs from {runfile} ===\n")
+    print(f"\n=== {len(inference_entries)} inference run(s) from {runfile} ===\n")
 
     # Build all commands
     cmds = []
-    for i, (name, cmd_args) in enumerate(entries):
+    for i, (flag, name, cmd_args) in enumerate(inference_entries):
         idx = i + 1
         gpu = gpus[i % len(gpus)]
         cmd = [script] + shlex.split(cmd_args) + ['-g', str(gpu)]
@@ -418,12 +427,13 @@ def run_from_file(args):
             cmd.append('--very-fast')
         elif args.fast:
             cmd.append('-F')
+        flag_note = f" [{flag}→rerun]" if flag else ""
         if idx in skip_set:
             cmds.append((name, cmd, True))
-            print(f"  [skipped] {name}: {' '.join(cmd)}")
+            print(f"  [skipped] {name}{flag_note}: {' '.join(cmd)}")
         else:
             cmds.append((name, cmd, False))
-            print(f"  [GPU {gpu}] {name}: {' '.join(cmd)}")
+            print(f"  [GPU {gpu}] {name}{flag_note}: {' '.join(cmd)}")
 
     if args.dry:
         return
@@ -437,7 +447,8 @@ def run_from_file(args):
             os.remove(log_path)
 
     def on_complete(name, rc):
-        mark_runfile(runfile, name, 'done' if rc == 0 else 'error')
+        new_flag = rf.inference_completion_flag(fast_mode) if rc == 0 else rf.FLAG_ERROR
+        rf.mark_runfile(runfile, name, new_flag)
 
     total_failed = _run_parallel_batches(
         active_all, gpus, args.refresh,

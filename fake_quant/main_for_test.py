@@ -84,6 +84,13 @@ def main():
         logging.info("down_bits=%d: overriding down_proj input bits", args.down_bits)
         args.a_bits_down_proj = args.down_bits
 
+    # --- hw_accurate: validate ---
+    if getattr(args, 'hw_accurate', False):
+        assert args.act_scales_path, \
+            "--hw_accurate requires static activation scales (--act_scales_path / static mode)"
+        assert not getattr(args, 'hw_align', False), \
+            "--hw_accurate and --hw_align are mutually exclusive"
+
     # Enable softmax output quantization (replaces SDPA globally)
     if args.smq > 0:
         import smq_utils
@@ -412,10 +419,14 @@ def main():
             if 'lm_head' in name:  # Skip lm_head quantization
                 layer_input_bits = 16
 
-            if args.o_per_head and 'o_proj' in name:  # Set the o_proj precision
-                num_heads = model.config.num_attention_heads
-                model_dim = model.config.hidden_size
-                layer_groupsize = model_dim // num_heads
+            if 'o_proj' in name:  # Set the o_proj precision
+                if getattr(args, 'oproj_bits', None) is not None:
+                    layer_input_bits = args.oproj_bits
+                # hw_accurate uses per-tensor for o_proj — skip per-head grouping
+                if args.o_per_head and not getattr(args, 'hw_accurate', False):
+                    num_heads = model.config.num_attention_heads
+                    model_dim = model.config.hidden_size
+                    layer_groupsize = model_dim // num_heads
 
             if 'down_proj' in name:  # Set the down_proj precision
                 if args.a_bits_down_proj is not None:
@@ -515,7 +526,10 @@ def main():
                 acc_wrap=args.acc_wrap,
                 acc_dtype=getattr(args, 'acc_dtype', 'float'),
                 gscaler_parsed=getattr(args, 'gscaler_parsed', None),
+                lsb_mac_shift=getattr(args, 'lsb_mac_shift', 0),
+                t1_msb_scan=getattr(args, 't1_msb_scan', False),
             )
+            qlayer.quantizer._sd_name = name
             n_int_gemm += 1
         logging.info("Integer GEMM prepared for %d layers", n_int_gemm)
 
@@ -723,6 +737,101 @@ def main():
         logging.info("hw_align: converted %d static quantizers to per-group scales "
                      "(group_size=%d)", n_hw_aligned, _hw_G)
 
+    # --- Hardware-accurate activation scales: collapse ALL static quantizers to per-tensor ---
+    if getattr(args, 'hw_accurate', False) and args.act_scales_path:
+        n_hw_acc = 0
+
+        def _collapse_to_pertensor(q, label):
+            """Collapse a static quantizer's per-column scales to a single per-tensor scalar."""
+            nonlocal n_hw_acc
+            if not q.static or (q.bits >= 16 and not q.realint):
+                return
+            col_scale = q.scale.to('cpu').flatten()   # [K] from calibration
+            if col_scale.numel() <= 1:
+                return  # already scalar
+            maxq = q.maxq.to('cpu')
+
+            if q.sym:
+                per_tensor_scale = col_scale.max()
+                q.scale = per_tensor_scale.unsqueeze(0)
+                q.zero = torch.zeros(1)
+            else:
+                col_zero = q.zero.to('cpu').flatten()  # [K]
+                # Recover representable range per column, then global envelope
+                col_min = -(col_zero * col_scale)            # [K]
+                col_max = (maxq - col_zero) * col_scale      # [K]
+                global_min = col_min.min()
+                global_max = col_max.max()
+                per_tensor_scale = (global_max - global_min) / maxq
+                if per_tensor_scale == 0:
+                    per_tensor_scale = torch.ones(1)
+                global_zero = torch.round(-global_min / per_tensor_scale)
+                q.scale = per_tensor_scale.unsqueeze(0)
+                q.zero = global_zero.unsqueeze(0)
+
+            n_hw_acc += 1
+
+        # Quantizers in the down_proj path keep per-channel scales (the hardware
+        # uses per-channel input_scale for down_proj, and all quantizers feeding
+        # into it must preserve per-channel granularity):
+        #   - down_proj.quantizer (input)
+        #   - down_proj.pre_quantizer (pre-R4 rotation)
+        #   - gate_proj.out_quantizer (feeds into SiLU * up → down_proj)
+        #   - up_proj.out_quantizer (feeds into gate * up → down_proj)
+        #   - PWL output_quantizer (replaces SiLU, feeds into down_proj)
+        _DOWN_PATH_PROJ = ('down_proj',)
+        _DOWN_PATH_OUT = ('gate_proj', 'up_proj')
+
+        def _in_down_path(name, quantizer_type):
+            """Return True if this quantizer feeds into the down_proj per-channel path."""
+            if quantizer_type == 'quantizer':
+                return any(p in name for p in _DOWN_PATH_PROJ)
+            if quantizer_type == 'out_quantizer':
+                return any(p in name for p in _DOWN_PATH_OUT)
+            if quantizer_type == 'pre_quantizer':
+                return any(p in name for p in _DOWN_PATH_PROJ)
+            return False
+
+        # 1. ActQuantWrapper quantizers (input, output, pre-R4)
+        qlayers_hwa = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        n_skip = 0
+        for name, qlayer in qlayers_hwa.items():
+            for qtype in ('quantizer', 'out_quantizer', 'pre_quantizer'):
+                q = getattr(qlayer, qtype)
+                if _in_down_path(name, qtype):
+                    n_skip += 1
+                else:
+                    _collapse_to_pertensor(q, f'{name}.{qtype}')
+
+        # 2. QKRotationWrapper quantizers (K-cache, Q)
+        layers_hwa = model_utils.get_layers(model)
+        for i, layer in enumerate(layers_hwa):
+            rope_fn = model_utils.get_rope_function_name(model)
+            wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
+            if hasattr(layer.self_attn, wrapper_attr):
+                wrapper = getattr(layer.self_attn, wrapper_attr)
+                _collapse_to_pertensor(wrapper.k_quantizer, f'layer.{i}.k_quantizer')
+                if hasattr(wrapper, 'q_quantizer'):
+                    _collapse_to_pertensor(wrapper.q_quantizer, f'layer.{i}.q_quantizer')
+
+        # 3. Residual quantizers
+        for i, layer in enumerate(layers_hwa):
+            for tag in ('_attn_res_quantizer', '_mlp_res_quantizer'):
+                rq = getattr(layer, tag, None)
+                if rq is not None:
+                    _collapse_to_pertensor(rq, f'layer.{i}.{tag}')
+
+        # 4. PWL quantizers — output feeds into down_proj path, keep per-channel
+        if getattr(args, 'pwl_act', False):
+            import pwl_utils
+            for name, pwl_mod in pwl_utils.find_pwl_activations(model).items():
+                _collapse_to_pertensor(pwl_mod.input_quantizer, f'{name}.input_quantizer')
+                # PWL output_quantizer feeds into down_proj path — skip collapse
+                n_skip += 1
+
+        logging.info("hw_accurate: collapsed %d static quantizers to per-tensor scales "
+                     "(%d kept per-channel for down_proj path)", n_hw_acc, n_skip)
+
     # Convert per-column static scales to per-group for int_gemm layers.
     # Per-column scales can't factor out of a dot product.  Per-group scales
     # (one per acc_block_k columns) can — each K-block gets its own scale.
@@ -733,6 +842,10 @@ def main():
     _acc_dtype_is_fp32 = (_acc_kind == 'float' and _acc_type_bits == 32)
     _acc_dtype_is_int = (_acc_kind == 'int')
     _acc_dtype_needs_pergroup = _acc_dtype_is_fp32 or _acc_dtype_is_int
+    _hw_acc = getattr(args, 'hw_accurate', False)
+    if _hw_acc and args.int_gemm and args.act_scales_path and _acc_dtype_needs_pergroup:
+        logging.info("hw_accurate: per-tensor a_scale for non-down-path layers (T2); "
+                     "per-group conversion for down_proj (per-channel approximation)")
     if args.int_gemm and args.act_scales_path and _acc_dtype_needs_pergroup:
         G = args.acc_block_k
         qlayers_pg = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
@@ -742,6 +855,16 @@ def main():
                 continue
             q = qlayer.quantizer
             if not q.static:
+                continue
+            # hw_accurate: non-down-path layers keep per-tensor scales [1] (applied
+            # post-loop / T2). Only down_proj goes through the per-group conversion
+            # — its scales are preserved as [K] per-column and we convert them to
+            # per-group [n_groups] to approximate the per-channel hardware spec
+            # (int_gemm can't natively apply per-column scales in a dot product).
+            if _hw_acc and 'down_proj' not in name:
+                continue
+            # Skip already-collapsed scalars (non-down-path under hw_accurate).
+            if q.scale.numel() <= 1:
                 continue
             col_scale = q.scale.flatten()  # [K] from calibration
             col_zero = q.zero.flatten()   # [K] from calibration
@@ -778,6 +901,66 @@ def main():
             for name, qlayer in qlayers_pg.items():
                 if (getattr(qlayer, 'use_int_gemm', False) or getattr(qlayer, 'use_semi_int_gemm', False)) and qlayer.quantizer.static:
                     qlayer.compute_static_zp_bias()
+
+    # --- hwscale: merge per-group (a_gscale × w_gscale) and snap to MxSy ---
+    # Applied at model-load for inference only. Untouched: GPTQ cache,
+    # calibration scales, zero-point mechanism. Replaces gscaler's
+    # exponent-bias trick with a per-layer FP32 global scale at T2.
+    _hwscale_spec = getattr(args, 'hwscale_parsed', None)
+    if args.int_gemm and _hwscale_spec is not None:
+        import math as _math
+        qlayers_hs = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        n_merged = 0
+        last_global = 1.0
+        for name, qlayer in qlayers_hs.items():
+            if not getattr(qlayer, 'use_int_gemm', False):
+                continue
+            q = qlayer.quantizer
+            # Require per-group activation scales at T1 (static, groupsize > 0).
+            if not q.static or q.groupsize <= 0:
+                continue
+            # Require per-group weight scales at T1 with matching geometry.
+            if (qlayer.w_scale is None or qlayer.w_scale.dim() != 2
+                    or qlayer.w_group_size <= 0
+                    or qlayer.w_group_size != q.groupsize):
+                continue
+            dev = qlayer.w_scale.device
+            a_gscale = q.scale.to(dev)                      # [n_groups]
+            # Undo gscaler prescaling (if any) — hwscale replaces that mechanism.
+            w_shift = getattr(qlayer, 'w_shift_bias', 0)
+            w_gscale = qlayer.w_scale
+            if w_shift > 0:
+                w_gscale = w_gscale * (2.0 ** (-w_shift))
+            # Merge and snap to MxSy (+ per-layer FP32 global).
+            raw_merged = a_gscale.unsqueeze(0) * w_gscale   # [N, n_groups]
+            stored, global_scalar = quant_utils.snap_to_hwscale(raw_merged, _hwscale_spec)
+            # Per-layer diagnostic for auto-bias modes
+            _mode = _hwscale_spec.get('bias_auto')
+            if _mode:
+                z_chosen = int(round(-_math.log2(global_scalar))) if global_scalar > 0 else 0
+                _abs_nz = raw_merged.abs()
+                _abs_nz = _abs_nz[_abs_nz > 0]
+                _min_nz = _abs_nz.min().item() if _abs_nz.numel() > 0 else 0.0
+                _max_val = raw_merged.abs().max().item()
+                _median = _abs_nz.median().item() if _abs_nz.numel() > 0 else 0.0
+                logging.info("  hwscale[b%s] %s: z=%d (global=%g) "
+                             "[min_nz=%g, median=%g, max=%g]",
+                             _mode, name, z_chosen, global_scalar,
+                             _min_nz, _median, _max_val)
+            # Stuff the MxSy-snapped merged value into w_scale, compensating
+            # for the a_gscale multiplication the kernel still applies.
+            # Kernel T1: partial * a_gscale * w_scale = partial * (a*w)_snapped.
+            # q.scale is KEPT intact — quantize_to_int uses it to scale
+            # activations to int8 before the matmul.
+            qlayer.w_scale = (stored / a_gscale.unsqueeze(0)).contiguous()
+            qlayer.hwscale_global = float(global_scalar)
+            qlayer.w_shift_bias = 0  # hwscale replaces gscaler exponent-bias
+            last_global = float(global_scalar)
+            n_merged += 1
+        if n_merged:
+            logging.info("hwscale: merged a_gscale * w_gscale for %d layers "
+                         "(spec=%s, last-layer global=%g)",
+                         n_merged, _hwscale_spec['spec'], last_global)
 
     # --- Selective dynamic: revert matching layers from static to dynamic ---
     if args.act_scales_path and getattr(args, 'selective_dyn', None):

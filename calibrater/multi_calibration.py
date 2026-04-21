@@ -16,7 +16,8 @@ Runfile mode — calibrate from the same runfile used by run_experiments.py:
     python multi_calibration.py --runfile ../fake_quant/runs.txt -g 2 --gptq --dry
 
 Only lines with --static-act are calibrated; others are silently skipped.
-The runfile is NOT modified (no [DONE]/[ERROR] markers).
+Each calibrated line is marked [CAL] on success or [ERROR-CALIBRATE] on
+failure. Use --recalib to force re-calibration of already-calibrated lines.
 """
 
 import argparse
@@ -29,6 +30,7 @@ import threading
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'fake_quant'))
 import experiment_config as cfg
+import runfile_flags as rf
 
 
 def stream_output(proc, prefix):
@@ -151,6 +153,8 @@ Examples:
                              'When set, -m and quant args are taken from each line.')
     parser.add_argument('--gptq', action='store_true',
                         help='Delete cached GPTQ checkpoint and re-quantize (forwarded to calibrate)')
+    parser.add_argument('--recalib', action='store_true',
+                        help='Force re-calibration regardless of existing [CAL]/[FAST]/[DONE]/[ERROR] flags')
 
     # Calibration-specific extras (--nsamples, --seqlen, etc.) remain in extra_args
     return parser.parse_known_args()
@@ -240,48 +244,66 @@ def _filter_runtime_flags(tokens):
     return filtered
 
 
-def parse_runfile_for_calibration(path):
-    """Parse a runfile, returning only --static-act runs for calibration.
+def parse_runfile_for_calibration(path, recalib=False):
+    """Parse a runfile and return groups of --static-act lines that need calibration.
 
-    Returns list of (name, mode, model_short, quant_args, extra_args, quant_tag).
-    Deduplicates by (mode, quant_tag).
+    Groups lines by (mode, quant_tag). A group is returned only if at least
+    one contributing line needs calibration according to
+    ``runfile_flags.needs_calibration(flag, recalib)``.
+
+    Returns list of dicts:
+        {'mode': str, 'model_short': str, 'quant_args': [...],
+         'extra_args': [...], 'quant_tag': str, 'names': [str, ...]}
+
+    ``names`` contains every runfile line name that maps to this group,
+    including ones already calibrated — the caller uses it to mark all
+    contributing lines when a calibration completes (or fails).
     """
-    from run_experiments import parse_runfile
+    entries = rf.parse_runfile(path)
+    groups = {}  # key (mode, quant_tag) -> group dict
+    order = []  # preserve insertion order for deterministic output
 
-    entries = parse_runfile(path)
-    seen = set()
-    runs = []
-
-    for name, cmd_args in entries:
+    for flag, name, cmd_args in entries:
         tokens = shlex.split(cmd_args)
 
         # Only calibrate static-act runs
         if '--static-act' not in tokens:
             continue
 
-        # Extract mode (first token: baseline/quarot/dart)
         mode = tokens[0]
         rest = tokens[1:]
 
-        # Filter out ignored flags
         filtered = _filter_runtime_flags(rest)
-
-        # Parse through experiment_config to get structured args
         line_args, extra = _parse_runfile_line_args(filtered)
         cfg.resolve_v_bits(line_args)
-        # Resolve model shorthand so GGUF path lookup works
         line_args.model = cfg.resolve_model(line_args.model)
 
         quant_tag = cfg.build_quant_tag(line_args)
         key = (mode, quant_tag)
-        if key in seen:
-            continue
-        seen.add(key)
 
-        quant_args = cfg.build_quant_args(line_args)
-        runs.append((name, mode, line_args.model, quant_args, extra, quant_tag))
+        if key not in groups:
+            groups[key] = {
+                'mode': mode,
+                'model_short': line_args.model,
+                'quant_args': cfg.build_quant_args(line_args),
+                'extra_args': extra,
+                'quant_tag': quant_tag,
+                'names': [],
+                'flags': [],
+            }
+            order.append(key)
+        groups[key]['names'].append(name)
+        groups[key]['flags'].append(flag)
 
-    return runs
+    # Keep only groups where at least one member needs calibration.
+    result = []
+    for key in order:
+        g = groups[key]
+        if any(rf.needs_calibration(flag, recalib=recalib) for flag in g['flags']):
+            # Drop the transient 'flags' field before returning.
+            g.pop('flags', None)
+            result.append(g)
+    return result
 
 
 def ensure_r1r2(model_names, gpus, dry=False, cwd=None):
@@ -303,35 +325,41 @@ def ensure_r1r2(model_names, gpus, dry=False, cwd=None):
 
 
 def run_from_runfile(args, extra_args):
-    """Run calibrations from a runfile."""
-    runs = parse_runfile_for_calibration(args.runfile)
-    if not runs:
-        print("No --static-act runs found in runfile.")
+    """Run calibrations from a runfile.
+
+    Marks each contributing runfile line with [CAL] on success or
+    [ERROR-CALIBRATE] on failure. With --recalib, calibrates every
+    static-act group regardless of existing flags.
+    """
+    groups = parse_runfile_for_calibration(args.runfile, recalib=args.recalib)
+    if not groups:
+        print("No calibration groups need running (all static-act lines already calibrated).")
         return
 
-    gpus = parse_gpus(args.gpus, n_needed=len(runs))
+    gpus = parse_gpus(args.gpus, n_needed=len(groups))
 
-    print(f"=== {len(runs)} calibration runs from {args.runfile} ===\n")
+    print(f"=== {len(groups)} calibration group(s) from {args.runfile} ===\n")
 
-    # Phase 1: Train R1/R2 if any dart runs need it
+    # Phase 1: Train R1/R2 if any dart groups need it
     dart_models = set()
-    for name, mode, model_short, quant_args, line_extra, quant_tag in runs:
-        if mode == 'dart':
-            model_full = cfg.resolve_model(model_short)
+    for g in groups:
+        if g['mode'] == 'dart':
+            model_full = cfg.resolve_model(g['model_short'])
             dart_models.add(cfg.model_name_from_path(model_full))
     if dart_models:
         ensure_r1r2(dart_models, gpus, dry=args.dry)
 
     # Phase 2: Build calibration commands
     jobs = []
-    for name, mode, model_short, quant_args, line_extra, quant_tag in runs:
-        # Merge extra_args from CLI with line-specific extras
-        all_extra = line_extra + extra_args
+    label_to_names = {}
+    for g in groups:
+        all_extra = list(g['extra_args']) + list(extra_args)
         if args.gptq:
             all_extra.append('--gptq')
-        cmd = build_calibrate_cmd(mode, model_short, quant_args, all_extra)
-        label = f"{mode}:{quant_tag}"
+        cmd = build_calibrate_cmd(g['mode'], g['model_short'], g['quant_args'], all_extra)
+        label = f"{g['mode']}:{g['quant_tag']}"
         jobs.append((label, cmd))
+        label_to_names[label] = list(g['names'])
 
     # Phase 3: Run in batches
     results = run_batch(jobs, gpus, dry=args.dry)
@@ -339,13 +367,21 @@ def run_from_runfile(args, extra_args):
     if args.dry:
         return
 
+    # Phase 4: Mark runfile per group outcome
+    for label, rc in results.items():
+        new_flag = rf.FLAG_CAL if rc == 0 else rf.FLAG_ERROR_CAL
+        for name in label_to_names.get(label, []):
+            rf.mark_runfile(args.runfile, name, new_flag)
+
     # Summary
     print(f"\n{'='*60}")
     print("Calibration summary:")
     print(f"{'='*60}")
     for label, _ in jobs:
-        status = "OK" if results.get(label) == 0 else f"FAILED (exit {results.get(label, '?')})"
-        print(f"  {label:40s} : {status}")
+        rc = results.get(label)
+        status = "OK" if rc == 0 else f"FAILED (exit {rc})"
+        names = label_to_names.get(label, [])
+        print(f"  {label:40s} : {status}  ({len(names)} line(s))")
 
 
 def main():

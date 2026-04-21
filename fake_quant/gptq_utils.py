@@ -325,6 +325,7 @@ def gptq_fwrd(model, dataloader, dev, args):
                             acc_wrap=getattr(args, 'acc_wrap', False),
                             acc_dtype=getattr(args, 'acc_dtype', 'float'),
                             gscaler_parsed=getattr(args, 'gscaler_parsed', None),
+                            lsb_mac_shift=getattr(args, 'lsb_mac_shift', 0),
                         )
 
         # Enable capped int GEMM on any remaining layers (safety net)
@@ -353,6 +354,7 @@ def gptq_fwrd(model, dataloader, dev, args):
                         acc_wrap=getattr(args, 'acc_wrap', False),
                         acc_dtype=getattr(args, 'acc_dtype', 'float'),
                         gscaler_parsed=getattr(args, 'gscaler_parsed', None),
+                        lsb_mac_shift=getattr(args, 'lsb_mac_shift', 0),
                     )
 
         avg_loss = sum(layer_losses) / len(layer_losses) if layer_losses else 0.0

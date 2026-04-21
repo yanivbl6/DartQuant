@@ -140,6 +140,8 @@ def add_quant_args(parser):
                              'Incompatible with --int_gemm on down_proj.')
     parser.add_argument('--down_bits', type=int, default=None,
                         help='Override down_proj input activation bits (without disabling R4)')
+    parser.add_argument('--oproj_bits', type=int, default=None,
+                        help='Override o_proj input activation bits (e.g. 16 for int16 decomposition)')
     parser.add_argument('--eq', action='store_true',
                         help='Enable per-channel equalization on down_proj inputs')
 
@@ -161,6 +163,10 @@ def add_quant_args(parser):
                         help='Wrap-around instead of saturation')
     parser.add_argument('--acc_dtype', type=str, default='float',
                         help='Tier-2 accumulator dtype (e.g. fp16, int24)')
+    parser.add_argument('--lsb_mac_shift', type=int, default=0,
+                        help='Right-shift tl.dot by N bits in LSB int16 kernel (default: 0)')
+    parser.add_argument('--t1_msb_scan', action='store_true',
+                        help='Diagnostic: detect tier-1 accumulator overflow per layer (aborts on mismatch)')
 
     # Softmax Output Quantization
     parser.add_argument('--smq', type=int, default=0,
@@ -195,6 +201,10 @@ def add_quant_args(parser):
     parser.add_argument('--gscaler', type=str, default=None,
                         help='Group scale format: M5S3, M6E4b2, M6S4l2, etc. '
                              '(default: None = FP32 scales)')
+    parser.add_argument('--hwscale', type=str, default=None,
+                        help='Merged (a_gscale*w_gscale) per-group scale snapped '
+                             'to M<m>S<s>[b<z>|l<z>|bmin] at model load. Inference-only '
+                             '(untouched: GPTQ/cal caches). bmin = per-layer auto bias.')
 
     # AdaQuant (alternative to GPTQ)
     parser.add_argument('--adaquant', type=str, nargs='?', const='default', default=None,
@@ -223,6 +233,10 @@ def add_quant_args(parser):
                         help='Diagnostic GEMM with toggleable precision stages (bitmask or keyword)')
     parser.add_argument('--hw_align', action='store_true', default=False,
                         help='Hardware-aligned activation scales (per-group instead of per-column)')
+    parser.add_argument('--hw_accurate', action='store_true', default=False,
+                        help='Hardware-accurate activation scales: collapse all static scales '
+                             'to per-tensor. Combine with --eq for per-channel down_proj '
+                             '(full hardware match). Mutually exclusive with --hw_align.')
     parser.add_argument('--quant_out', type=str, default='none',
                         choices=['none', 'up', 'mlp', 'spec', 'speco', 'all', 'r4', 'res', 'mm', 'ex'],
                         help='Output quantization: none (default), up (up_proj only), '
@@ -277,6 +291,8 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
             tag += "_noR4"
         if getattr(args, 'down_bits', None) is not None:
             tag += f"_down{args.down_bits}"
+    if getattr(args, 'oproj_bits', None) is not None:
+        tag += f"_oproj{args.oproj_bits}"
     if getattr(args, 'eq', False):
         tag += "_eq"
     # PWL activation tag
@@ -303,6 +319,9 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
         acc_dtype_str = getattr(args, 'acc_dtype', 'float')
         if acc_dtype_str.lower().strip() not in ('float', 'fp32'):
             parts.append(f"t2{acc_dtype_str}")
+        _mshift = getattr(args, 'lsb_mac_shift', 0)
+        if _mshift > 0:
+            parts.append(f"mshift{_mshift}")
         tag += "_".join(parts)
     # SMQ tag
     if getattr(args, 'smq', 0) > 0:
@@ -332,6 +351,9 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
     # Group scaler tag
     if getattr(args, 'gscaler', None):
         tag += f"_G-scaler-{args.gscaler}"
+    # hwscale tag (merged per-group a*w scale, result-only — GPTQ/cal caches unchanged)
+    if getattr(args, 'hwscale', None) and not (for_gptq_cache or for_cal_cache):
+        tag += f"_hws-{args.hwscale}"
     # AdaQuant tag
     _aq = getattr(args, 'adaquant', None)
     if _aq is not None:
@@ -350,8 +372,13 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
     if getattr(args, 'realint', False):
         tag += "_RINT"
     # Hardware-aligned activation scales (affects calibration + result, not GPTQ)
-    if getattr(args, 'hw_align', False) and not for_gptq_cache:
+    # hw_accurate reuses the same calibration as hw_align (per-column scales are
+    # identical; the per-tensor collapse is runtime-only).
+    if (getattr(args, 'hw_align', False) or getattr(args, 'hw_accurate', False)) and not for_gptq_cache:
         tag += "_aligned"
+    # Hardware-accurate activation scales (affects result, not GPTQ/calibration)
+    if getattr(args, 'hw_accurate', False) and not (for_gptq_cache or for_cal_cache):
+        tag += "_hwacc"
     # Output quantization tag (activation-side, not relevant for GPTQ cache)
     _qo = getattr(args, 'quant_out', 'none')
     if _qo != 'none' and not for_gptq_cache:
@@ -420,6 +447,8 @@ def build_quant_args(args):
             cmd.append('--no_r4')
         if getattr(args, 'down_bits', None) is not None:
             cmd += ['--down_bits', str(args.down_bits)]
+    if getattr(args, 'oproj_bits', None) is not None:
+        cmd += ['--oproj_bits', str(args.oproj_bits)]
     if getattr(args, 'eq', False):
         cmd.append('--eq')
     if args.pwl_act:
@@ -438,6 +467,9 @@ def build_quant_args(args):
         acc_dtype_str = getattr(args, 'acc_dtype', 'float')
         if acc_dtype_str.lower().strip() not in ('float', 'fp32'):
             cmd += ['--acc_dtype', acc_dtype_str]
+        _mshift = getattr(args, 'lsb_mac_shift', 0)
+        if _mshift > 0:
+            cmd += ['--lsb_mac_shift', str(_mshift)]
     if getattr(args, 'smq', 0) > 0:
         cmd += ['--smq', str(args.smq)]
     if getattr(args, 'imitate_gguf', None):
@@ -452,6 +484,8 @@ def build_quant_args(args):
         cmd += ['--gptq_strength', str(args.gptq_strength)]
     if getattr(args, 'gscaler', None):
         cmd += ['--gscaler', args.gscaler]
+    if getattr(args, 'hwscale', None):
+        cmd += ['--hwscale', args.hwscale]
     _aq = getattr(args, 'adaquant', None)
     if _aq is not None:
         cmd += ['--adaquant', _aq]
@@ -474,6 +508,8 @@ def build_quant_args(args):
         cmd += ['--semi_int_gemm', args.semi_int_gemm]
     if getattr(args, 'hw_align', False):
         cmd.append('--hw_align')
+    if getattr(args, 'hw_accurate', False):
+        cmd.append('--hw_accurate')
     return cmd
 
 

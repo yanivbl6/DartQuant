@@ -458,6 +458,8 @@ Examples:
                         help='Disable R4 rotation on down_proj (without changing bits)')
     parser.add_argument('--down_bits', type=int, default=None,
                         help='Override down_proj input activation bits (without disabling R4)')
+    parser.add_argument('--oproj_bits', type=int, default=None,
+                        help='Override o_proj input activation bits (e.g. 16 for int16 decomposition)')
     parser.add_argument('--eq', action='store_true',
                         help='Enable per-channel equalization on down_proj inputs')
     parser.add_argument('--fp32_had', action='store_true')
@@ -493,6 +495,10 @@ Examples:
                         help='Use wrap-around instead of saturation on accumulator overflow')
     parser.add_argument('--acc_dtype', type=str, default='float',
                         help='Tier-2 accumulator dtype (e.g. fp16, int24). Default: float')
+    parser.add_argument('--lsb_mac_shift', type=int, default=0,
+                        help='Right-shift tl.dot by N bits in LSB int16 kernel (default: 0)')
+    parser.add_argument('--t1_msb_scan', action='store_true',
+                        help='Diagnostic: detect tier-1 accumulator overflow per layer (aborts on mismatch)')
 
     # Softmax Output Quantization
     parser.add_argument('--smq', type=int, default=0,
@@ -557,6 +563,8 @@ Examples:
     # Hardware-aligned activation scales
     parser.add_argument('--hw_align', action='store_true', default=False,
                         help='Tag calibration for hardware-aligned per-group scales')
+    parser.add_argument('--hw_accurate', action='store_true', default=False,
+                        help='Tag calibration for hardware-accurate per-tensor scales.')
 
     # Output quantization
     parser.add_argument('--quant_out', type=str, default='none',
@@ -748,10 +756,14 @@ def main():
         if 'lm_head' in name:
             layer_input_bits = 16
 
-        if args.o_per_head and 'o_proj' in name:
-            num_heads = model.config.num_attention_heads
-            model_dim = model.config.hidden_size
-            layer_groupsize = model_dim // num_heads
+        if 'o_proj' in name:
+            if getattr(args, 'oproj_bits', None) is not None:
+                layer_input_bits = args.oproj_bits
+            # hw_accurate uses per-tensor for o_proj — skip per-head grouping
+            if args.o_per_head and not getattr(args, 'hw_accurate', False):
+                num_heads = model.config.num_attention_heads
+                model_dim = model.config.hidden_size
+                layer_groupsize = model_dim // num_heads
 
         if 'down_proj' in name:
             if getattr(args, 'down_bits', None) is not None:
@@ -842,6 +854,7 @@ def main():
                 aq_args.int_gemm_use_triton = True
                 aq_args.gscaler_parsed = quant_utils.parse_gscaler(
                     getattr(args, 'gscaler', None))
+                aq_args.lsb_mac_shift = getattr(args, 'lsb_mac_shift', 0)
 
                 _quantizers, _x_scales = adaquant_utils.adaquant_fwrd(
                     model, trainloader, 'cuda', aq_args, aq_params)
@@ -907,6 +920,7 @@ def main():
                 # Forward group-scale quantization config
                 gptq_args.gscaler_parsed = quant_utils.parse_gscaler(
                     getattr(args, 'gscaler', None))
+                gptq_args.lsb_mac_shift = getattr(args, 'lsb_mac_shift', 0)
 
                 gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
 
@@ -1074,7 +1088,8 @@ def main():
                 acc_bits=args.acc_bits, acc_block_k=args.acc_block_k,
                 acc_wrap=args.acc_wrap,
                 acc_dtype=getattr(args, 'acc_dtype', 'float'),
-                gscaler_parsed=getattr(args, 'gscaler_parsed', None))
+                gscaler_parsed=getattr(args, 'gscaler_parsed', None),
+                lsb_mac_shift=getattr(args, 'lsb_mac_shift', 0))
             n_ig += 1
             print(f"    done.", flush=True)
         print(f"Integer GEMM prepared for {n_ig} layers", flush=True)

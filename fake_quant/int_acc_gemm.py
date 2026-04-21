@@ -103,6 +103,11 @@ if _HAS_TRITON:
         T2_FRAC_SCALE: tl.constexpr,  # = 2^T2_FRAC_BITS as float (precomputed)
         # Gscaler shift bias — w_scale was prescaled by 2^bias; undo after K-loop
         W_SHIFT_BIAS: tl.constexpr,
+        # hwscale per-layer global FP32 scale — applied once at T2 post-loop.
+        # NOT constexpr: per-layer varying values would trigger a Triton
+        # recompile each time. Passed as a runtime scalar; multiply-by-1.0
+        # is a no-op so the default path pays effectively zero cost.
+        GLOBAL_SCALE_FP32,
         # Weight zero-point correction (asymmetric weights)
         HAS_W_ZP: tl.constexpr,    # True = apply w_zp correction inside accumulator
         W_zp_ptr,                   # [N, n_groups] or [N] int32 — weight zero points
@@ -113,6 +118,7 @@ if _HAS_TRITON:
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         ACC_BLOCK_K: tl.constexpr,  # logical accumulation block size (may be < BLOCK_K for padding)
+        MAC_SHIFT: tl.constexpr,    # right-shift tl.dot partial by N bits (0 = disabled)
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -149,6 +155,10 @@ if _HAS_TRITON:
             # b_tile is [BLOCK_N, BLOCK_K] so we transpose it
             partial = tl.dot(a_tile, tl.trans(b_tile))  # [BLOCK_M, BLOCK_N] int32
 
+            # LSB MAC shift: reduce magnitude before tier-1 cap to prevent wrap
+            if MAC_SHIFT > 0:
+                partial = partial >> MAC_SHIFT
+
             # Cap to tier-1 accumulator range
             if ACC_WRAP:
                 partial = ((partial - ACC_MIN) % ACC_RANGE + ACC_RANGE) % ACC_RANGE + ACC_MIN
@@ -166,7 +176,10 @@ if _HAS_TRITON:
                 else:
                     w_zp_g = tl.load(W_zp_ptr + offs_n * stride_wzp_n,
                                      mask=offs_n < N, other=0)     # [BLOCK_N] int32
-                partial = partial + a_block_sum[:, None] * w_zp_g[None, :]
+                correction = a_block_sum[:, None] * w_zp_g[None, :]
+                if MAC_SHIFT > 0:
+                    correction = correction >> MAC_SHIFT
+                partial = partial + correction
                 # Cap/wrap again after correction
                 if ACC_WRAP:
                     partial = ((partial - ACC_MIN) % ACC_RANGE + ACC_RANGE) % ACC_RANGE + ACC_MIN
@@ -174,6 +187,10 @@ if _HAS_TRITON:
                     partial = tl.minimum(tl.maximum(partial, ACC_MIN), ACC_MAX)
 
             partial_f = partial.to(tl.float32)
+
+            # Undo LSB MAC shift in float domain
+            if MAC_SHIFT > 0:
+                partial_f = partial_f * (1 << MAC_SHIFT)
 
             # Per-group activation scale (static mode)
             if A_GROUP_SIZE > 0:
@@ -222,6 +239,11 @@ if _HAS_TRITON:
                 acc = acc * (2.0 ** (-T2_FRAC_BITS))
         elif W_SHIFT_BIAS > 0:
             acc = acc * (2.0 ** (-W_SHIFT_BIAS))
+
+        # hwscale per-layer global FP32 scale — merges the "scale-the-scales"
+        # correction that replaces the gscaler exponent bias for --hwscale.
+        # Unconditional multiply (runtime scalar, no branch, no-op at 1.0).
+        acc = acc * GLOBAL_SCALE_FP32
 
         # Apply scales that weren't folded in during the K-block loop
         if A_GROUP_SIZE <= 0:
@@ -282,23 +304,27 @@ def _int16_gemm_reference(
     acc_dtype: str = 'float',
     w_shift_bias: int = 0,
     w_zp: Optional[torch.Tensor] = None,
+    lsb_mac_shift: int = 0,
+    global_scale_fp32: float = 1.0,
 ) -> torch.Tensor:
     """Int16 reference GEMM via two int8 reference calls with carry decomposition."""
     M, K = a_int16.shape
     N = w_int.shape[0]
     a_hi, a_lo = _decompose_int16_to_int8(a_int16)
 
-    # Both halves are int8 — use the original acc_bits (no doubling needed)
+    # Both halves are int8 — MSB keeps original acc_bits, LSB gets extra bits
     out_hi = int_gemm_capped_reference(
         a_hi, a_scale, w_int, w_scale, acc_bits, block_k,
         w_group_size, None, acc_wrap,
         a_group_scale=a_group_scale, a_group_size=a_group_size,
-        acc_dtype=acc_dtype, w_shift_bias=w_shift_bias, w_zp=w_zp)
+        acc_dtype=acc_dtype, w_shift_bias=w_shift_bias, w_zp=w_zp,
+        global_scale_fp32=global_scale_fp32)
     out_lo = int_gemm_capped_reference(
-        a_lo, a_scale, w_int, w_scale, acc_bits, block_k,
+        a_lo, a_scale, w_int, w_scale, acc_bits + lsb_mac_shift, block_k,
         w_group_size, None, acc_wrap,
         a_group_scale=a_group_scale, a_group_size=a_group_size,
-        acc_dtype=acc_dtype, w_shift_bias=w_shift_bias, w_zp=w_zp)
+        acc_dtype=acc_dtype, w_shift_bias=w_shift_bias, w_zp=w_zp,
+        global_scale_fp32=global_scale_fp32)
 
     output = out_hi * 256.0 + out_lo
     if bias is not None:
@@ -321,6 +347,9 @@ def int_gemm_capped_reference(
     acc_dtype: str = 'float',
     w_shift_bias: int = 0,
     w_zp: Optional[torch.Tensor] = None,  # [N] or [N, n_groups] — weight zero-point correction
+    mac_shift: int = 0,
+    lsb_mac_shift: int = 0,
+    global_scale_fp32: float = 1.0,
 ) -> torch.Tensor:
     """Pure-PyTorch reference for capped-accumulator integer GEMM."""
     M, K = a_int.shape
@@ -332,7 +361,9 @@ def int_gemm_capped_reference(
             a_int, a_scale, w_int, w_scale, acc_bits, block_k,
             w_group_size, bias, acc_wrap,
             a_group_scale=a_group_scale, a_group_size=a_group_size,
-            acc_dtype=acc_dtype, w_shift_bias=w_shift_bias, w_zp=w_zp)
+            acc_dtype=acc_dtype, w_shift_bias=w_shift_bias, w_zp=w_zp,
+            lsb_mac_shift=lsb_mac_shift,
+            global_scale_fp32=global_scale_fp32)
 
     acc_max = 2 ** (acc_bits - 1) - 1
     acc_min = -acc_max - 1
@@ -351,6 +382,9 @@ def int_gemm_capped_reference(
         # then round to int semantics and cap to accumulator range.
         partial = a_int[:, k_start:k_end].float() @ w_int[:, k_start:k_end].float().t()
         partial = partial.round()
+        # LSB MAC shift: reduce magnitude before tier-1 cap
+        if mac_shift > 0:
+            partial = (partial.long() >> mac_shift).float()
         if acc_wrap:
             partial = ((partial.long() - acc_min) % acc_range + acc_min).float()
         else:
@@ -364,12 +398,19 @@ def int_gemm_capped_reference(
                 w_zp_g = w_zp[:, g_idx]                               # [N]
             else:
                 w_zp_g = w_zp                                          # [N]
-            partial = partial + (a_block_sum.unsqueeze(1) * w_zp_g.unsqueeze(0)).round()
+            correction = (a_block_sum.unsqueeze(1) * w_zp_g.unsqueeze(0)).round()
+            if mac_shift > 0:
+                correction = (correction.long() >> mac_shift).float()
+            partial = partial + correction
             # Cap/wrap again after correction
             if acc_wrap:
                 partial = ((partial.long() - acc_min) % acc_range + acc_min).float()
             else:
                 partial = partial.clamp(acc_min, acc_max)
+
+        # Undo LSB MAC shift in float domain
+        if mac_shift > 0:
+            partial = partial * float(1 << mac_shift)
 
         # Per-group activation scale (static mode)
         if a_group_size > 0 and a_group_scale is not None:
@@ -397,6 +438,10 @@ def int_gemm_capped_reference(
     output = output.float()
     if total_shift > 0:
         output *= 2.0 ** (-total_shift)
+
+    # hwscale per-layer global FP32 scale (mirror of the Triton kernel)
+    if global_scale_fp32 != 1.0:
+        output *= global_scale_fp32
 
     # Apply scales that weren't folded in during the K-block loop
     if a_group_size <= 0:
@@ -430,6 +475,9 @@ def int_gemm_capped(
     w_zp_cross: Optional[torch.Tensor] = None,
     acc_dtype: str = 'float',
     w_shift_bias: int = 0,
+    lsb_mac_shift: int = 0,
+    global_scale_fp32: float = 1.0,
+    _t1_scan_label: str = '',
 ) -> torch.Tensor:
     """
     Quantize activations → run integer GEMM with capped accumulator → float output.
@@ -488,15 +536,30 @@ def int_gemm_capped(
     is_int16 = (a_int.dtype == torch.int16)
 
     if use_triton and _HAS_TRITON and x_float.is_cuda:
-        _launcher = _triton_int16_gemm if is_int16 else _triton_int_gemm
-        output = _launcher(a_int, a_token_scale, w_int, w_scale,
-                           acc_bits, block_k, w_group_size, bias,
-                           M, N, K, acc_wrap,
-                           a_gscale=a_group_scale,
-                           a_group_size=a_group_size,
-                           acc_dtype=acc_dtype,
-                           w_shift_bias=w_shift_bias,
-                           w_zp=w_zp)
+        if is_int16:
+            output = _triton_int16_gemm(
+                a_int, a_token_scale, w_int, w_scale,
+                acc_bits, block_k, w_group_size, bias,
+                M, N, K, acc_wrap,
+                a_gscale=a_group_scale,
+                a_group_size=a_group_size,
+                acc_dtype=acc_dtype,
+                w_shift_bias=w_shift_bias,
+                w_zp=w_zp,
+                lsb_mac_shift=lsb_mac_shift,
+                global_scale_fp32=global_scale_fp32,
+                _t1_scan_label=_t1_scan_label)
+        else:
+            output = _triton_int_gemm(
+                a_int, a_token_scale, w_int, w_scale,
+                acc_bits, block_k, w_group_size, bias,
+                M, N, K, acc_wrap,
+                a_gscale=a_group_scale,
+                a_group_size=a_group_size,
+                acc_dtype=acc_dtype,
+                w_shift_bias=w_shift_bias,
+                w_zp=w_zp,
+                global_scale_fp32=global_scale_fp32)
     else:
         # Reference impl handles int16 internally via _int16_gemm_reference
         output = int_gemm_capped_reference(a_int, a_token_scale, w_int, w_scale,
@@ -506,7 +569,9 @@ def int_gemm_capped(
                                            a_group_size=a_group_size,
                                            acc_dtype=acc_dtype,
                                            w_shift_bias=w_shift_bias,
-                                           w_zp=w_zp)
+                                           w_zp=w_zp,
+                                           lsb_mac_shift=lsb_mac_shift,
+                                           global_scale_fp32=global_scale_fp32)
 
     # Zero-point correction for asymmetric activations (applied in float,
     # outside the capped accumulator).
@@ -624,6 +689,9 @@ def _triton_int16_gemm(
     acc_dtype='float',
     w_shift_bias=0,
     w_zp=None,
+    lsb_mac_shift=0,
+    global_scale_fp32=1.0,
+    _t1_scan_label='',
 ):
     """Int16 GEMM via two int8 kernel calls.
 
@@ -633,29 +701,47 @@ def _triton_int16_gemm(
     Result = kernel(a_hi, w) * 256 + kernel(a_lo, w).
 
     Both calls use the unmodified int8 Triton kernel with the same acc_bits.
+    lsb_mac_shift: widen the LSB accumulator by N extra bits
+    (e.g. lsb_mac_shift=2 with acc_bits=16 → LSB uses acc_bits=18).
+    MSB keeps original acc_bits. No shifting applied.
     """
     a_hi, a_lo = _decompose_int16_to_int8(a_int16)
 
-    # Both halves are int8 — use the original acc_bits (no doubling needed)
-    # Two int8 kernel calls — no bias (added after combining)
-    out_hi = _triton_int_gemm(
-        a_hi, a_scale, w_int, w_scale,
-        acc_bits, block_k, w_group_size, None,
-        M, N, K, acc_wrap,
+    _common = dict(
+        a_scale=a_scale, w_int=w_int, w_scale=w_scale,
+        block_k=block_k, w_group_size=w_group_size, bias=None,
+        M=M, N=N, K=K, acc_wrap=acc_wrap,
         a_gscale=a_gscale, a_group_size=a_group_size,
-        acc_dtype=acc_dtype,
-        w_shift_bias=w_shift_bias,
-        w_zp=w_zp,
+        acc_dtype=acc_dtype, w_shift_bias=w_shift_bias, w_zp=w_zp,
+        global_scale_fp32=global_scale_fp32,
     )
-    out_lo = _triton_int_gemm(
-        a_lo, a_scale, w_int, w_scale,
-        acc_bits, block_k, w_group_size, None,
-        M, N, K, acc_wrap,
-        a_gscale=a_gscale, a_group_size=a_group_size,
-        acc_dtype=acc_dtype,
-        w_shift_bias=w_shift_bias,
-        w_zp=w_zp,
-    )
+
+    out_hi = _triton_int_gemm(a_hi, acc_bits=acc_bits, **_common)
+    out_lo = _triton_int_gemm(a_lo, acc_bits=acc_bits + lsb_mac_shift, **_common)
+
+    # t1_msb_scan: compare MSB and LSB individually against acc32
+    if _t1_scan_label:
+        _ref_common = dict(_common, acc_wrap=False)
+        ref_hi = _triton_int_gemm(a_hi, acc_bits=32, **_ref_common)
+        ref_lo = _triton_int_gemm(a_lo, acc_bits=32, **_ref_common)
+        results = {}
+        for tag, out, ref in [('MSB', out_hi, ref_hi), ('LSB', out_lo, ref_lo)]:
+            d = (out.float() - ref.float())
+            ma = d.abs().max().item()
+            rms = (ref.float() ** 2).mean().sqrt().item() + 1e-12
+            nrmse = (d ** 2).mean().sqrt().item() / rms
+            nd = int((d.abs() > 1e-6).sum().item())
+            results[tag] = (nrmse, ma, nd)
+        # Only print when the outer scan will also flag a mismatch
+        if any(r[1] > 1e-6 for r in results.values()):
+            msb_n, lsb_n = results['MSB'][0], results['LSB'][0]
+            culprit = 'MSB' if msb_n > lsb_n else 'LSB' if lsb_n > msb_n else 'BOTH'
+            for tag in ['MSB', 'LSB']:
+                nrmse, ma, nd = results[tag]
+                marker = ' <<<' if tag == culprit or culprit == 'BOTH' else ''
+                print(f"[t1_msb_scan] {_t1_scan_label} {tag}: "
+                      f"NRMSE={nrmse:.4e}, max_abs={ma:.4e}, n_diff={nd}{marker}",
+                      flush=True)
 
     output = out_hi * 256.0 + out_lo
     if bias is not None:
@@ -671,6 +757,8 @@ def _triton_int_gemm(
     acc_dtype='float',
     w_shift_bias=0,
     w_zp=None,
+    mac_shift=0,
+    global_scale_fp32=1.0,
 ):
     """Launch the Triton int8 kernel.  a_int must be int8."""
     assert a_int.dtype == torch.int8, \
@@ -766,6 +854,7 @@ def _triton_int_gemm(
         T2_FRAC_BITS=t2_frac_bits,
         T2_FRAC_SCALE=float(1 << t2_frac_bits) if t2_frac_bits > 0 else 1.0,
         W_SHIFT_BIAS=w_shift_bias,
+        GLOBAL_SCALE_FP32=float(global_scale_fp32),
         HAS_W_ZP=has_w_zp,
         W_zp_ptr=w_zp_int,
         stride_wzp_n=stride_wzp_n,
@@ -774,6 +863,7 @@ def _triton_int_gemm(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         ACC_BLOCK_K=ACC_BLOCK_K,
+        MAC_SHIFT=mac_shift,
     )
 
     return output
