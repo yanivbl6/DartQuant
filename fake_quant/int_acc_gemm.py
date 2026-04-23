@@ -391,10 +391,11 @@ if _HAS_TRITON:
         # Convert to float, then undo frac bits and gscaler prescaling together.
         # Reverses the in-loop shift for all signs: positive T2_FRAC_BITS scales
         # down (acc was left-shifted); negative scales up (acc was right-shifted).
+        # Keep arithmetic inline so Triton evaluates at compile time (assigning
+        # to an intermediate local promotes it to a runtime tensor).
         acc = acc.to(tl.float32)
-        _TOTAL_SHIFT = T2_FRAC_BITS + W_SHIFT_BIAS
-        if _TOTAL_SHIFT != 0:
-            acc = acc * (2.0 ** (-_TOTAL_SHIFT))
+        if T2_FRAC_BITS + W_SHIFT_BIAS != 0:
+            acc = acc * (2.0 ** (-(T2_FRAC_BITS + W_SHIFT_BIAS)))
 
         # hwscale per-layer global FP32 scale — merges the "scale-the-scales"
         # correction that replaces the gscaler exponent bias for --hwscale.
