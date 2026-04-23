@@ -27,13 +27,17 @@ def parse_acc_dtype(s):
     Returns (kind, bits, frac_bits) where:
       kind      : 'int', 'float', or 'bfloat'
       bits      : total bit-width
-      frac_bits : number of fractional bits (0 for float types)
+      frac_bits : number of fractional bits; may be negative (right-shift
+                  applied before T2 add — loses LSB precision but preserves
+                  integer range when total_bits can't cover the observed MSB)
 
     Format: int<N>[p<M>] — e.g. int32, int32p4, int26p8.
+            int<N>pm<M>  — negative shift, e.g. int20pm2 (= frac_bits=-2).
     Auto:   int<N>a<Y>  — frac_bits resolved from calibration at init time;
             returns ('int', N, 0) as a placeholder. Callers must run
             resolve_auto_acc_dtype(...) before the first forward so every
-            qlayer.acc_dtype is rewritten to a concrete int<N>p<M>.
+            qlayer.acc_dtype is rewritten to a concrete int<N>p<M> /
+            int<N>pm<M>.
     Also:   float/fp32, half/fp16, bfloat/bf16.
     """
     s = s.lower().strip()
@@ -44,17 +48,23 @@ def parse_acc_dtype(s):
     }
     if s in aliases:
         return aliases[s]
+    # int<N>pm<M>  — negative frac_bits (shift out integer LSBs before T2 add)
+    m = re.match(r'^int(\d+)pm(\d+)$', s)
+    if m:
+        return ('int', int(m.group(1)), -int(m.group(2)))
+    # int<N>[p<M>]  — standard positive (or zero) frac_bits
     m = re.match(r'^int(\d+)(?:p(\d+))?$', s)
     if m:
         bits = int(m.group(1))
         frac = int(m.group(2)) if m.group(2) else 0
         return ('int', bits, frac)
+    # int<N>a<Y>  — auto form, placeholder frac=0 until resolver runs
     m = re.match(r'^int(\d+)a(\d+)$', s)
     if m:
         return ('int', int(m.group(1)), 0)
     raise ValueError(
-        f"Unknown acc_dtype: '{s}'. Must be int<N>[p<M>], int<N>a<Y> "
-        "(e.g. int25, int32p4, int26p8, int24a1), "
+        f"Unknown acc_dtype: '{s}'. Must be int<N>[p<M>], int<N>pm<M>, "
+        "int<N>a<Y> (e.g. int25, int32p4, int20pm2, int24a1), "
         "or float/fp32, half/fp16, bfloat/bf16"
     )
 
@@ -162,31 +172,32 @@ def resolve_auto_acc_dtype(qlayers, total_bits, safety_bits):
 
         I = max(0, math.ceil(math.log2(max(eff_abs_max, 1e-30))))
         total_shift = (total_bits - 1) - I - safety_bits
-        if total_shift < 0:
-            raise RuntimeError(
-                f"int{total_bits}a{safety_bits}: {name} effective MSB={I} "
-                f"(abs_max={abs_max:.3g}, hwscale_global={hw_global:.3g}) "
-                f"exceeds the accumulator range. Increase total bits, "
-                f"reduce safety, or adjust hwscale.")
-
         wsb = int(getattr(qlayer, 'w_shift_bias', 0))
         frac_bits = total_shift - wsb
-        if frac_bits < 0:
-            raise RuntimeError(
-                f"int{total_bits}a{safety_bits}: {name} has "
-                f"w_shift_bias={wsb}, effective MSB={I}, safety={safety_bits} "
-                f"— leaves no room for frac_bits (got {frac_bits}). "
-                f"Disable hwscale/gscaler or increase total bits.")
 
-        qlayer.acc_dtype = f'int{total_bits}p{frac_bits}'
+        # Negative frac_bits = physical right-shift on the T1 partial
+        # before the T2 add. Loses |frac_bits| LSBs of precision but
+        # preserves integer range. Warn loudly — this degrades accuracy
+        # but beats silent saturation. Encode as int<N>pm<|frac|>.
+        if frac_bits >= 0:
+            qlayer.acc_dtype = f'int{total_bits}p{frac_bits}'
+        else:
+            qlayer.acc_dtype = f'int{total_bits}pm{-frac_bits}'
+            logging.warning(
+                "[int_acc_auto] %s: negative shift frac_bits=%d — "
+                "%d LSB(s) dropped at T1->T2. abs_max=%.3g, eff_I=%d, "
+                "total_bits=%d, safety=%d, w_shift_bias=%d. "
+                "Consider increasing total bits for a faithful result.",
+                name, frac_bits, -frac_bits, abs_max, I,
+                total_bits, safety_bits, wsb)
         frac_per_layer[name] = frac_bits
         logging.info("[int_acc_auto] %s: abs_max=%.3g "
                      "hw_global=%.3g a_post=%.3g w_post=%.3g "
-                     "eff_I=%d w_shift_bias=%d safety=%d -> int%dp%d "
+                     "eff_I=%d w_shift_bias=%d safety=%d -> %s "
                      "(T1->T2 shift=%d bits, T2=%d bits)",
                      name, abs_max, hw_global, a_post, w_post,
                      I, wsb, safety_bits,
-                     total_bits, frac_bits, frac_bits, total_bits)
+                     qlayer.acc_dtype, frac_bits, total_bits)
 
     if frac_per_layer:
         vals = sorted(frac_per_layer.values())
@@ -357,10 +368,11 @@ if _HAS_TRITON:
 
             # Accumulate in tier-2 dtype
             if T2_IS_INT:
-                if T2_FRAC_BITS > 0:
-                    scaled = contrib * T2_FRAC_SCALE
-                else:
-                    scaled = contrib
+                # T2_FRAC_SCALE = 2^T2_FRAC_BITS. Positive shift adds
+                # fractional precision; negative shift physically right-
+                # shifts the partial (drops LSBs) before the T2 add; zero
+                # is a pass-through (scale = 1.0).
+                scaled = contrib * T2_FRAC_SCALE
                 # Round-to-nearest (not truncate) for faithful fixed-point
                 acc += (scaled + tl.where(scaled >= 0, 0.5, -0.5)).to(tl.int32)
                 # Clamp to tier-2 accumulator range
@@ -376,15 +388,13 @@ if _HAS_TRITON:
             a_ptrs += ACC_BLOCK_K * stride_ak
             b_ptrs += ACC_BLOCK_K * stride_bk
 
-        # Convert to float, then undo frac bits and gscaler prescaling together
+        # Convert to float, then undo frac bits and gscaler prescaling together.
+        # Reverses the in-loop shift for all signs: positive T2_FRAC_BITS scales
+        # down (acc was left-shifted); negative scales up (acc was right-shifted).
         acc = acc.to(tl.float32)
-        if T2_FRAC_BITS > 0:
-            if W_SHIFT_BIAS > 0:
-                acc = acc * (2.0 ** (-(T2_FRAC_BITS + W_SHIFT_BIAS)))
-            else:
-                acc = acc * (2.0 ** (-T2_FRAC_BITS))
-        elif W_SHIFT_BIAS > 0:
-            acc = acc * (2.0 ** (-W_SHIFT_BIAS))
+        _TOTAL_SHIFT = T2_FRAC_BITS + W_SHIFT_BIAS
+        if _TOTAL_SHIFT != 0:
+            acc = acc * (2.0 ** (-_TOTAL_SHIFT))
 
         # hwscale per-layer global FP32 scale — merges the "scale-the-scales"
         # correction that replaces the gscaler exponent bias for --hwscale.
@@ -519,7 +529,9 @@ def int_gemm_capped_reference(
     t2_dtype, t2_clamp_max, t2_clamp_min = _t2_acc_dtype_info(acc_dtype)
     t2_is_int = t2_clamp_max is not None
     _, _, t2_frac_bits = parse_acc_dtype(acc_dtype)
-    t2_frac_scale = float(1 << t2_frac_bits) if t2_frac_bits > 0 else 1.0
+    # 2^t2_frac_bits, sign-agnostic. Negative frac_bits yields 2^-|N| < 1
+    # → in-loop right-shift; zero → pass-through (1.0).
+    t2_frac_scale = 2.0 ** t2_frac_bits
     output = torch.zeros(M, N, dtype=t2_dtype, device=a_int.device)
 
     for k_start in range(0, K, block_k):
@@ -571,18 +583,19 @@ def int_gemm_capped_reference(
             contrib = partial.float()
 
         if t2_is_int:
-            if t2_frac_bits > 0:
-                output += (contrib * t2_frac_scale).round().long()
-            else:
-                output += contrib.round().long()
+            # t2_frac_scale = 2^t2_frac_bits. Positive shift adds fractional
+            # precision; negative shift physically right-shifts the partial
+            # (drops LSBs) before the T2 add; zero is a pass-through.
+            output += (contrib * t2_frac_scale).round().long()
             output = output.clamp(t2_clamp_min, t2_clamp_max)
         else:
             output += contrib.to(t2_dtype)
 
-    # Convert to float, then undo frac bits and gscaler prescaling together
+    # Convert to float, then undo frac bits and gscaler prescaling together.
+    # Sign-agnostic: positive total_shift scales down; negative scales up.
     total_shift = t2_frac_bits + w_shift_bias
     output = output.float()
-    if total_shift > 0:
+    if total_shift != 0:
         output *= 2.0 ** (-total_shift)
 
     # hwscale per-layer global FP32 scale (mirror of the Triton kernel)
@@ -998,7 +1011,7 @@ def _triton_int_gemm(
         T2_IS_FP16=t2_is_fp16,
         T2_IS_BF16=t2_is_bf16,
         T2_FRAC_BITS=t2_frac_bits,
-        T2_FRAC_SCALE=float(1 << t2_frac_bits) if t2_frac_bits > 0 else 1.0,
+        T2_FRAC_SCALE=2.0 ** t2_frac_bits,  # sign-agnostic: 2^+N, 1.0, or 2^-|N|
         W_SHIFT_BIAS=w_shift_bias,
         GLOBAL_SCALE_FP32=float(global_scale_fp32),
         HAS_W_ZP=has_w_zp,

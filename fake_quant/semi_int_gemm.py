@@ -393,7 +393,7 @@ def _semi_int_kloop(
     t2_dtype, t2_clamp_max, t2_clamp_min = _t2_acc_dtype_info(acc_dtype)
     t2_is_int = t2_clamp_max is not None
     _, _, t2_frac_bits = parse_acc_dtype(acc_dtype)
-    t2_frac_scale = float(1 << t2_frac_bits) if t2_frac_bits > 0 else 1.0
+    t2_frac_scale = 2.0 ** t2_frac_bits  # sign-agnostic (supports int<N>pm<M>)
 
     if _bit(mask, MASK_T2_INT) and t2_is_int:
         output = torch.zeros(M, N, dtype=torch.int64, device=a_work.device)
@@ -458,18 +458,16 @@ def _semi_int_kloop(
 
         # Stage 5: Tier-2 accumulation
         if _bit(mask, MASK_T2_INT) and t2_is_int:
-            if t2_frac_bits > 0:
-                output += (contrib * t2_frac_scale).round().long()
-            else:
-                output += contrib.round().long()
+            # Sign-agnostic scale: + frac_bits = left-shift, - frac_bits = right-shift.
+            output += (contrib * t2_frac_scale).round().long()
             output = output.clamp(t2_clamp_min, t2_clamp_max)
         else:
             output += contrib.to(output.dtype)
 
-    # Convert to float, undo shifts
+    # Convert to float, undo shifts (sign-agnostic).
     total_shift = t2_frac_bits + w_shift_bias
     output = output.float()
-    if total_shift > 0:
+    if total_shift != 0:
         output *= 2.0 ** (-total_shift)
 
     return output
