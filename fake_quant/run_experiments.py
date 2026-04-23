@@ -42,72 +42,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(SCRIPT_DIR, '..', 'data', 'cached_results')
 
 
-def _read_last_line(path):
-    """Read the last non-empty line from a log file (handles \\r from tqdm)."""
-    try:
-        with open(path, 'rb') as f:
-            f.seek(0, 2)  # end
-            size = f.tell()
-            if size == 0:
-                return ""
-            f.seek(max(0, size - 4096))
-            tail = f.read().decode('utf-8', errors='replace')
-        # tqdm uses \r for in-place updates; split on both \r and \n
-        lines = re.split(r'[\r\n]', tail)
-        for line in reversed(lines):
-            stripped = line.strip()
-            if stripped:
-                return stripped
-    except (OSError, ValueError):
-        pass
-    return ""
-
-
-def _print_status(procs, first_call=False):
-    """Print / refresh a fixed-size status block (one line per slot).
-
-    `procs` is length = capacity.  Each entry is (name, proc, log_path) or
-    None for an idle slot.  The set of entries is stable across calls, so
-    cursor-up `\\033[nA` safely rewrites the block in place.
-    """
-    term_width = shutil.get_terminal_size((120, 24)).columns
-    n = len(procs)
-    if not first_call:
-        sys.stdout.write(f"\033[{n}A")
-
-    for entry in procs:
-        if entry is None:
-            line = "  [idle]"
-        else:
-            name, proc, log_path = entry
-            rc = proc.poll()
-            if rc is None:
-                tail = _read_last_line(log_path)
-                if tail:
-                    prefix = f"  [running] {name}: "
-                    max_tail = term_width - len(prefix)
-                    if len(tail) > max_tail:
-                        tail = "..." + tail[-(max_tail - 3):]
-                    line = prefix + tail
-                else:
-                    line = f"  [running] {name}: starting..."
-            elif rc == 0:
-                tail = _read_last_line(log_path)
-                if tail:
-                    prefix = f"  [done]    {name}: "
-                    max_tail = term_width - len(prefix)
-                    if len(tail) > max_tail:
-                        tail = "..." + tail[-(max_tail - 3):]
-                    line = prefix + tail
-                else:
-                    line = f"  [done]    {name}"
-            else:
-                line = f"  [FAIL]    {name} (exit code {rc})"
-        # Clear rest of line in case previous line was longer
-        sys.stdout.write(f"\033[K{line}\n")
-    sys.stdout.flush()
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Run 7 DartQuant experiments in parallel',
@@ -306,15 +240,14 @@ def _pick_gpu(args, gpus, slot_idx):
 def _run_jobs(active_cmds, gpus, args, log_fn, on_complete=None):
     """Dynamic scheduler: up to `capacity = len(gpus)` jobs in flight.
 
-    Fixed-size `slots` list (length = capacity) of (name, proc, log_path, log_f)
-    or None for idle.  On each pass: notify completed jobs (on_complete +
-    failure tally), refill any done/idle slots from the pending queue,
-    redraw the status block in place, sleep, repeat.  Keeps the stable
-    per-slot line count so cursor-up refresh works exactly as before.
+    Each slot, on spawn, calls `_pick_gpu` to get a GPU id and appends
+    `-g <id>` to the command.  As jobs finish, slots are refilled from
+    the pending queue.  Replaces the old batch-synchronous scheduler and
+    the --sequential inline loop.
 
     Args:
-        active_cmds: list of (name, cmd_without_g) — non-skipped runs.
-        gpus: list of GPU IDs (only len(gpus) matters under --wait).
+        active_cmds: list of (name, cmd_without_g) — the non-skipped runs.
+        gpus: list of GPU IDs (determines capacity).
         args: parsed CLI args (reads .wait, .max_used_mb, .refresh).
         log_fn: callable(name) -> log file path.
         on_complete: optional callable(name, returncode) called per finished run.
@@ -323,68 +256,51 @@ def _run_jobs(active_cmds, gpus, args, log_fn, on_complete=None):
     """
     capacity = len(gpus)
     pending = list(active_cmds)
-    slots = [None] * capacity
+    running = []  # list of (name, proc, log_path, log_f)
     total_failed = 0
     launched = 0
-    notified = set()
     refresh = args.refresh
-    wait_mode = getattr(args, 'wait', False)
-
-    def notify(i):
-        nonlocal total_failed
-        entry = slots[i]
-        if entry is None:
-            return
-        name, proc, _, log_f = entry
-        if proc.poll() is not None and name not in notified:
-            notified.add(name)
-            log_f.close()
-            if on_complete:
-                on_complete(name, proc.returncode)
-            if proc.returncode != 0:
-                total_failed += 1
-
-    def launch_into(i):
-        nonlocal launched
-        name, cmd = pending.pop(0)
-        gpu = _pick_gpu(args, gpus, launched)
-        full_cmd = list(cmd) + ['-g', str(gpu)]
-        log_path = log_fn(name)
-        log_f = open(log_path, 'w')
-        proc = subprocess.Popen(full_cmd, stdout=log_f, stderr=subprocess.STDOUT)
-        slots[i] = (name, proc, log_path, log_f)
-        launched += 1
 
     print(f"\n=== {len(active_cmds)} runs, capacity={capacity} "
           f"(refreshing every {refresh}s) ===\n")
 
-    first_call = True
-    while pending or any(s is not None and s[0] not in notified for s in slots):
-        # Notify finished slots (idempotent) and refill idle / done slots.
-        for i in range(capacity):
-            notify(i)
-            if pending and (slots[i] is None
-                            or slots[i][1].poll() is not None):
-                slots[i] = None
-                launch_into(i)
-                if pending and wait_mode:
-                    # Inter-launch cooldown so the previous allocation
-                    # shows up in nvidia-smi before the next wait_for_gpu.
-                    time.sleep(refresh)
+    while pending or running:
+        # Fill empty slots
+        while len(running) < capacity and pending:
+            name, cmd = pending.pop(0)
+            gpu = _pick_gpu(args, gpus, launched)
+            full_cmd = list(cmd) + ['-g', str(gpu)]
+            log_path = log_fn(name)
+            log_f = open(log_path, 'w')
+            proc = subprocess.Popen(full_cmd, stdout=log_f, stderr=subprocess.STDOUT)
+            running.append((name, proc, log_path, log_f))
+            launched += 1
+            print(f"  [launch {launched}/{len(active_cmds)}] {name} -> GPU {gpu}", flush=True)
+            if pending and len(running) < capacity:
+                # Inter-launch cooldown so nvidia-smi reflects the prior
+                # allocation before the next wait_for_gpu call.
+                time.sleep(refresh)
 
-        # Redraw fixed-height status block
-        status = [(s[0], s[1], s[2]) if s is not None else None for s in slots]
-        _print_status(status, first_call=first_call)
-        first_call = False
-
-        # Exit if everything is done
-        if not pending and all(s is None or s[1].poll() is not None
-                               for s in slots):
-            for i in range(capacity):
-                notify(i)
-            break
-
+        # One-line status (no in-place refresh; set size changes over time)
+        alive = [name for name, proc, _, _ in running if proc.poll() is None]
+        print(f"  [running {len(alive)}/{capacity}, pending {len(pending)}] "
+              f"{', '.join(alive)}", flush=True)
         time.sleep(refresh)
+
+        # Reap finished
+        still_running = []
+        for name, proc, log_path, log_f in running:
+            if proc.poll() is None:
+                still_running.append((name, proc, log_path, log_f))
+            else:
+                log_f.close()
+                status = 'done' if proc.returncode == 0 else f'FAIL rc={proc.returncode}'
+                print(f"  [{status}] {name} (see {log_path})", flush=True)
+                if on_complete:
+                    on_complete(name, proc.returncode)
+                if proc.returncode != 0:
+                    total_failed += 1
+        running = still_running
 
     return total_failed
 
