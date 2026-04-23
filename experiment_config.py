@@ -9,6 +9,7 @@ Imported by:
 import argparse
 import glob
 import os
+import re
 
 # ── Model paths ──────────────────────────────────────────────────────────────
 
@@ -317,7 +318,14 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
         if getattr(args, 'acc_wrap', False):
             parts.append("wrap")
         acc_dtype_str = getattr(args, 'acc_dtype', 'float')
-        if acc_dtype_str.lower().strip() not in ('float', 'fp32'):
+        # intXaY is the calibration-driven auto form — its frac_bits is
+        # resolved per-layer at inference init from the loaded cal scales,
+        # so the cal file itself CANNOT be captured with intXaY active
+        # (circular dep). Strip the t2 tag for cal-cache only in this case;
+        # preserve historical per-t2 cal files for manual intNpM / fp16 etc.
+        _is_auto_t2 = bool(re.match(r'^int\d+a\d+$', acc_dtype_str.lower().strip()))
+        if (acc_dtype_str.lower().strip() not in ('float', 'fp32')
+                and not (for_cal_cache and _is_auto_t2)):
             parts.append(f"t2{acc_dtype_str}")
         _mshift = getattr(args, 'lsb_mac_shift', 0)
         if _mshift > 0:
