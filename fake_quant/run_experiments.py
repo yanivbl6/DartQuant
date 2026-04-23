@@ -42,6 +42,64 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(SCRIPT_DIR, '..', 'data', 'cached_results')
 
 
+def _read_last_line(path):
+    """Read the last non-empty line from a log file (handles \\r from tqdm)."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)  # end
+            size = f.tell()
+            if size == 0:
+                return ""
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode('utf-8', errors='replace')
+        # tqdm uses \r for in-place updates; split on both \r and \n
+        lines = re.split(r'[\r\n]', tail)
+        for line in reversed(lines):
+            stripped = line.strip()
+            if stripped:
+                return stripped
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def _print_status(procs, first_call=False):
+    """Print or refresh the status block for all experiments."""
+    term_width = shutil.get_terminal_size((120, 24)).columns
+    n = len(procs)
+    if not first_call:
+        # Move cursor up to overwrite previous status block
+        sys.stdout.write(f"\033[{n}A")
+
+    for name, proc, log_path in procs:
+        rc = proc.poll()
+        if rc is None:
+            tail = _read_last_line(log_path)
+            if tail:
+                prefix = f"  [running] {name}: "
+                max_tail = term_width - len(prefix)
+                if len(tail) > max_tail:
+                    tail = "..." + tail[-(max_tail - 3):]
+                line = prefix + tail
+            else:
+                line = f"  [running] {name}: starting..."
+        elif rc == 0:
+            tail = _read_last_line(log_path)
+            if tail:
+                prefix = f"  [done]    {name}: "
+                max_tail = term_width - len(prefix)
+                if len(tail) > max_tail:
+                    tail = "..." + tail[-(max_tail - 3):]
+                line = prefix + tail
+            else:
+                line = f"  [done]    {name}"
+        else:
+            line = f"  [FAIL]    {name} (exit code {rc})"
+        # Clear rest of line in case previous line was longer
+        sys.stdout.write(f"\033[K{line}\n")
+    sys.stdout.flush()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Run 7 DartQuant experiments in parallel',
@@ -85,13 +143,10 @@ Examples:
     parser.add_argument('--skip', type=str, default=None,
                         help='Experiments to skip (1-indexed by print order): '
                              'a single number like "4" or comma-separated like "3,6"')
-    parser.add_argument('--wait', action='store_true',
-                        help='Dynamic GPU scheduling: each of the N=len(--gpus) slots '
-                             'polls nvidia-smi (via utils/gpu_wait.py) and launches on '
-                             'the first GPU that falls below --max_used_mb. Replaces '
-                             'the old --sequential (use --wait -g <single> for 1-at-a-time).')
+    parser.add_argument('--sequential', action='store_true',
+                        help='Run experiments one at a time, each with --wait for a clear GPU')
     parser.add_argument('--max_used_mb', type=int, default=200,
-                        help='Max used memory (MiB) for --wait GPU selection (default: 200)')
+                        help='Max used memory (MiB) for --sequential GPU waiting (default: 200)')
     parser.add_argument('--refresh', type=int, default=10,
                         help='Status refresh interval in seconds (default: 10)')
     parser.add_argument('--dry', action='store_true',
@@ -105,10 +160,13 @@ Examples:
     return parser.parse_args()
 
 
-def build_experiment_cmd(mode, quant_args, extra_flags, args):
-    """Build the dart_gptq_wxaykvz.sh command (no -g; scheduler appends it)."""
+def build_experiment_cmd(mode, gpu, quant_args, extra_flags, args, use_wait=False):
+    """Build the dart_gptq_wxaykvz.sh command for one experiment."""
     script = os.path.join(SCRIPT_DIR, 'Script', 'dart_gptq_wxaykvz.sh')
-    cmd = [script, mode, '-m', args.model]
+    if use_wait:
+        cmd = [script, mode, '--wait', '--max_used_mb', str(args.max_used_mb), '-m', args.model]
+    else:
+        cmd = [script, mode, '-g', str(gpu), '-m', args.model]
 
     if mode != 'full':
         cmd += quant_args
@@ -224,83 +282,67 @@ def run_calibration_for_runfile(args):
 # Flag parsing/writing lives in runfile_flags.py (shared with multi_calibration).
 
 
-def _pick_gpu(args, gpus, slot_idx):
-    """Select a GPU for the next slot.
+def _run_parallel_batches(active_cmds, gpus, refresh, log_fn, on_complete=None):
+    """Run a list of (name, cmd) jobs in batches of len(gpus).
 
-    Under --wait, block on `wait_for_gpu` (via utils/gpu_wait.py) until one
-    falls below `args.max_used_mb`.  Otherwise round-robin through `gpus`.
-    """
-    if getattr(args, 'wait', False):
-        sys.path.insert(0, os.path.join(SCRIPT_DIR, '..', 'utils'))
-        from gpu_wait import wait_for_gpu
-        return wait_for_gpu(max_used_mb=args.max_used_mb, poll_interval=30)
-    return gpus[slot_idx % len(gpus)]
-
-
-def _run_jobs(active_cmds, gpus, args, log_fn, on_complete=None):
-    """Dynamic scheduler: up to `capacity = len(gpus)` jobs in flight.
-
-    Each slot, on spawn, calls `_pick_gpu` to get a GPU id and appends
-    `-g <id>` to the command.  As jobs finish, slots are refilled from
-    the pending queue.  Replaces the old batch-synchronous scheduler and
-    the --sequential inline loop.
+    Each batch runs in parallel, waits for all to finish, then starts the next.
 
     Args:
-        active_cmds: list of (name, cmd_without_g) — the non-skipped runs.
-        gpus: list of GPU IDs (determines capacity).
-        args: parsed CLI args (reads .wait, .max_used_mb, .refresh).
+        active_cmds: list of (name, cmd) — the non-skipped runs to execute.
+        gpus: list of GPU IDs (determines batch size).
+        refresh: status refresh interval in seconds.
         log_fn: callable(name) -> log file path.
-        on_complete: optional callable(name, returncode) called per finished run.
+        on_complete: optional callable(name, returncode) called when each run finishes.
 
     Returns total number of failures.
     """
-    capacity = len(gpus)
-    pending = list(active_cmds)
-    running = []  # list of (name, proc, log_path, log_f)
+    n_gpus = len(gpus)
+    n_batches = (len(active_cmds) + n_gpus - 1) // n_gpus
     total_failed = 0
-    launched = 0
-    refresh = args.refresh
 
-    print(f"\n=== {len(active_cmds)} runs, capacity={capacity} "
-          f"(refreshing every {refresh}s) ===\n")
+    for batch_idx in range(n_batches):
+        batch = active_cmds[batch_idx * n_gpus : (batch_idx + 1) * n_gpus]
 
-    while pending or running:
-        # Fill empty slots
-        while len(running) < capacity and pending:
-            name, cmd = pending.pop(0)
-            gpu = _pick_gpu(args, gpus, launched)
-            full_cmd = list(cmd) + ['-g', str(gpu)]
+        if n_batches > 1:
+            print(f"\n=== Batch {batch_idx + 1}/{n_batches}: "
+                  f"{len(batch)} runs (refreshing every {refresh}s) ===\n")
+        else:
+            print(f"\n=== Waiting for {len(batch)} runs (refreshing every {refresh}s) ===\n")
+
+        procs = []
+        log_files = []
+        for name, cmd in batch:
             log_path = log_fn(name)
             log_f = open(log_path, 'w')
-            proc = subprocess.Popen(full_cmd, stdout=log_f, stderr=subprocess.STDOUT)
-            running.append((name, proc, log_path, log_f))
-            launched += 1
-            print(f"  [launch {launched}/{len(active_cmds)}] {name} -> GPU {gpu}", flush=True)
-            if pending and len(running) < capacity:
-                # Inter-launch cooldown so nvidia-smi reflects the prior
-                # allocation before the next wait_for_gpu call.
-                time.sleep(refresh)
+            proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
+            procs.append((name, proc, log_path))
+            log_files.append(log_f)
 
-        # One-line status (no in-place refresh; set size changes over time)
-        alive = [name for name, proc, _, _ in running if proc.poll() is None]
-        print(f"  [running {len(alive)}/{capacity}, pending {len(pending)}] "
-              f"{', '.join(alive)}", flush=True)
-        time.sleep(refresh)
+        _print_status(procs, first_call=True)
 
-        # Reap finished
-        still_running = []
-        for name, proc, log_path, log_f in running:
-            if proc.poll() is None:
-                still_running.append((name, proc, log_path, log_f))
-            else:
-                log_f.close()
-                status = 'done' if proc.returncode == 0 else f'FAIL rc={proc.returncode}'
-                print(f"  [{status}] {name} (see {log_path})", flush=True)
-                if on_complete:
+        completed = set()
+
+        while any(proc.poll() is None for _, proc, _ in procs):
+            time.sleep(refresh)
+            _print_status(procs)
+            if on_complete:
+                for name, proc, _ in procs:
+                    if name not in completed and proc.poll() is not None:
+                        on_complete(name, proc.returncode)
+                        completed.add(name)
+
+        _print_status(procs)
+
+        # Notify any remaining
+        if on_complete:
+            for name, proc, _ in procs:
+                if name not in completed:
                     on_complete(name, proc.returncode)
-                if proc.returncode != 0:
-                    total_failed += 1
-        running = still_running
+
+        for lf in log_files:
+            lf.close()
+
+        total_failed += sum(1 for _, proc, _ in procs if proc.returncode != 0)
 
     return total_failed
 
@@ -371,11 +413,12 @@ def run_from_file(args):
 
     print(f"\n=== {len(inference_entries)} inference run(s) from {runfile} ===\n")
 
-    # Build all commands (no -g; scheduler assigns at launch time)
+    # Build all commands
     cmds = []
     for i, (flag, name, cmd_args) in enumerate(inference_entries):
         idx = i + 1
-        cmd = [script] + shlex.split(cmd_args)
+        gpu = gpus[i % len(gpus)]
+        cmd = [script] + shlex.split(cmd_args) + ['-g', str(gpu)]
         if args.overwrite:
             cmd.append('--overwrite')
         if gptq_for_experiments:
@@ -385,13 +428,12 @@ def run_from_file(args):
         elif args.fast:
             cmd.append('-F')
         flag_note = f" [{flag}→rerun]" if flag else ""
-        gpu_note = "wait" if getattr(args, 'wait', False) else f"GPU {gpus[i % len(gpus)]}"
         if idx in skip_set:
             cmds.append((name, cmd, True))
             print(f"  [skipped] {name}{flag_note}: {' '.join(cmd)}")
         else:
             cmds.append((name, cmd, False))
-            print(f"  [{gpu_note}] {name}{flag_note}: {' '.join(cmd)}")
+            print(f"  [GPU {gpu}] {name}{flag_note}: {' '.join(cmd)}")
 
     if args.dry:
         return
@@ -408,8 +450,8 @@ def run_from_file(args):
         new_flag = rf.inference_completion_flag(fast_mode) if rc == 0 else rf.FLAG_ERROR
         rf.mark_runfile(runfile, name, new_flag)
 
-    total_failed = _run_jobs(
-        active_all, gpus, args,
+    total_failed = _run_parallel_batches(
+        active_all, gpus, args.refresh,
         log_fn=lambda name: os.path.join(RESULTS_DIR, f'{name}.log'),
         on_complete=on_complete,
     )
@@ -469,14 +511,18 @@ def main():
     cmds = []
     for i, (name, mode, extra_flags) in enumerate(experiments):
         idx = i + 1  # 1-indexed
-        cmd = build_experiment_cmd(mode, quant_args, extra_flags, args)
-        gpu_note = "wait" if getattr(args, 'wait', False) else f"GPU {gpus[i % len(gpus)]}"
+        gpu = gpus[i % len(gpus)]
+        cmd = build_experiment_cmd(mode, gpu, quant_args, extra_flags, args,
+                                   use_wait=args.sequential)
         if idx in skip_set:
             cmds.append((name, cmd, True))
             print(f"  [skipped] {name}: {' '.join(cmd)}")
+        elif args.sequential:
+            cmds.append((name, cmd, False))
+            print(f"  [wait] {name}: {' '.join(cmd)}")
         else:
             cmds.append((name, cmd, False))
-            print(f"  [{gpu_note}] {name}: {' '.join(cmd)}")
+            print(f"  [GPU {gpu}] {name}: {' '.join(cmd)}")
 
     if args.dry:
         return
@@ -495,10 +541,36 @@ def main():
     active_cmds = [(name, cmd) for name, cmd, skipped in cmds if not skipped]
     num_run = len(active_cmds)
 
-    failed = _run_jobs(
-        active_cmds, gpus, args,
-        log_fn=lambda name: os.path.join(RESULTS_DIR, f'{name}_results.log'),
-    )
+    if args.sequential:
+        # Run one at a time; between runs wait then poll for a clear GPU
+        sys.path.insert(0, os.path.join(SCRIPT_DIR, '..', 'utils'))
+        from gpu_wait import wait_for_gpu
+
+        print(f"=== Running {num_run} experiments sequentially ===\n")
+        failed = 0
+        for i, (name, cmd) in enumerate(active_cmds):
+            print(f"  [{i+1}/{num_run}] Launching {name} ...")
+            log_path = os.path.join(RESULTS_DIR, f'{name}_results.log')
+            log_f = open(log_path, 'w')
+            proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
+            proc.wait()
+            log_f.close()
+            if proc.returncode == 0:
+                print(f"  [done] {name}")
+            else:
+                print(f"  [FAIL] {name} (see {log_path})")
+                failed += 1
+
+            # After each run (except the last), wait then poll for a clear GPU
+            if i < len(active_cmds) - 1:
+                print(f"  Cooling down {args.refresh}s before next experiment ...")
+                time.sleep(args.refresh)
+                wait_for_gpu(max_used_mb=args.max_used_mb, poll_interval=30)
+    else:
+        failed = _run_parallel_batches(
+            active_cmds, gpus, args.refresh,
+            log_fn=lambda name: os.path.join(RESULTS_DIR, f'{name}_results.log'),
+        )
 
     num_skipped = len(skip_set)
     print()
