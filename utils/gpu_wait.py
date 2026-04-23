@@ -50,22 +50,32 @@ def wait_for_gpu(max_used_mb=200, poll_interval=20):
 
     Among qualifying GPUs, selects the one with the least used memory.
     Status messages go to stderr so stdout stays clean for shell capture.
+    While waiting, refreshes a single status line in place (carriage return)
+    instead of spamming a new line per poll.
 
     Returns:
         int: GPU index.
     """
+    start = time.time()
+    waited = False
     while True:
         mem = get_gpu_memory()
         candidates = {idx: info for idx, info in mem.items()
                       if info['used'] <= max_used_mb}
         if candidates:
             best = min(candidates, key=lambda i: candidates[i]['used'])
+            if waited:
+                sys.stderr.write('\n')  # finish the in-place line
             print(f"GPU {best} available ({candidates[best]['used']} MiB used, "
                   f"{candidates[best]['free']} MiB free)", file=sys.stderr)
             return best
         best_used = min(info['used'] for info in mem.values())
-        print(f"Waiting for GPU (lowest used: {best_used} MiB, "
-              f"need <= {max_used_mb} MiB) ...", file=sys.stderr)
+        elapsed = int(time.time() - start)
+        sys.stderr.write(
+            f"\rwaiting {elapsed}s for GPU (lowest used: {best_used} MiB, "
+            f"need <= {max_used_mb} MiB) ...\033[K")
+        sys.stderr.flush()
+        waited = True
         time.sleep(poll_interval)
 
 
