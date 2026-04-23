@@ -30,6 +30,10 @@ def parse_acc_dtype(s):
       frac_bits : number of fractional bits (0 for float types)
 
     Format: int<N>[p<M>] — e.g. int32, int32p4, int26p8.
+    Auto:   int<N>a<Y>  — frac_bits resolved from calibration at init time;
+            returns ('int', N, 0) as a placeholder. Callers must run
+            resolve_auto_acc_dtype(...) before the first forward so every
+            qlayer.acc_dtype is rewritten to a concrete int<N>p<M>.
     Also:   float/fp32, half/fp16, bfloat/bf16.
     """
     s = s.lower().strip()
@@ -45,11 +49,103 @@ def parse_acc_dtype(s):
         bits = int(m.group(1))
         frac = int(m.group(2)) if m.group(2) else 0
         return ('int', bits, frac)
+    m = re.match(r'^int(\d+)a(\d+)$', s)
+    if m:
+        return ('int', int(m.group(1)), 0)
     raise ValueError(
-        f"Unknown acc_dtype: '{s}'. Must be int<N>[p<M>] "
-        "(e.g. int25, int32p4, int26p8), "
+        f"Unknown acc_dtype: '{s}'. Must be int<N>[p<M>], int<N>a<Y> "
+        "(e.g. int25, int32p4, int26p8, int24a1), "
         "or float/fp32, half/fp16, bfloat/bf16"
     )
+
+
+def parse_acc_dtype_auto(s):
+    """Return (total_bits, safety_bits) for 'int<N>a<Y>', else None.
+
+    The auto form indicates per-layer T1→T2 shift resolution from
+    calibration. `safety_bits` is reserved headroom beyond the observed
+    output MSB. `total_bits` is the full T2 accumulator width (the X-bit
+    clamp remains in force exactly as for any 'int<N>p<M>' run).
+    """
+    if not isinstance(s, str):
+        return None
+    m = re.match(r'^int(\d+)a(\d+)$', s.lower().strip())
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def resolve_auto_acc_dtype(qlayers, total_bits, safety_bits):
+    """Resolve per-layer acc_dtype for int<X>a<Y> mode.
+
+    Walks every ActQuantWrapper using int_gemm, derives max|output| from
+    the loaded out_quantizer calibration, computes a per-layer frac_bits,
+    and rewrites qlayer.acc_dtype to 'int<total_bits>p<frac_bits>'.
+
+    Raises RuntimeError if any eligible layer lacks calibrated
+    out_quantizer scales, or if the bit budget is insufficient.
+
+    The T2 clamp at 2^(total_bits-1)-1 is unchanged — this is purely a
+    per-layer shift selection, not a clamp relaxation.
+    """
+    frac_per_layer = {}
+    for name, qlayer in qlayers.items():
+        if not getattr(qlayer, 'use_int_gemm', False):
+            continue
+        if 'lm_head' in name:
+            continue
+
+        oq = qlayer.out_quantizer
+        if not (getattr(oq, 'static', False) and oq.scale is not None
+                and oq.scale.numel() > 1):
+            raise RuntimeError(
+                f"int{total_bits}a{safety_bits} mode requires calibrated "
+                f"out_quantizer for {name}, but none was found. Re-run with "
+                f"--quant_out ex --realint --static-act (so out_quantizer "
+                f"scales are captured and loaded), or use explicit "
+                f"int{total_bits}p<M>.")
+        if not getattr(oq, 'sym', False):
+            raise RuntimeError(
+                f"int{total_bits}a{safety_bits} mode expects symmetric "
+                f"out_quantizer, but {name}.out_quantizer.sym is False. "
+                f"Output quantizers are symmetric by convention — check "
+                f"calibration config.")
+
+        maxq = float(oq.maxq.item()) if torch.is_tensor(oq.maxq) else float(oq.maxq)
+        abs_max = float((oq.scale.abs() * maxq).max().item())
+        if abs_max <= 0 or not math.isfinite(abs_max):
+            raise RuntimeError(
+                f"int{total_bits}a{safety_bits}: {name} has non-positive "
+                f"or non-finite abs_max={abs_max} from calibration.")
+
+        I = max(0, math.ceil(math.log2(max(abs_max, 1e-30))))
+        total_shift = (total_bits - 1) - I - safety_bits
+        if total_shift < 0:
+            raise RuntimeError(
+                f"int{total_bits}a{safety_bits}: {name} output MSB={I} "
+                f"(abs_max={abs_max:.3g}) exceeds the accumulator range. "
+                f"Increase total bits or reduce safety.")
+
+        wsb = int(getattr(qlayer, 'w_shift_bias', 0))
+        frac_bits = total_shift - wsb
+        if frac_bits < 0:
+            raise RuntimeError(
+                f"int{total_bits}a{safety_bits}: {name} has "
+                f"w_shift_bias={wsb}, output MSB={I}, safety={safety_bits} "
+                f"— leaves no room for frac_bits (got {frac_bits}). "
+                f"Disable hwscale/gscaler or increase total bits.")
+
+        qlayer.acc_dtype = f'int{total_bits}p{frac_bits}'
+        frac_per_layer[name] = frac_bits
+        logging.info("[int_acc_auto] %s: abs_max=%.3g I=%d w_shift_bias=%d "
+                     "safety=%d -> int%dp%d",
+                     name, abs_max, I, wsb, safety_bits, total_bits, frac_bits)
+
+    if frac_per_layer:
+        vals = sorted(frac_per_layer.values())
+        logging.info("[int_acc_auto] summary: %d layers resolved, "
+                     "frac_bits min=%d median=%d max=%d",
+                     len(vals), vals[0], vals[len(vals) // 2], vals[-1])
+    else:
+        logging.warning("[int_acc_auto] no int_gemm layers found to resolve")
 
 # Triton is optional — fall back to the PyTorch reference if unavailable.
 _HAS_TRITON = False

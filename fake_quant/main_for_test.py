@@ -1049,6 +1049,26 @@ def main():
 
         logging.info("sd_check enabled: threshold=%.4e, norm=%s", _sd_thr, args.sd_check_norm)
 
+    # --- Resolve int<X>a<Y> acc_dtype from calibrated out_quantizer stats ---
+    # Runs after static scales are loaded and hwscale/selective_dyn/sd_check
+    # have finalized w_shift_bias. Rewrites each qlayer.acc_dtype to a
+    # concrete int<X>p<M> so downstream kernel/reference code is unchanged.
+    from int_acc_gemm import parse_acc_dtype_auto, resolve_auto_acc_dtype
+    _auto = parse_acc_dtype_auto(getattr(args, 'acc_dtype', ''))
+    if _auto is not None:
+        if not args.int_gemm:
+            raise RuntimeError(
+                f"--acc_dtype {args.acc_dtype} requires --int_gemm.")
+        if not args.act_scales_path:
+            raise RuntimeError(
+                f"--acc_dtype {args.acc_dtype} requires --static-act with "
+                f"calibrated scales (--act_scales_path / --quant_out ex "
+                f"--realint during calibration).")
+        _total_bits, _safety = _auto
+        _qlayers_auto = quant_utils.find_qlayers(
+            model, layers=[quant_utils.ActQuantWrapper])
+        resolve_auto_acc_dtype(_qlayers_auto, _total_bits, _safety)
+
     if args.distribute:
         utils.distribute_model(model)
     else:
