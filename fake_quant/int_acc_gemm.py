@@ -105,15 +105,18 @@ def resolve_auto_acc_dtype(qlayers, total_bits, safety_bits):
                 f"--quant_out ex --realint --static-act (so out_quantizer "
                 f"scales are captured and loaded), or use explicit "
                 f"int{total_bits}p<M>.")
-        if not getattr(oq, 'sym', False):
-            raise RuntimeError(
-                f"int{total_bits}a{safety_bits} mode expects symmetric "
-                f"out_quantizer, but {name}.out_quantizer.sym is False. "
-                f"Output quantizers are symmetric by convention — check "
-                f"calibration config.")
-
         maxq = float(oq.maxq.item()) if torch.is_tensor(oq.maxq) else float(oq.maxq)
-        abs_max = float((oq.scale.abs() * maxq).max().item())
+        # Derive per-layer abs_max from the calibrated (scale, zero). Symmetric
+        # is the common case; v_proj's out_quantizer (the V-cache) is asymmetric
+        # — handle both by reconstructing the representable range envelope.
+        if getattr(oq, 'sym', False):
+            abs_max = float((oq.scale.abs() * maxq).max().item())
+        else:
+            # Asymmetric: cmin = -zero*scale, cmax = (maxq-zero)*scale
+            zero = oq.zero if oq.zero is not None else torch.zeros_like(oq.scale)
+            cmin_abs = (zero * oq.scale).abs()
+            cmax_abs = ((maxq - zero) * oq.scale).abs()
+            abs_max = float(torch.maximum(cmin_abs, cmax_abs).max().item())
         if abs_max <= 0 or not math.isfinite(abs_max):
             raise RuntimeError(
                 f"int{total_bits}a{safety_bits}: {name} has non-positive "
