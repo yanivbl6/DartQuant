@@ -122,28 +122,42 @@ def resolve_auto_acc_dtype(qlayers, total_bits, safety_bits):
                 f"int{total_bits}a{safety_bits}: {name} has non-positive "
                 f"or non-finite abs_max={abs_max} from calibration.")
 
-        I = max(0, math.ceil(math.log2(max(abs_max, 1e-30))))
+        # The T2 int accumulator stores final_output × 2^(frac+w_shift_bias) /
+        # hwscale_global (kernel divides by 2^shift AND multiplies by global
+        # post-loop). So the effective max magnitude reaching the T2 clamp is
+        # abs_max / hwscale_global. Layers without hwscale have global=1.0 —
+        # no-op, preserving the non-hwscale math.
+        hw_global = float(getattr(qlayer, 'hwscale_global', 1.0))
+        if hw_global <= 0 or not math.isfinite(hw_global):
+            raise RuntimeError(
+                f"int{total_bits}a{safety_bits}: {name} has invalid "
+                f"hwscale_global={hw_global}.")
+        eff_abs_max = abs_max / hw_global
+
+        I = max(0, math.ceil(math.log2(max(eff_abs_max, 1e-30))))
         total_shift = (total_bits - 1) - I - safety_bits
         if total_shift < 0:
             raise RuntimeError(
-                f"int{total_bits}a{safety_bits}: {name} output MSB={I} "
-                f"(abs_max={abs_max:.3g}) exceeds the accumulator range. "
-                f"Increase total bits or reduce safety.")
+                f"int{total_bits}a{safety_bits}: {name} effective MSB={I} "
+                f"(abs_max={abs_max:.3g}, hwscale_global={hw_global:.3g}) "
+                f"exceeds the accumulator range. Increase total bits, "
+                f"reduce safety, or adjust hwscale.")
 
         wsb = int(getattr(qlayer, 'w_shift_bias', 0))
         frac_bits = total_shift - wsb
         if frac_bits < 0:
             raise RuntimeError(
                 f"int{total_bits}a{safety_bits}: {name} has "
-                f"w_shift_bias={wsb}, output MSB={I}, safety={safety_bits} "
+                f"w_shift_bias={wsb}, effective MSB={I}, safety={safety_bits} "
                 f"— leaves no room for frac_bits (got {frac_bits}). "
                 f"Disable hwscale/gscaler or increase total bits.")
 
         qlayer.acc_dtype = f'int{total_bits}p{frac_bits}'
         frac_per_layer[name] = frac_bits
-        logging.info("[int_acc_auto] %s: abs_max=%.3g I=%d w_shift_bias=%d "
-                     "safety=%d -> int%dp%d",
-                     name, abs_max, I, wsb, safety_bits, total_bits, frac_bits)
+        logging.info("[int_acc_auto] %s: abs_max=%.3g hw_global=%.3g "
+                     "eff_I=%d w_shift_bias=%d safety=%d -> int%dp%d",
+                     name, abs_max, hw_global, I, wsb, safety_bits,
+                     total_bits, frac_bits)
 
     if frac_per_layer:
         vals = sorted(frac_per_layer.values())
