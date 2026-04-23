@@ -94,8 +94,11 @@ def resolve_auto_acc_dtype(qlayers, total_bits, safety_bits):
             continue
 
         oq = qlayer.out_quantizer
+        # scale may be [N] (per-channel from calibration) or [1] (per-tensor
+        # after hw_accurate collapse) — both are valid. Uninitialized scale
+        # is zeros(1) with static=False, which fails the .static check.
         if not (getattr(oq, 'static', False) and oq.scale is not None
-                and oq.scale.numel() > 1):
+                and oq.scale.numel() >= 1):
             raise RuntimeError(
                 f"int{total_bits}a{safety_bits} mode requires calibrated "
                 f"out_quantizer for {name}, but none was found. Re-run with "
