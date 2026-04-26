@@ -528,6 +528,15 @@ Examples:
                         help='Group scale format: M5S3, M6E4b2, M6S4l2, etc. '
                              '(default: None = FP32 scales)')
 
+    # Inference-only knobs accepted-but-ignored here (the cal-tag excludes
+    # them, so the cal file is intentionally hwscale-agnostic and reused
+    # across all hwscale spec values at inference time).
+    parser.add_argument('--hwscale', type=str, default=None,
+                        help='[ignored at calibration] hwscale spec (e.g. M4S4bmid). '
+                             'The merged-scale snap is an inference-time step; the '
+                             'cal-tag excludes it so all hwscale variants share one '
+                             'cal file.')
+
     # AdaQuant (alternative to GPTQ)
     parser.add_argument('--adaquant', type=str, nargs='?', const='default', default=None,
                         help='Use AdaQuant instead of GPTQ. No value = defaults. '

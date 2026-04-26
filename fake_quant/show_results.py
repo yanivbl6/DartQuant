@@ -406,23 +406,70 @@ def _make_title(col_header, baseline_value, common_sub):
     return title
 
 
-def _save_fig(fig, fig_dir, metric_kw, baseline_value, chart_type):
-    """Save figure to disk and print path."""
+def _save_fig(fig, fig_dir, metric_kw, baseline_value, chart_type, subdir=None):
+    """Save figure to disk and print path. Returns the saved path."""
     fname = f"{metric_kw}_{baseline_value}_{chart_type}.png".replace("/", "_")
-    path = os.path.join(fig_dir, fname)
+    out_dir = os.path.join(fig_dir, subdir) if subdir else fig_dir
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, fname)
     fig.savefig(path, dpi=150)
     import matplotlib.pyplot as plt
     plt.close(fig)
     print(f"  {DIM}Saved {path}{RESET}")
+    return path
 
 
-def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
-                    baseline_value, key_colors, col_header, common_sub,
-                    short_labels, fig_dir, metric_kw, file_label=None):
-    """Draw and save a clustered bar chart for one metric."""
+def _choose_summary_grid(n):
+    """Choose (rows, cols) for tiling n panels into a page-shaped grid.
+
+    Per-panel charts are wide (height:width ≈ 1:2), so we stack vertically up
+    to 4 rows before adding a new column. Pattern: 1→1x1, 2→2x1, 3→3x1,
+    4→4x1, 5-6→3x2, 7-8→4x2, 9→3x3, 10-12→4x3, 13-16→4x4, ...
+    """
+    import math
+    if n <= 0:
+        return (1, 1)
+    cols = math.ceil(n / 4)
+    rows = math.ceil(n / cols)
+    return (rows, cols)
+
+
+def _save_summary_figure(specs, fig_dir, file_label):
+    """Compose all subfigures natively into a single summary_<label>.png.
+
+    Each spec is a dict with:
+      - "render": callable(ax) that draws the panel
+      - "figsize": (w, h) reference per-panel size in inches
+    No raster roundtrip — every panel is drawn fresh into a subplot Axes,
+    so text and lines retain matplotlib's native vector quality.
+    """
+    specs = [s for s in specs if s is not None]
+    if len(specs) < 2:
+        return
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(max(6, len(configs) * 1.5 + 2), 5))
+    rows, cols = _choose_summary_grid(len(specs))
+    panel_w = max(s["figsize"][0] for s in specs)
+    panel_h = max(s["figsize"][1] for s in specs)
+    fig, axes = plt.subplots(rows, cols,
+                             figsize=(panel_w * cols, panel_h * rows))
+    axes_flat = (axes.flatten() if hasattr(axes, "flatten") else [axes])
+    for ax, spec in zip(axes_flat, specs):
+        spec["render"](ax)
+    for ax in axes_flat[len(specs):]:
+        ax.set_axis_off()
+    fig.tight_layout()
+    out = os.path.join(fig_dir,
+                       f"summary_{file_label}.png".replace("/", "_"))
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"  {DIM}Saved {out}{RESET}")
+
+
+def _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
+                      baseline_value, key_colors, col_header, common_sub,
+                      short_labels):
+    """Render a clustered bar chart for one metric into the given Axes."""
     n_keys = len(key_values)
     bar_width = 0.8 / n_keys
 
@@ -434,7 +481,7 @@ def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
         seen_labels.add(kl)
         return kl
 
-    bars = []  # (x, val) for value labels
+    bars = []
     for ci, cfg in enumerate(configs):
         bl_val = matrix[cfg["baseline_idx"]][col_idx]
         if bl_val is not None:
@@ -455,10 +502,8 @@ def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
     _set_focused_ylim(ax, _collect_metric_values(configs, matrix, col_idx),
                       ppl_col)
 
-    # Value labels on bars
     for x, val in bars:
-        ax.text(x, val, f'{val:.2f}', ha='center', va='bottom',
-                fontsize=9)
+        ax.text(x, val, f'{val:.2f}', ha='center', va='bottom', fontsize=9)
 
     wrapped = [_wrap_label(l) for l in short_labels]
     ax.set_xticks([ci + bar_width * (n_keys - 1) / 2
@@ -468,19 +513,24 @@ def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
     ax.set_title(_make_title(col_header, baseline_value, common_sub),
                  fontsize=10)
     ax.legend(fontsize=8)
-    fig.tight_layout()
-    _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value, "bar")
 
 
-def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
-                     baseline_value, col_header, common_sub, short_labels,
-                     fig_dir, metric_kw, fp16_val=None, file_label=None,
-                     wildcard_capture=None):
-    """Draw and save a line chart for one metric (numeric compare, ≥3 values)."""
+def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
+                    baseline_value, key_colors, col_header, common_sub,
+                    short_labels, fig_dir, metric_kw, file_label=None):
+    """Draw and save a clustered bar chart for one metric."""
     import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(max(6, len(configs) * 1.5 + 2), 5))
+    _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
+                      baseline_value, key_colors, col_header, common_sub,
+                      short_labels)
+    fig.tight_layout()
+    return _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value,
+                     "bar", subdir="subfigures")
 
-    # Extract numeric x-values.  When a wildcard capture regex is available,
-    # use the *-matched segment; otherwise fall back to last digit group.
+
+def _line_chart_x_nums(key_values, wildcard_capture):
+    """Resolve numeric x-values for a line chart, or None if any are non-numeric."""
     x_nums = []
     for kv in key_values:
         val = None
@@ -492,14 +542,21 @@ def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
             digits = re.findall(r'\d+', kv)
             val = int(digits[-1]) if digits else None
         x_nums.append(val)
-
-    # Skip line chart if wildcard-matched parts aren't all numeric
     if any(v is None for v in x_nums):
-        return
+        return None
+    return x_nums
 
-    fig, ax = plt.subplots(figsize=(max(6, len(key_values) + 2), 5))
+
+def _render_line_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
+                       baseline_value, col_header, common_sub, short_labels,
+                       fp16_val=None, wildcard_capture=None):
+    """Render a line chart into the given Axes. Returns False if non-numeric."""
+    import matplotlib.pyplot as plt
+    x_nums = _line_chart_x_nums(key_values, wildcard_capture)
+    if x_nums is None:
+        return False
+
     cmap = plt.cm.get_cmap("tab10", max(len(configs), 3))
-
     for ci, cfg in enumerate(configs):
         y_vals = [None] * len(key_values)
         bl_ki = key_values.index(baseline_value)
@@ -528,7 +585,6 @@ def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
     ax.set_axisbelow(True)
     _set_focused_ylim(ax, _collect_metric_values(configs, matrix, col_idx),
                       ppl_col)
-    # Extend the ylim to make the FP16 reference line visible.
     if fp16_val is not None:
         y0, y1 = ax.get_ylim()
         lo, hi = min(y0, y1), max(y0, y1)
@@ -536,12 +592,27 @@ def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
             pad = 0.5
             new_lo = min(lo, fp16_val - pad)
             new_hi = max(hi, fp16_val + pad)
-            # Preserve inversion (PPL axis has y0 > y1).
             ax.set_ylim(new_hi if y0 > y1 else new_lo,
                         new_lo if y0 > y1 else new_hi)
     ax.legend(fontsize=7)
+    return True
+
+
+def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
+                     baseline_value, col_header, common_sub, short_labels,
+                     fig_dir, metric_kw, fp16_val=None, file_label=None,
+                     wildcard_capture=None):
+    """Draw and save a line chart for one metric (numeric compare, ≥3 values)."""
+    import matplotlib.pyplot as plt
+    if _line_chart_x_nums(key_values, wildcard_capture) is None:
+        return None
+    fig, ax = plt.subplots(figsize=(max(6, len(key_values) + 2), 5))
+    _render_line_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
+                       baseline_value, col_header, common_sub, short_labels,
+                       fp16_val=fp16_val, wildcard_capture=wildcard_capture)
     fig.tight_layout()
-    _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value, "line")
+    return _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value,
+                     "line", subdir="subfigures")
 
 
 def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
@@ -603,20 +674,86 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
             fp16_idx = i
             break
 
+    specs = []
+    bar_figsize = (max(6, len(configs) * 1.5 + 2), 5)
+    line_figsize = (max(6, len(key_values) + 2), 5)
     for metric_kw, col_header, col_idx in metric_indices:
         ppl_col = is_ppl[col_idx]
 
         _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
                         baseline_value, key_colors, col_header, common_sub,
-                        short_labels, fig_dir, metric_kw, file_label=file_label)
+                        short_labels, fig_dir, metric_kw,
+                        file_label=file_label)
+        specs.append({
+            "figsize": bar_figsize,
+            "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header:
+                       _render_bar_chart(ax, configs, matrix, ci, p,
+                                         key_values, baseline_value,
+                                         key_colors, h, common_sub,
+                                         short_labels)),
+        })
 
         if cmp_mode in ("numeric", "wildcard") and len(key_values) >= 3:
             fp16_val = matrix[fp16_idx][col_idx] if fp16_idx is not None else None
-            _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
-                             baseline_value, col_header, common_sub,
-                             short_labels, fig_dir, metric_kw,
-                             fp16_val=fp16_val, file_label=file_label,
-                             wildcard_capture=wildcard_capture)
+            line_path = _draw_line_chart(
+                configs, matrix, col_idx, ppl_col, key_values,
+                baseline_value, col_header, common_sub, short_labels,
+                fig_dir, metric_kw, fp16_val=fp16_val, file_label=file_label,
+                wildcard_capture=wildcard_capture)
+            if line_path is not None:
+                specs.append({
+                    "figsize": line_figsize,
+                    "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header,
+                               fv=fp16_val:
+                               _render_line_chart(ax, configs, matrix, ci, p,
+                                                  key_values, baseline_value,
+                                                  h, common_sub, short_labels,
+                                                  fp16_val=fv,
+                                                  wildcard_capture=wildcard_capture)),
+                })
+
+    _save_summary_figure(specs, fig_dir, file_label)
+
+
+def _render_all_runs_bar(ax, run_indices, matrix, col_idx, ppl_col, fp16_val,
+                         common_sub, col_header, short_labels, colors):
+    """Render the all-runs bar chart for one metric into the given Axes."""
+    xs = list(range(len(run_indices)))
+    bar_vals = []
+    for x, ri in zip(xs, run_indices):
+        v = matrix[ri][col_idx]
+        bar_vals.append(v)
+        if v is not None:
+            ax.bar(x, v, 0.8, color=colors[x])
+
+    if fp16_val is not None:
+        ax.axhline(fp16_val, color='black', linestyle='--', linewidth=1,
+                   label='FP16')
+        ax.legend(fontsize=8)
+
+    for x, v in zip(xs, bar_vals):
+        if v is not None:
+            ax.text(x, v, f'{v:.2f}', ha='center', va='bottom', fontsize=8)
+
+    wrapped = [_wrap_label(l, max_chars=12) for l in short_labels]
+    ax.set_xticks(xs)
+    ax.set_xticklabels(wrapped, rotation=45, ha='right', fontsize=7)
+    ax.set_ylabel(col_header)
+    ax.set_title(_make_title(col_header, "all runs", common_sub), fontsize=10)
+    ax.grid(True, axis='y', linestyle=':', linewidth=0.5, alpha=0.6)
+    ax.set_axisbelow(True)
+
+    vals = [v for v in bar_vals if v is not None]
+    _set_focused_ylim(ax, vals, ppl_col)
+    if fp16_val is not None:
+        y0, y1 = ax.get_ylim()
+        lo, hi = min(y0, y1), max(y0, y1)
+        if fp16_val < lo or fp16_val > hi:
+            pad = 0.5
+            new_lo = min(lo, fp16_val - pad)
+            new_hi = max(hi, fp16_val + pad)
+            ax.set_ylim(new_hi if y0 > y1 else new_lo,
+                        new_lo if y0 > y1 else new_hi)
 
 
 def _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl, draw_metrics,
@@ -667,6 +804,7 @@ def _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl, draw_metrics,
     cmap = plt.cm.get_cmap("tab10")
     colors = [cmap((i * 3) % 10) for i in range(len(run_indices))]
 
+    specs = []
     for metric_kw, col_header, col_idx in metric_indices:
         ppl_col = is_ppl[col_idx]
         fp16_val = (matrix[fp16_idx][col_idx] if fp16_idx is not None
@@ -674,50 +812,22 @@ def _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl, draw_metrics,
 
         fig, ax = plt.subplots(
             figsize=(max(8, len(run_indices) * 0.7 + 2), 5))
-
-        xs = list(range(len(run_indices)))
-        bar_vals = []
-        for x, ri in zip(xs, run_indices):
-            v = matrix[ri][col_idx]
-            bar_vals.append(v)
-            if v is not None:
-                ax.bar(x, v, 0.8, color=colors[x])
-
-        if fp16_val is not None:
-            ax.axhline(fp16_val, color='black', linestyle='--',
-                       linewidth=1, label='FP16')
-            ax.legend(fontsize=8)
-
-        # Value labels
-        for x, v in zip(xs, bar_vals):
-            if v is not None:
-                ax.text(x, v, f'{v:.2f}', ha='center', va='bottom',
-                        fontsize=8)
-
-        wrapped = [_wrap_label(l, max_chars=12) for l in short_labels]
-        ax.set_xticks(xs)
-        ax.set_xticklabels(wrapped, rotation=45, ha='right', fontsize=7)
-        ax.set_ylabel(col_header)
-        ax.set_title(_make_title(col_header, "all runs", common_sub),
-                     fontsize=10)
-        ax.grid(True, axis='y', linestyle=':', linewidth=0.5, alpha=0.6)
-        ax.set_axisbelow(True)
-
-        vals = [v for v in bar_vals if v is not None]
-        _set_focused_ylim(ax, vals, ppl_col)
-        # Extend ylim to keep FP16 line visible
-        if fp16_val is not None:
-            y0, y1 = ax.get_ylim()
-            lo, hi = min(y0, y1), max(y0, y1)
-            if fp16_val < lo or fp16_val > hi:
-                pad = 0.5
-                new_lo = min(lo, fp16_val - pad)
-                new_hi = max(hi, fp16_val + pad)
-                ax.set_ylim(new_hi if y0 > y1 else new_lo,
-                            new_lo if y0 > y1 else new_hi)
-
+        _render_all_runs_bar(ax, run_indices, matrix, col_idx, ppl_col,
+                             fp16_val, common_sub, col_header, short_labels,
+                             colors)
         fig.tight_layout()
-        _save_fig(fig, fig_dir, metric_kw, "all", "bar")
+        _save_fig(fig, fig_dir, metric_kw, "all", "bar", subdir="subfigures")
+
+        specs.append({
+            "figsize": (max(8, len(run_indices) * 0.7 + 2), 5),
+            "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header,
+                       fv=fp16_val:
+                       _render_all_runs_bar(ax, run_indices, matrix, ci, p,
+                                            fv, common_sub, h, short_labels,
+                                            colors)),
+        })
+
+    _save_summary_figure(specs, fig_dir, "all")
 
 
 def _extract_model_name(path):

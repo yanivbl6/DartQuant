@@ -9,3 +9,4 @@ fake_quant/experiments/*
 data
 calibrater/figures/*.png
 figures/*.png
+figures/subfigures/*.png
