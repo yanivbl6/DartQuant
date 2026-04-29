@@ -616,7 +616,7 @@ def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
 
 
 def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
-                  draw_metrics):
+                  draw_metrics, bar_only=False):
     """Generate bar charts (and line charts for numeric keys) from compare data."""
     import matplotlib
     matplotlib.use("Agg")
@@ -693,7 +693,8 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
                                          short_labels)),
         })
 
-        if cmp_mode in ("numeric", "wildcard") and len(key_values) >= 3:
+        if (not bar_only and cmp_mode in ("numeric", "wildcard")
+                and len(key_values) >= 3):
             fp16_val = matrix[fp16_idx][col_idx] if fp16_idx is not None else None
             line_path = _draw_line_chart(
                 configs, matrix, col_idx, ppl_col, key_values,
@@ -1009,7 +1010,7 @@ def hline(widths, char="─", left="├", mid="┼", right="┤"):
 
 
 def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None,
-                   fast=False):
+                   fast=False, bar_only=False):
     """Print a pretty summary table."""
     if not runs:
         print("No result files found.")
@@ -1195,7 +1196,7 @@ def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None,
                                       compare_expr, label_w=label_w)
         if draw_metrics and compare_data:
             _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
-                          draw_metrics)
+                          draw_metrics, bar_only=bar_only)
 
     # Legend
     print()
@@ -1371,6 +1372,9 @@ def main():
                              "E.g.: C4,MMLU,avg")
     parser.add_argument("-F", "--fast", action="store_true",
                         help="Show only PPL columns (hide accuracy columns)")
+    parser.add_argument("--bar", action="store_true",
+                        help="Force bar charts only (skip line charts even for "
+                             "numeric/wildcard compares)")
     parser.add_argument("--nbl", "--no-baseline", action="store_true",
                         dest="no_baseline",
                         help="Exclude the FP16 full-precision baseline")
@@ -1445,7 +1449,7 @@ def main():
         runs = [r for r in runs if r[2] != "full"]
 
     print_summary(runs, show_delta=args.delta, compare_expr=args.compare,
-                  draw_metrics=draw_metrics, fast=args.fast)
+                  draw_metrics=draw_metrics, fast=args.fast, bar_only=args.bar)
 
 
 if __name__ == "__main__":

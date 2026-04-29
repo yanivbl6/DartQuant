@@ -318,7 +318,12 @@ if _HAS_TRITON:
 
             # Cap to tier-1 accumulator range
             if ACC_WRAP:
-                partial = ((partial - ACC_MIN) % ACC_RANGE + ACC_RANGE) % ACC_RANGE + ACC_MIN
+                # Cast constexprs to int32 explicitly: Triton infers uint32 for
+                # large positive constexprs (e.g. ACC_RANGE = 2^30 at acc_bits=30),
+                # which then conflicts with `partial` (int32 from tl.dot) on `%`.
+                _ACC_MIN_I32 = tl.full((1,), ACC_MIN, dtype=tl.int32)
+                _ACC_RANGE_I32 = tl.full((1,), ACC_RANGE, dtype=tl.int32)
+                partial = ((partial - _ACC_MIN_I32) % _ACC_RANGE_I32 + _ACC_RANGE_I32) % _ACC_RANGE_I32 + _ACC_MIN_I32
             else:
                 partial = tl.minimum(tl.maximum(partial, ACC_MIN), ACC_MAX)
 

@@ -125,6 +125,139 @@ def extract_weight_scales(checkpoint_dir, w_bits, w_groupsize, w_sym):
     return cat_scales
 
 
+# ── Merged per-group scale extraction (--group mode) ──
+
+# GPTQ checkpoints contain both "<...>.weight" and "<...>.module.weight" for
+# the same Linear (Linear + ActQuantWrapper), with identical post-GPTQ values.
+# Match only the inner ".module.weight" to avoid double-counting.
+_PROJ_RE = re.compile(
+    r'^(model\.layers\.(\d+)\.(self_attn\.(q|k|v|o)_proj|mlp\.(up|gate|down)_proj))'
+    r'\.module\.weight$'
+)
+
+
+def _act_per_group_scale(col_scale, col_zero, G, a_sym, maxq_a):
+    """Collapse per-column activation (scale, zero) → per-group scale, mirroring
+    main_for_test.py:877-893. Returns float32 [n_groups] tensor."""
+    K = col_scale.shape[0]
+    assert K % G == 0, f"K={K} not divisible by acc_block_k={G}"
+    n_g = K // G
+    if a_sym:
+        return col_scale.reshape(n_g, G).max(dim=1).values.float()
+    # asym: recover group_min/group_max from (col_min, col_max) via stored zero/scale
+    col_min = -(col_zero * col_scale)
+    col_max = (maxq_a - col_zero) * col_scale
+    group_min = col_min.reshape(n_g, G).min(dim=1).values
+    group_max = col_max.reshape(n_g, G).max(dim=1).values
+    group_scale = (group_max - group_min) / maxq_a
+    dead = (group_min == 0) & (group_max == 0)
+    group_scale[dead] = 1.0
+    return group_scale.float()
+
+
+def extract_merged_scales(
+    cal_path, gptq_dir, w_bits, w_groupsize, acc_block_k, w_sym, a_sym,
+    hw_accurate, hwscale_spec_str=None,
+):
+    """For each per-group layer, return (raw_merged, scaled_post_global, layer_globals).
+
+    raw_merged   : dict {category: 1-D numpy array} — flattened a_gscale * w_gscale values
+    scaled       : dict {category: 1-D numpy array} OR None if hwscale_spec_str is None
+    layer_globals: list of (layer_idx, proj, n_groups_total, global_scalar)
+                   for diagnostics, only when hwscale_spec_str is set
+    """
+    # Load both inputs
+    cal = torch.load(cal_path, map_location='cpu', weights_only=True)
+    sd = {}
+    for f in sorted(os.listdir(gptq_dir)):
+        if f.endswith('.pth'):
+            sd.update(torch.load(os.path.join(gptq_dir, f), map_location='cpu',
+                                 weights_only=True))
+
+    G = acc_block_k
+    maxq_w_sym = 2 ** (w_bits - 1) - 1
+    maxq_w_asym = 2 ** w_bits - 1
+    # Activation maxq (a_bits=8 by default; cal may store it differently —
+    # use the recorded scale/zero unchanged for sym, derive maxq from zero
+    # range for asym). Most common case: a_bits=8 asym → maxq=255.
+    maxq_a = 255.0  # fallback for 8-bit asym; sym path doesn't use it
+
+    # Optional hwscale spec
+    spec = None
+    if hwscale_spec_str is not None:
+        # Lazy-import quant_utils (lives under fake_quant)
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '..', 'fake_quant'))
+        from quant_utils import parse_gscaler, hwscale_global_from_spec
+        spec = parse_gscaler(hwscale_spec_str)
+
+    raw_per_cat = {}
+    scaled_per_cat = {} if spec is not None else None
+    layer_globals = []
+
+    for key, W in sd.items():
+        m = _PROJ_RE.match(key)
+        if not m:
+            continue
+        layer_path = m.group(1)
+        layer_idx = int(m.group(2))
+        proj_name = m.group(4) or m.group(5)
+        cat = f'{proj_name}_proj'
+
+        # Skip non-down layers under hw_accurate (mirrors main_for_test.py:864)
+        if hw_accurate and proj_name != 'down':
+            continue
+
+        # Activation per-group scale from cal
+        cal_q_key = f'{layer_path}.quantizer'
+        if cal_q_key not in cal:
+            continue
+        a_col_scale = cal[cal_q_key]['scale'].float()
+        a_col_zero = cal[cal_q_key].get('zero')
+        if a_col_zero is None:
+            a_col_zero = torch.zeros_like(a_col_scale)
+        else:
+            a_col_zero = a_col_zero.float()
+        a_gscale = _act_per_group_scale(a_col_scale, a_col_zero, G, a_sym, maxq_a)
+
+        # Weight per-group scale from GPTQ checkpoint
+        Wf = W.float()
+        N, K = Wf.shape
+        n_w_groups = K // w_groupsize
+        if w_groupsize * n_w_groups != K:
+            n_w_groups = math.ceil(K / w_groupsize)
+            padded_K = n_w_groups * w_groupsize
+            Wf = torch.nn.functional.pad(Wf, (0, padded_K - K))
+        Wg = Wf.reshape(N * n_w_groups, w_groupsize)
+        if w_sym:
+            w_scale_flat = _recover_group_scales(Wg, maxq_w_sym)
+        else:
+            w_scale_flat = _recover_group_scales_asym(Wg, maxq_w_asym)
+        w_gscale = w_scale_flat.reshape(N, n_w_groups)
+
+        # Merged scale (must align activation groups with weight groups: with
+        # acc_block_k == w_groupsize they share the same n_groups, which is the
+        # configuration hwscale requires at inference).
+        if a_gscale.shape[0] != n_w_groups:
+            # Mismatched group geometry — skip rather than guess.
+            continue
+        raw_merged = (a_gscale.unsqueeze(0) * w_gscale).flatten().numpy()
+        raw_per_cat.setdefault(cat, []).append(raw_merged)
+
+        if spec is not None:
+            from quant_utils import hwscale_global_from_spec
+            gs = hwscale_global_from_spec(
+                spec, raw_scale=a_gscale.unsqueeze(0) * w_gscale)
+            scaled = raw_merged / max(gs, 1e-300)
+            scaled_per_cat.setdefault(cat, []).append(scaled)
+            layer_globals.append((layer_idx, cat, raw_merged.size, float(gs)))
+
+    raw_per_cat = {k: np.concatenate(v) for k, v in raw_per_cat.items()}
+    if scaled_per_cat is not None:
+        scaled_per_cat = {k: np.concatenate(v) for k, v in scaled_per_cat.items()}
+    return raw_per_cat, scaled_per_cat, layer_globals
+
+
 # ── Categorize keys ──
 
 def categorize_key(key):
@@ -312,6 +445,13 @@ def main():
     cfg.add_quant_args(parser)
     parser.add_argument('--weights', action='store_true',
                         help='Analyze weight group scales from GPTQ checkpoint (instead of activation scales)')
+    parser.add_argument('--group', action='store_true',
+                        help='Analyze MERGED per-group scales (a_gscale * w_gscale) for layers '
+                             'that use per-group scaling — mirrors hwscale\'s actual input. '
+                             'Scope follows --hw_accurate (down_proj only) / --hw_align (all int_gemm '
+                             'layers). Mutually exclusive with --weights. '
+                             'When combined with --hwscale <spec>, plots a second histogram of '
+                             'merged_scale / hwscale_global (continuous, NO snap applied).')
     parser.add_argument('--pt_path', type=str, default=None,
                         help='Explicit path to .pt file (activation mode) or GPTQ checkpoint dir (weight mode)')
     parser.add_argument('--no-plot', action='store_true',
@@ -325,6 +465,100 @@ def main():
     output_dir = os.path.join(script_dir, 'figures')
 
     act_path, gptq_dir, quant_tag = _resolve_paths(args, args.mode)
+
+    if args.group and args.weights:
+        print("Error: --group and --weights are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+    if args.hwscale and not args.group:
+        print("Error: --hwscale requires --group.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.group:
+        # ── Merged per-group scale analysis (a_gscale × w_gscale) ──
+        # Cal and GPTQ caches strip result-only tag segments (hwscale/hwacc/etc),
+        # so the file lookups need their own tag forms instead of `quant_tag`.
+        _cal_tag = cfg.build_quant_tag(args, for_cal_cache=True)
+        _gptq_tag = cfg.build_quant_tag(args, for_gptq_cache=True, for_cal_cache=True)
+        cal_pt = (args.pt_path
+                  if (args.pt_path and os.path.isfile(args.pt_path))
+                  else cfg.resolve_act_scales_path(args.model, args.mode, _cal_tag))
+        ckpt_dir = (args.pt_path
+                    if (args.pt_path and os.path.isdir(args.pt_path))
+                    else cfg.resolve_gptq_checkpoint_dir(
+                        args.model, args.mode, _gptq_tag, args.w_bits,
+                        imitate_gguf=bool(getattr(args, 'imitate_gguf', None))))
+
+        if not os.path.isfile(cal_pt):
+            print(f"Error: calibration file not found: {cal_pt}")
+            sys.exit(1)
+        if not os.path.isdir(ckpt_dir):
+            print(f"Error: GPTQ checkpoint dir not found: {ckpt_dir}")
+            sys.exit(1)
+
+        w_sym = not getattr(args, 'w_asym', False) and not args.sym is False
+        # Above is awkward — reuse the same convention as build_quant_tag:
+        # w_asym is True only when --w_asym is passed AND not --sym.
+        w_asym = getattr(args, 'w_asym', False) and not args.sym
+        w_sym = not w_asym
+        # Activation symmetry: by convention activations are asym (a_asym=True
+        # is the default in calibrate_act_scales.py). --sym makes everything sym.
+        a_sym = bool(args.sym)
+        hw_accurate = bool(getattr(args, 'hw_accurate', False))
+
+        print(f"Cal:  {cal_pt}")
+        print(f"GPTQ: {ckpt_dir}")
+        print(f"w_sym={w_sym}  a_sym={a_sym}  hw_accurate={hw_accurate}  "
+              f"acc_block_k={args.acc_block_k}  w_groupsize={args.groupsize}")
+        if args.hwscale:
+            print(f"hwscale spec: {args.hwscale} (continuous post-global, NO snap)")
+
+        raw_per_cat, scaled_per_cat, layer_globals = extract_merged_scales(
+            cal_path=cal_pt,
+            gptq_dir=ckpt_dir,
+            w_bits=args.w_bits,
+            w_groupsize=args.groupsize,
+            acc_block_k=args.acc_block_k,
+            w_sym=w_sym,
+            a_sym=a_sym,
+            hw_accurate=hw_accurate,
+            hwscale_spec_str=args.hwscale,
+        )
+
+        if not raw_per_cat:
+            print("No per-group layers in scope — check --hw_accurate / --hw_align flags "
+                  "and that the cal/GPTQ files match the requested config.")
+            sys.exit(1)
+
+        # Tag (raw merged scales)
+        scope_tag = 'hwacc' if hw_accurate else 'all'
+        base_tag = f'merged-{scope_tag}_{args.mode}_{quant_tag}'
+        print(f"\n=== Raw merged scales (a_gscale * w_gscale) — {scope_tag} scope ===")
+        print_scale_report(raw_per_cat, tag=base_tag)
+        if not args.no_plot:
+            plot_histograms(raw_per_cat, {}, output_dir, base_tag)
+
+        # Tag (post-global scales)
+        if scaled_per_cat is not None:
+            postg_tag = f'{base_tag}_postglobal-{args.hwscale}'
+            # Per-layer global summary
+            print(f"\n=== Per-layer hwscale_global (spec={args.hwscale}) ===")
+            print(f"{'layer':>6s}  {'proj':>10s}  {'#groups':>8s}  {'global':>12s}  {'log2':>8s}")
+            for li, c, n, gs in layer_globals:
+                lg = math.log2(gs) if gs > 0 else float('-inf')
+                print(f"{li:>6d}  {c:>10s}  {n:>8d}  {gs:>12.3e}  {lg:>8.2f}")
+            globals_arr = np.array([gs for *_, gs in layer_globals])
+            if globals_arr.size > 0 and (globals_arr > 0).all():
+                lg = np.log2(globals_arr)
+                print(f"\nglobal_scalar log2: min={lg.min():.2f} median={np.median(lg):.2f} "
+                      f"max={lg.max():.2f}  (fp32 normal range: log2 in [-127, 127])")
+                if lg.max() > 100 or lg.min() < -100:
+                    print("WARNING: global_scalar exceeds safe fp32 range — snap precision will degrade.")
+
+            print(f"\n=== Post-global merged scales (raw / global, NO snap applied) ===")
+            print_scale_report(scaled_per_cat, tag=postg_tag)
+            if not args.no_plot:
+                plot_histograms(scaled_per_cat, {}, output_dir, postg_tag)
+        return
 
     if args.weights:
         # ── Weight group scale analysis ──
