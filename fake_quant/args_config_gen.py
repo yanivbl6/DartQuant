@@ -200,6 +200,12 @@ def parser_gen():
     parser.add_argument('--w_clip', action=argparse.BooleanOptionalAction, default=False,
                         help='''Clipping the weight quantization!
                         We do not support arguments for clipping and we find the best clip ratio during the weight quantization''')
+    parser.add_argument('--fp4', type=str, default='none',
+                        choices=['all', 'down', 'none'],
+                        help='FP4 weight quantization mode. Levels are the integer set '
+                             '{0, +/-1, +/-2, +/-3, +/-4, +/-6, +/-8, +/-12} with scale = amax/12. '
+                             'all: every GPTQ-quantized linear; down: only mlp.down_proj; '
+                             'none: disabled (default). Symmetric only.')
     parser.add_argument('--nsamples', type=int, default=128,
                         help='Number of calibration data samples for GPTQ.')
     parser.add_argument('--cal_dataset', type=str, default='wikitext2',

@@ -1212,6 +1212,34 @@ def prepare_int_weights(
     W = linear.weight.data.float()  # [N, K]
     N, K = W.shape
 
+    # --- Fast path (symmetric): reuse GPTQ's stored scale ---
+    # GPTQ only stashes params on sym layers when the level set is non-uniform
+    # (today: --fp4). Codes are signed int8 in {0, +/-1, +/-2, +/-3, +/-4,
+    # +/-6, +/-8, +/-12} and require no zero point.
+    if (w_sym
+            and hasattr(linear, '_gptq_w_scale')
+            and linear._gptq_w_scale is not None):
+        dev = W.device
+        scale = linear._gptq_w_scale.to(dev).float()  # [N, n_groups] or [N, 1]
+        if w_group_size > 0:
+            scale_exp = scale.repeat_interleave(w_group_size, dim=1)[:, :K]
+            w_int = torch.round(W / scale_exp.clamp(min=1e-10)).to(torch.int8)
+            recon = scale_exp * w_int.float()
+            w_scale_out = scale
+        else:
+            # scale is [N, 1] from find_params reshape on a 2D weight
+            w_int = torch.round(W / scale.clamp(min=1e-10)).to(torch.int8)
+            recon = scale * w_int.float()
+            w_scale_out = scale.squeeze(1)
+        w_min_val, w_max_val = w_int.min().item(), w_int.max().item()
+        assert -12 <= w_min_val and w_max_val <= 12, \
+            f"sym fast path got code outside [-12, 12]: [{w_min_val}, {w_max_val}]"
+        recon_err = (recon - W).abs().max().item()
+        logging.info("  prepare_int_weights: STORED sym GPTQ params "
+                     "(w_bits=%d, scale=%s, recon_err=%.3e)",
+                     w_bits, list(linear._gptq_w_scale.shape), recon_err)
+        return w_int, w_scale_out, None
+
     # --- Fast path: reuse GPTQ's original scale/zero (asymmetric only) ---
     if (not w_sym
             and hasattr(linear, '_gptq_w_scale')

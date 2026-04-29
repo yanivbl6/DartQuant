@@ -130,6 +130,9 @@ def add_quant_args(parser):
                         help='Symmetric quantization for W/K/V')
     parser.add_argument('--w_asym', action='store_true',
                         help='Asymmetric weight quantization (default: symmetric)')
+    parser.add_argument('--fp4', type=str, default='none',
+                        choices=['all', 'down', 'none'],
+                        help='FP4 weight quantization: all / down (down_proj only) / none (default)')
     parser.add_argument('--kv_ex', type=int, default=0,
                         help='K-cache quant without R3 rotation (0=off)')
     parser.add_argument('--proj_ex', type=int, default=0,
@@ -416,6 +419,13 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
     _sig = getattr(args, 'semi_int_gemm', None)
     if _sig and not (for_gptq_cache or for_cal_cache):
         tag += f"_semi-{_sig}"
+    # FP4 weights (changes the GPTQ output, post-quant activations, and result —
+    # tag in all three modes).
+    _fp4 = getattr(args, 'fp4', 'none')
+    if _fp4 == 'all':
+        tag += "_FP4"
+    elif _fp4 == 'down':
+        tag += "_FP4-DOWN"
     return tag
 
 
@@ -537,6 +547,9 @@ def build_quant_args(args):
         cmd.append('--hw_align')
     if getattr(args, 'hw_accurate', False):
         cmd.append('--hw_accurate')
+    _fp4 = getattr(args, 'fp4', 'none')
+    if _fp4 != 'none':
+        cmd += ['--fp4', _fp4]
     return cmd
 
 

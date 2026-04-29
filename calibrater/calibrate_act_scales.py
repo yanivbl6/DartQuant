@@ -442,6 +442,9 @@ Examples:
                         help='Symmetric K/V quantization (default: asymmetric)')
     parser.add_argument('--w_asym', action='store_true',
                         help='Asymmetric weight quantization (default: symmetric)')
+    parser.add_argument('--fp4', type=str, default='none',
+                        choices=['all', 'down', 'none'],
+                        help='FP4 weight quantization: all / down (down_proj only) / none (default)')
 
     # Rarely changed tuning knobs
     parser.add_argument('--a_clip_ratio', type=float, default=0.9)
@@ -985,6 +988,8 @@ def main():
                 gptq_args.gscaler_parsed = quant_utils.parse_gscaler(
                     getattr(args, 'gscaler', None))
                 gptq_args.lsb_mac_shift = getattr(args, 'lsb_mac_shift', 0)
+                # Forward FP4 mode so GPTQ snaps to FP4 levels on selected layers
+                gptq_args.fp4 = getattr(args, 'fp4', 'none')
 
                 gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
 

@@ -327,6 +327,31 @@ def sym_quant_dequant(x, scale, maxq, stochastic=False):
     return sym_dequant(*sym_quant(x, scale, maxq, stochastic=stochastic))
 
 
+# FP4 (NVFP4) integer level set: 16 codes ordered ascending.
+# NVFP4 levels are {0, +/-0.5, +/-1, +/-1.5, +/-2, +/-3, +/-4, +/-6}; multiplying
+# by 2 gives the integer code set below, and the per-group scale becomes amax/12
+# so dequant value (code * scale) matches the original NVFP4 dequant value.
+_FP4_CODES = torch.tensor(
+    [-12.0, -8.0, -6.0, -4.0, -3.0, -2.0, -1.0, 0.0,
+     1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0],
+    dtype=torch.float32,
+)
+
+
+def fp4_quant_dequant(x, scale):
+    """Snap x/scale to the nearest FP4 integer code, return code * scale.
+
+    Uses bucketize on the midpoints between adjacent codes — exact nearest-
+    neighbour mapping with no off-by-one at the level boundaries.
+    """
+    codes = _FP4_CODES.to(device=x.device, dtype=x.dtype)
+    scale = scale.to(x.device)
+    x_norm = x / scale.clamp(min=1e-10)
+    mids = (codes[:-1] + codes[1:]) / 2.0
+    idx = torch.bucketize(x_norm.contiguous(), mids)
+    return codes[idx] * scale
+
+
 def two_compl(x, bits: int):
     return torch.where(x < 0, 2 ** bits + x, x)
 
@@ -1343,8 +1368,17 @@ class WeightQuantizer(torch.nn.Module):
         bits, perchannel=False, sym=True,
         mse=False, norm=2.4, grid=100, maxshrink=.8,
         groupsize=-1, static_groups=False,
-        gscaler=None
+        gscaler=None,
+        nvfp4=False,
     ):
+        # FP4 is symmetric, per-channel, 4-bit; MSE search disabled (its loop
+        # uses uniform-integer rounding that doesn't apply to FP4 levels).
+        if nvfp4:
+            bits = 4
+            sym = True
+            perchannel = True
+            mse = False
+        self.nvfp4 = nvfp4
         self.bits = bits
         self.perchannel = perchannel
         self.sym = sym
@@ -1353,7 +1387,10 @@ class WeightQuantizer(torch.nn.Module):
         self.grid = grid
         self.maxshrink = maxshrink
         self.gscaler = gscaler
-        if sym:
+        if nvfp4:
+            # Max FP4 code magnitude is 12 → scale = amax / 12 in find_params.
+            self.maxq = torch.tensor(12)
+        elif sym:
             self.maxq = torch.tensor(2**(bits - 1) - 1)
         else:
             self.maxq = torch.tensor(2**bits - 1)
@@ -1429,6 +1466,8 @@ class WeightQuantizer(torch.nn.Module):
     def quantize(self, x, stochastic=False):
         x_dtype = x.dtype
         if self.ready() and self.bits < 16:
+            if getattr(self, 'nvfp4', False):
+                return fp4_quant_dequant(x, self.scale).to(x_dtype)
             if self.sym:
                 return sym_quant_dequant(x, self.scale, self.maxq,
                                          stochastic=stochastic).to(x_dtype)

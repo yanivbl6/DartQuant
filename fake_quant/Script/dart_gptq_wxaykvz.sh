@@ -72,6 +72,7 @@ Options:
   --sim_version N  Simulation version tag for A/B comparisons       (default: 0=omitted)
   --fp32           Run model in float32 instead of float16 (isolate precision effects)
   --realint        Force real integer quantize/dequantize even at 16 bits
+  --fp4 MODE       FP4 weight quantization: all, down, none                (default: none)
   -F               Fast mode (skip lm_eval tasks)
   --very-fast      Very fast mode (skip lm_eval, PPL on wikitext2 only)
   -h               Show this help message
@@ -162,6 +163,7 @@ R4_STATS=""
 R4_STATS_BATCHES=0
 STOCHASTIC_QUANT=0
 SEMI_INT_GEMM=""
+FP4="none"
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -221,6 +223,7 @@ while [[ $# -gt 0 ]]; do
         --semi_int_gemm) SEMI_INT_GEMM="$2"; shift 2 ;;
         --hw_align)    HW_ALIGN=1;         shift   ;;
         --hw_accurate) HW_ACCURATE=1;     shift   ;;
+        --fp4)         FP4="$2";           shift 2 ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
@@ -500,6 +503,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ -n "$SEMI_INT_GEMM" ] && TAG_ARGS="${TAG_ARGS} --semi_int_gemm ${SEMI_INT_GEMM}"
 [ "$HW_ALIGN" == "1" ] && TAG_ARGS="${TAG_ARGS} --hw_align"
 [ "$HW_ACCURATE" == "1" ] && TAG_ARGS="${TAG_ARGS} --hw_accurate"
+[ "$FP4" != "none" ] && TAG_ARGS="${TAG_ARGS} --fp4 ${FP4}"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
 QUANT_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS})
@@ -654,6 +658,7 @@ python main_for_test.py \
     $([ "$EQ" == "1" ] && echo "--eq") \
     $([ "$UD_EQ" == "1" ] && echo "--ud_eq") \
     $([ "$UGD_EQ" == "1" ] && echo "--ugd_eq") \
+    $([ "$FP4" != "none" ] && echo "--fp4 ${FP4}") \
     --percdamp 0.1 \
     --no-w_ft \
     --ft_percdamp 0.0 \

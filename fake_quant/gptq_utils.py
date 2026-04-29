@@ -54,15 +54,16 @@ class GPTQ:
         H[dead, dead] = 1
         W[:, dead] = 0
 
-        # Collect per-group scale/zero for asymmetric weights so that
-        # prepare_int_weights can reuse GPTQ's exact parameters instead of
-        # re-deriving them from fake-quantized values (which fails when not
-        # all quantization levels are used in a group).
+        # Collect per-group scale/zero so prepare_int_weights can reuse GPTQ's
+        # exact parameters instead of re-deriving them from fake-quantized
+        # values (which fails when not all quantization levels are used in a
+        # group, or when the level set is non-uniform like FP4).
         # Skip when actorder=True + static_groups=False: columns are permuted
         # so per-group params in permuted order don't map to final column groups.
         _collect_gptq_params = (
             groupsize != -1
-            and not self.quantizer.sym
+            and (not self.quantizer.sym
+                 or getattr(self.quantizer, 'nvfp4', False))
             and not (actorder and not static_groups)
         )
         _gptq_scales = []  # will be [n_groups] list of [N,1] tensors
@@ -158,8 +159,9 @@ class GPTQ:
             self.layer._gptq_w_scale = torch.cat(_gptq_scales, dim=1)  # [N, n_groups]
             self.layer._gptq_w_zero = torch.cat(_gptq_zeros, dim=1)    # [N, n_groups]
 
-        # For per-channel asymmetric (groupsize == -1), also save.
-        if groupsize == -1 and not self.quantizer.sym:
+        # For per-channel (groupsize == -1) asym or FP4, also save.
+        if groupsize == -1 and (not self.quantizer.sym
+                                or getattr(self.quantizer, 'nvfp4', False)):
             self.layer._gptq_w_scale = self.quantizer.scale.clone()
             self.layer._gptq_w_zero = self.quantizer.zero.clone()
 
@@ -267,11 +269,20 @@ def gptq_fwrd(model, dataloader, dev, args):
                     layer_weight_bits = w_bits_map.get(full_name, layer_weight_bits)
                 if args.w_bits_down_proj is not None and 'down_proj' in name:
                     layer_weight_bits = args.w_bits_down_proj
+                fp4_mode = getattr(args, 'fp4', 'none')
+                layer_use_fp4 = (fp4_mode == 'all') or (
+                    fp4_mode == 'down' and 'down_proj' in name
+                )
+                if layer_use_fp4 and args.w_asym:
+                    raise ValueError(
+                        "--fp4 is symmetric-only; remove --w_asym for FP4 layers"
+                    )
                 gptq[name] = GPTQ(subset[name])
                 gptq[name].quantizer = quant_utils.WeightQuantizer()
                 gptq[name].quantizer.configure(
                     layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip,
-                    gscaler=getattr(args, 'gscaler_parsed', None)
+                    gscaler=getattr(args, 'gscaler_parsed', None),
+                    nvfp4=layer_use_fp4,
                 )
 
             def add_batch(name):
@@ -408,11 +419,20 @@ def rtn_fwrd(model, dev, args, stochastic=False):
                 layer_weight_bits = w_bits_map.get(full_name, layer_weight_bits)
             if args.w_bits_down_proj is not None and 'down_proj' in name:
                 layer_weight_bits = args.w_bits_down_proj
+            fp4_mode = getattr(args, 'fp4', 'none')
+            layer_use_fp4 = (fp4_mode == 'all') or (
+                fp4_mode == 'down' and 'down_proj' in name
+            )
+            if layer_use_fp4 and args.w_asym:
+                raise ValueError(
+                    "--fp4 is symmetric-only; remove --w_asym for FP4 layers"
+                )
 
             quantizer = quant_utils.WeightQuantizer()
             quantizer.configure(
                 layer_weight_bits, perchannel=True, sym=not (args.w_asym), mse=args.w_clip,
-                gscaler=getattr(args, 'gscaler_parsed', None)
+                gscaler=getattr(args, 'gscaler_parsed', None),
+                nvfp4=layer_use_fp4,
             )
             W = subset[name].weight.data
 
@@ -425,7 +445,8 @@ def rtn_fwrd(model, dev, args, stochastic=False):
                         group_quantizer.configure(
                             layer_weight_bits, perchannel=True,
                             sym=not (args.w_asym), mse=args.w_clip,
-                            gscaler=getattr(args, 'gscaler_parsed', None)
+                            gscaler=getattr(args, 'gscaler_parsed', None),
+                            nvfp4=layer_use_fp4,
                         )
                         group_quantizer.find_params(W[:, j:j + groupsize])
                         groups.append(group_quantizer)
