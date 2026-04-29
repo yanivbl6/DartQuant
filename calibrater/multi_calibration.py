@@ -25,50 +25,21 @@ import shlex
 import subprocess
 import sys
 import os
-import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'fake_quant'))
 import experiment_config as cfg
 import runfile_flags as rf
+from parallel_runner import run_parallel_batches, calibration_fail_line
+
+DEFAULT_LOG_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
+                 'data', 'cached_results'))
 
 
-def stream_output(proc, prefix):
-    """Read process stdout/stderr line-by-line and print with a prefix tag."""
-    for stream in (proc.stdout, proc.stderr):
-        if stream is None:
-            continue
-        for line in stream:
-            print(f"[{prefix}] {line}", end='', flush=True)
-
-
-def run_job(cmd, env, label, cwd=None):
-    """Run a subprocess, stream its output with a label prefix, return the exit code."""
-    print(f"\n{'='*60}")
-    print(f"[{label}] Starting: {' '.join(cmd)}")
-    print(f"{'='*60}\n", flush=True)
-
-    proc = subprocess.Popen(
-        cmd,
-        env=env,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    for line in proc.stdout:
-        print(f"[{label}] {line}", end='', flush=True)
-
-    proc.wait()
-
-    if proc.returncode != 0:
-        print(f"\n[{label}] FAILED (exit code {proc.returncode})")
-    else:
-        print(f"\n[{label}] Done.")
-
-    return proc.returncode
+def _sanitize_label(label):
+    """Make a label safe for use as a filename."""
+    return label.replace(':', '_').replace('/', '_').replace(' ', '_')
 
 
 def make_env(gpu_id):
@@ -155,6 +126,8 @@ Examples:
                         help='Delete cached GPTQ checkpoint and re-quantize (forwarded to calibrate)')
     parser.add_argument('--recalib', action='store_true',
                         help='Force re-calibration regardless of existing [CAL]/[FAST]/[DONE]/[ERROR] flags')
+    parser.add_argument('--refresh', type=int, default=10,
+                        help='Status refresh interval in seconds (default: 10)')
 
     # Calibration-specific extras (--nsamples, --seqlen, etc.) remain in extra_args
     return parser.parse_known_args()
@@ -169,43 +142,52 @@ def parse_gpus(gpu_str, n_needed=3):
     return [int(p) for p in parts]
 
 
-def run_batch(jobs, gpus, dry=False, cwd=None):
+def run_batch(jobs, gpus, dry=False, cwd=None, log_dir=None, refresh=10):
     """Run a list of (label, cmd) jobs in batches of len(gpus).
 
     Each batch runs in parallel (one job per GPU), then waits for all to finish
     before starting the next batch. Returns dict of label -> exit code.
+
+    Output for each job is redirected to a per-job log file under `log_dir`
+    (default: data/cached_results/). The shared parallel runner displays a
+    refreshing status block — one line per job — instead of streaming all
+    outputs to stdout.
     """
-    all_results = {}
+    if log_dir is None:
+        log_dir = DEFAULT_LOG_DIR
+    os.makedirs(log_dir, exist_ok=True)
 
-    for batch_start in range(0, len(jobs), len(gpus)):
-        batch = jobs[batch_start:batch_start + len(gpus)]
+    # Announce all commands upfront (one-shot, not per batch) so the user can
+    # see what was launched and on which GPU.
+    for i, (label, cmd) in enumerate(jobs):
+        gpu = gpus[i % len(gpus)]
+        print(f"  [GPU {gpu}] {label}: CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}")
 
-        if dry:
-            for i, (label, cmd) in enumerate(batch):
-                gpu = gpus[i % len(gpus)]
-                print(f"  [GPU {gpu}] {label}: CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}")
-            continue
+    if dry:
+        return {label: 0 for label, _ in jobs}
 
-        threads = []
-        results = {}
+    # Pair each job with its env (CUDA_VISIBLE_DEVICES + offline flags).
+    active_cmds = []
+    for i, (label, cmd) in enumerate(jobs):
+        gpu = gpus[i % len(gpus)]
+        active_cmds.append((label, cmd, make_env(gpu)))
 
-        def worker(label, cmd, gpu_id):
-            results[label] = run_job(cmd, make_env(gpu_id), label, cwd=cwd)
+    log_path_for = lambda name: os.path.join(log_dir, f"{_sanitize_label(name)}.log")
 
-        for i, (label, cmd) in enumerate(batch):
-            gpu = gpus[i % len(gpus)]
-            print(f"  [GPU {gpu}] {label}: CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}")
-            t = threading.Thread(target=worker, args=(label, cmd, gpu), daemon=True)
-            threads.append(t)
+    results = {}
 
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+    def on_complete(name, rc):
+        results[name] = rc
 
-        all_results.update(results)
+    run_parallel_batches(
+        active_cmds, gpus, refresh,
+        log_fn=log_path_for,
+        on_complete=on_complete,
+        cwd=cwd,
+        fail_message_fn=calibration_fail_line,
+    )
 
-    return all_results
+    return results
 
 
 def _parse_runfile_line_args(tokens):
@@ -306,22 +288,41 @@ def parse_runfile_for_calibration(path, recalib=False):
     return result
 
 
-def ensure_r1r2(model_names, gpus, dry=False, cwd=None):
-    """Train R1/R2 for any model that needs it."""
+def ensure_r1r2(model_names, gpus, dry=False, cwd=None, log_dir=None, refresh=10):
+    """Train R1/R2 for any model that needs it.
+
+    Uses the shared parallel runner with a single-job batch so output is
+    redirected to a log file and the user sees the refreshing tail instead
+    of an interleaved stream.
+    """
+    if log_dir is None:
+        log_dir = DEFAULT_LOG_DIR
+    os.makedirs(log_dir, exist_ok=True)
+
     for model_name in model_names:
         if cfg.r1r2_exist(model_name):
             print(f"R1/R2 already exist for {model_name}. Skipping training.")
             continue
         model_full = cfg.resolve_model(model_name)
         r1r2_cmd = ['bash', 'calibrate_model.sh', '-m', model_full, '-g', str(gpus[0])]
+        label = f"cal_r1r2_{model_name}"
         print(f"R1/R2 not found for {model_name}. Training on GPU {gpus[0]} first...")
         if dry:
             print(f"  CUDA_VISIBLE_DEVICES={gpus[0]} {' '.join(r1r2_cmd)}")
-        else:
-            ret = run_job(r1r2_cmd, make_env(gpus[0]), f'R1/R2 train ({model_name})', cwd=cwd)
-            if ret != 0:
-                print(f"R1/R2 training failed for {model_name}. Aborting.")
-                sys.exit(1)
+            continue
+
+        log_path_for = lambda name: os.path.join(log_dir, f"{_sanitize_label(name)}.log")
+        failed = run_parallel_batches(
+            [(label, r1r2_cmd, make_env(gpus[0]))],
+            gpus=[gpus[0]],
+            refresh=refresh,
+            log_fn=log_path_for,
+            cwd=cwd,
+            fail_message_fn=calibration_fail_line,
+        )
+        if failed:
+            print(f"R1/R2 training failed for {model_name}. Aborting.")
+            sys.exit(1)
 
 
 def run_from_runfile(args, extra_args):
@@ -347,7 +348,7 @@ def run_from_runfile(args, extra_args):
             model_full = cfg.resolve_model(g['model_short'])
             dart_models.add(cfg.model_name_from_path(model_full))
     if dart_models:
-        ensure_r1r2(dart_models, gpus, dry=args.dry)
+        ensure_r1r2(dart_models, gpus, dry=args.dry, refresh=args.refresh)
 
     # Phase 2: Build calibration commands
     jobs = []
@@ -362,7 +363,7 @@ def run_from_runfile(args, extra_args):
         label_to_names[label] = list(g['names'])
 
     # Phase 3: Run in batches
-    results = run_batch(jobs, gpus, dry=args.dry)
+    results = run_batch(jobs, gpus, dry=args.dry, refresh=args.refresh)
 
     if args.dry:
         return
@@ -412,7 +413,7 @@ def main():
     modes = ['dart', 'quarot', 'baseline']
 
     # --- Phase 1: Train R1/R2 if needed ---
-    ensure_r1r2({model_name}, gpus, dry=args.dry)
+    ensure_r1r2({model_name}, gpus, dry=args.dry, refresh=args.refresh)
 
     # --- Phase 2: Run all three calibrations in parallel ---
     gptq_extra = ['--gptq'] if args.gptq else []
@@ -422,7 +423,7 @@ def main():
         jobs.append((mode, cmd))
 
     print()
-    results = run_batch(jobs, gpus, dry=args.dry)
+    results = run_batch(jobs, gpus, dry=args.dry, refresh=args.refresh)
 
     if args.dry:
         return

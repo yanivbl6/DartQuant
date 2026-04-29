@@ -461,7 +461,14 @@ Examples:
     parser.add_argument('--oproj_bits', type=int, default=None,
                         help='Override o_proj input activation bits (e.g. 16 for int16 decomposition)')
     parser.add_argument('--eq', action='store_true',
-                        help='Enable per-channel equalization on down_proj inputs')
+                        help='Enable per-channel equalization on down_proj inputs '
+                             '(legacy: online division at down_proj input)')
+    parser.add_argument('--ud_eq', action='store_true',
+                        help='Branch equalization (up + down): per-channel scale on '
+                             'up_proj output, folded into W_up rows and W_down cols.')
+    parser.add_argument('--ugd_eq', action='store_true',
+                        help='Branch equalization (up + gate + down): per-channel '
+                             'scales on silu(gate) and up_proj output. Requires --pwl_act.')
     parser.add_argument('--fp32_had', action='store_true')
     parser.add_argument('--rotate_mode', type=str, default='hadamard',
                         choices=['hadamard', 'random'])
@@ -789,8 +796,35 @@ def main():
             if qlayers[name].out_quantizer.maxq != 0:
                 qlayers[name].out_quantizer.realint = True
 
+    # --- Replace activations with PWL (before eq pre-pass / GPTQ) ---
+    # Moved earlier than the original placement so the eq pre-pass and GPTQ
+    # see the runtime activation function (PWL) and so apply_branch_eq_gate
+    # can use set_eq_factors_g on the PWL when --ugd_eq is active.  This
+    # eliminates the calibration/runtime distribution mismatch that hurt
+    # --ugd_eq.
+    if args.pwl_act:
+        import pwl_utils
+        act_name = getattr(model.config, 'hidden_act', 'silu')
+        hw_config = None if args.pwl_no_hw_sim else pwl_utils.HWConfig(
+            mantissa_bits=args.pwl_mantissa_bits,
+            exp_bits=args.pwl_exp_bits,
+            offset_bits=args.pwl_offset_bits)
+        replaced = pwl_utils.replace_activation_with_pwl(
+            model, act_name=act_name,
+            n_segments=args.pwl_n_segments,
+            hw_config=hw_config,
+            input_bits=args.pwl_input_bits,
+            output_bits=args.pwl_output_bits)
+        print(f"Replaced {len(replaced)} activations with PWL ({act_name}, {args.pwl_n_segments} segments)")
+        if getattr(args, 'realint', False):
+            for pwl_mod in pwl_utils.find_pwl_activations(model).values():
+                pwl_mod.input_quantizer.realint = True
+                pwl_mod.output_quantizer.realint = True
+
     # --- Equalization pre-pass (before GPTQ) ---
     eq_factors = None
+    branch_eq_factors = None
+    branch_eq_mode = None
     if getattr(args, 'eq', False):
         import equalization as eq_module
         print("Running equalization pre-pass to collect down_proj stats...")
@@ -805,6 +839,27 @@ def main():
         eq_module.apply_eq_to_weights(model, eq_factors)
         eq_module.setup_eq_online(model, eq_factors)
         print("Equalization applied to weights and online scaling")
+    elif getattr(args, 'ud_eq', False) or getattr(args, 'ugd_eq', False):
+        import equalization as eq_module
+        with_gate = getattr(args, 'ugd_eq', False)
+        branch_eq_mode = 'ugd_eq' if with_gate else 'ud_eq'
+        print(f"Running branch equalization pre-pass (mode={branch_eq_mode}, "
+              f"with_gate={with_gate})...")
+        eq_dataloader = data_utils.get_loaders(
+            args.calib_dataset, nsamples=args.nsamples,
+            seed=args.seed, model=args.model,
+            seqlen=model.seqlen, eval_mode=False)
+        branch_stats = eq_module.collect_eq_stats_branches(
+            model, eq_dataloader, args.nsamples, dev='cuda', with_gate=with_gate)
+        branch_eq_factors = eq_module.compute_eq_factors_branches(branch_stats)
+        print(f"Computed branch equalization factors for "
+              f"{len(branch_eq_factors)} layers")
+        # Apply BOTH weight-side and gate-side rescales here so GPTQ
+        # Hessian collection AND act_scales calibration see the same input
+        # distributions as runtime.  PWL (if --pwl_act) is already in place
+        # above, so set_eq_factors_g on the PWL works for --ugd_eq + --pwl_act.
+        eq_module.apply_branch_eq(model, branch_eq_factors)
+        print("Branch equalization fully applied (weights + gate-side)")
 
     # --- Weight quantization (GPTQ or AdaQuant) ---
     # Must happen before activation calibration so we measure activations
@@ -1017,25 +1072,9 @@ def main():
                 if hasattr(layer.self_attn, wrapper_attr):
                     getattr(layer.self_attn, wrapper_attr).k_quantizer.realint = True
 
-    # --- Replace activations with PWL (before calibration so scales reflect PWL) ---
-    if args.pwl_act:
-        import pwl_utils
-        act_name = getattr(model.config, 'hidden_act', 'silu')
-        hw_config = None if args.pwl_no_hw_sim else pwl_utils.HWConfig(
-            mantissa_bits=args.pwl_mantissa_bits,
-            exp_bits=args.pwl_exp_bits,
-            offset_bits=args.pwl_offset_bits)
-        replaced = pwl_utils.replace_activation_with_pwl(
-            model, act_name=act_name,
-            n_segments=args.pwl_n_segments,
-            hw_config=hw_config,
-            input_bits=args.pwl_input_bits,
-            output_bits=args.pwl_output_bits)
-        print(f"Replaced {len(replaced)} activations with PWL ({act_name}, {args.pwl_n_segments} segments)")
-        if getattr(args, 'realint', False):
-            for pwl_mod in pwl_utils.find_pwl_activations(model).values():
-                pwl_mod.input_quantizer.realint = True
-                pwl_mod.output_quantizer.realint = True
+    # (PWL replacement was moved earlier — before the eq pre-pass and GPTQ —
+    #  so cal sees the runtime act_fn and the eq gate-side rescale can ride
+    #  PWL per-channel n_q for --ugd_eq + --pwl_act.)
 
     # --- Configure output quantization (--quant_out) ---
     # Must happen AFTER GPTQ/checkpoint loading, which overwrites buffers via load_state_dict.
@@ -1122,6 +1161,16 @@ def main():
     if eq_factors is not None:
         act_scales['__eq_factors__'] = {k: v.cpu() for k, v in eq_factors.items()}
         print(f"Including equalization factors for {len(eq_factors)} layers")
+    if branch_eq_factors is not None:
+        act_scales['__branch_eq_factors__'] = {
+            'mode': branch_eq_mode,
+            'factors': {
+                i: {k: v.cpu() for k, v in entry.items()}
+                for i, entry in branch_eq_factors.items()
+            },
+        }
+        print(f"Including branch equalization factors (mode={branch_eq_mode}) "
+              f"for {len(branch_eq_factors)} layers")
 
     # --- Save ---
     save_dir = os.path.dirname(args.save_path)

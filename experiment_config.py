@@ -144,7 +144,18 @@ def add_quant_args(parser):
     parser.add_argument('--oproj_bits', type=int, default=None,
                         help='Override o_proj input activation bits (e.g. 16 for int16 decomposition)')
     parser.add_argument('--eq', action='store_true',
-                        help='Enable per-channel equalization on down_proj inputs')
+                        help='Enable per-channel equalization on down_proj inputs '
+                             '(legacy: online division at down_proj input)')
+    parser.add_argument('--ud_eq', action='store_true',
+                        help='Branch equalization (up + down): per-channel scale on '
+                             'up_proj output, folded into W_up rows and W_down cols. '
+                             'Mutually exclusive with --eq and --ugd_eq.')
+    parser.add_argument('--ugd_eq', action='store_true',
+                        help='Branch equalization (up + gate + down): independent '
+                             'per-channel scales on silu(gate) and up_proj output. '
+                             'PWL path uses per-channel s_out; non-PWL path wraps '
+                             'silu with an in-fp EqActivation. '
+                             'Mutually exclusive with --eq and --ud_eq.')
 
     # PWL activation
     parser.add_argument('--pwl_act', action='store_true',
@@ -296,6 +307,10 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
         tag += f"_oproj{args.oproj_bits}"
     if getattr(args, 'eq', False):
         tag += "_eq"
+    if getattr(args, 'ud_eq', False):
+        tag += "_udeq"
+    if getattr(args, 'ugd_eq', False):
+        tag += "_ugdeq"
     # PWL activation tag
     if getattr(args, 'pwl_act', False):
         parts = ["_pwl"]
@@ -459,6 +474,10 @@ def build_quant_args(args):
         cmd += ['--oproj_bits', str(args.oproj_bits)]
     if getattr(args, 'eq', False):
         cmd.append('--eq')
+    if getattr(args, 'ud_eq', False):
+        cmd.append('--ud_eq')
+    if getattr(args, 'ugd_eq', False):
+        cmd.append('--ugd_eq')
     if args.pwl_act:
         cmd += ['--pwl_act',
                 '--pwl_n_segments', str(args.pwl_n_segments),

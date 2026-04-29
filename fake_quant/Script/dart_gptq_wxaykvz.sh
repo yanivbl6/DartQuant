@@ -43,6 +43,8 @@ Options:
   --no_r4          Disable R4 rotation on down_proj            (default: off)
   --down_bits N    Override down_proj input activation bits     (default: a_bits)
   --eq             Enable per-channel equalization on down_proj (default: off)
+  --ud_eq          Branch eq (up + down) — fold u[c] into W_up rows, W_down cols
+  --ugd_eq         Branch eq (up + gate + down) — adds gate-side rescale
   --static-act     Use pre-calibrated static activation scales
   --pwl_act            Replace activations with PWL approximation
   --pwl_n_segments N   Number of PWL segments                     (default: 9)
@@ -124,6 +126,8 @@ NO_R4=0
 DOWN_BITS=""
 OPROJ_BITS=""
 EQ=0
+UD_EQ=0
+UGD_EQ=0
 PWL_ACT=0
 PWL_N_SEGMENTS=9
 PWL_INPUT_BITS=16
@@ -180,6 +184,8 @@ while [[ $# -gt 0 ]]; do
         --down_bits) DOWN_BITS="$2"; shift 2 ;;
         --oproj_bits) OPROJ_BITS="$2"; shift 2 ;;
         --eq)     EQ=1;        shift   ;;
+        --ud_eq)  UD_EQ=1;     shift   ;;
+        --ugd_eq) UGD_EQ=1;    shift   ;;
         --pwl_act) PWL_ACT=1;    shift   ;;
         --pwl_n_segments) PWL_N_SEGMENTS="$2"; shift 2 ;;
         --pwl_input_bits) PWL_INPUT_BITS="$2"; shift 2 ;;
@@ -474,6 +480,8 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ "$PROJ_EX" == "0" ] && [ -n "$DOWN_BITS" ] && TAG_ARGS="${TAG_ARGS} --down_bits ${DOWN_BITS}"
 [ -n "$OPROJ_BITS" ] && TAG_ARGS="${TAG_ARGS} --oproj_bits ${OPROJ_BITS}"
 [ "$EQ" == "1" ] && TAG_ARGS="${TAG_ARGS} --eq"
+[ "$UD_EQ" == "1" ] && TAG_ARGS="${TAG_ARGS} --ud_eq"
+[ "$UGD_EQ" == "1" ] && TAG_ARGS="${TAG_ARGS} --ugd_eq"
 [ -n "$PWL_ACT_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${PWL_ACT_FLAG}"
 [ -n "$INT_GEMM_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${INT_GEMM_FLAG}"
 [ -n "$SMQ_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${SMQ_FLAG}"
@@ -644,6 +652,8 @@ python main_for_test.py \
     $([ -n "$DOWN_BITS" ] && echo "--down_bits ${DOWN_BITS}") \
     $([ -n "$OPROJ_BITS" ] && echo "--oproj_bits ${OPROJ_BITS}") \
     $([ "$EQ" == "1" ] && echo "--eq") \
+    $([ "$UD_EQ" == "1" ] && echo "--ud_eq") \
+    $([ "$UGD_EQ" == "1" ] && echo "--ugd_eq") \
     --percdamp 0.1 \
     --no-w_ft \
     --ft_percdamp 0.0 \

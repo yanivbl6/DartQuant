@@ -176,18 +176,35 @@ def _quantize_slopes_mantissa_exp(slopes: torch.Tensor,
 
 
 def _quantize_offsets_fixed(offsets: torch.Tensor,
-                            offset_bits: int) -> torch.Tensor:
+                            offset_bits: int,
+                            per_channel: bool = False) -> torch.Tensor:
     """Simulate fixed-point quantization of PWL offsets.
 
     Offsets are quantized to *offset_bits* signed fixed-point
     relative to the maximum absolute offset value.
+
+    Args:
+        offsets: 1-D [n_segments] (default) or 2-D [C, n_segments]
+            (per-channel mode).
+        offset_bits: bit-width of the fixed-point representation.
+        per_channel: if True, normalize independently along the last
+            (segment) dim per channel — i.e. each channel uses its own
+            abs_max, matching the HW where each channel has its own
+            n_q encoding.
     """
+    max_int = 2 ** (offset_bits - 1) - 1
+
+    if per_channel:
+        # offsets: [C, n_segments] — each channel has its own abs_max
+        abs_max = offsets.abs().amax(dim=-1, keepdim=True)
+        scale = torch.where(abs_max > 0, abs_max / max_int, torch.ones_like(abs_max))
+        return torch.round(offsets / scale) * scale
+
     abs_max = offsets.abs().max()
     if abs_max == 0:
         return offsets
 
     # Scale so that abs_max maps to 2^(offset_bits-1) - 1
-    max_int = 2 ** (offset_bits - 1) - 1
     scale = abs_max / max_int
     quantized = torch.round(offsets / scale) * scale
     return quantized
@@ -239,6 +256,17 @@ class PWLActivation(nn.Module):
         if hw_config is not None:
             self.simulate_hw_precision()
 
+        # Per-channel equalization factors for --ugd_eq.  When None, the
+        # forward path is unchanged.  When set to a [C] tensor of factors in
+        # (0, 1], the dequantized output is silu(x) / eq_factors_g[c] — i.e.
+        # the gate branch carries an equalization scale that the new HW's
+        # per-channel n_q feature absorbs.
+        self.register_buffer('eq_factors_g', None)
+        # Per-channel HW-quantized slopes/offsets, shape [C, n_segments].
+        # Built by _build_per_channel_coefs() when eq_factors_g is set.
+        self.register_buffer('slopes_pc', None)
+        self.register_buffer('offsets_pc', None)
+
         # Input / output quantizers (reuse existing ActQuantizer)
         self.input_quantizer = quant_utils.ActQuantizer()
         self.output_quantizer = quant_utils.ActQuantizer()
@@ -256,6 +284,47 @@ class PWLActivation(nn.Module):
             self.slopes, self.hw_config.mantissa_bits, self.hw_config.exp_bits)
         self.offsets_hw = _quantize_offsets_fixed(
             self.offsets, self.hw_config.offset_bits)
+
+    def set_eq_factors_g(self, factors: torch.Tensor):
+        """Enable per-channel output scale (gate-side equalization).
+
+        For each channel c with factor f[c] in (0, 1], dequantized output
+        becomes silu(x) / f[c].  The new HW absorbs this via per-channel
+        m_q[c, seg] and n_q[c, seg]; we simulate that here in fp by simply
+        dividing the float PWL output by f[c] per channel.  When --pwl_act
+        runs at output_bits=16 (current default) this is bit-equivalent to
+        a per-channel scale on a pass-through quantizer; at lower output
+        bits the per-channel scale would also affect rounding, but that
+        path isn't exercised in current configs and isn't the focus of
+        this feature.
+
+        For HW-precision simulation, also build per-channel slopes/offsets
+        with hw quantization applied per element.
+        """
+        f = factors.detach().to(torch.float32)
+        assert f.dim() == 1, f"eq_factors_g must be 1-D [C], got {tuple(f.shape)}"
+        assert torch.all(f > 0), "eq_factors_g must be strictly positive"
+        self.eq_factors_g = f
+
+        # Build per-channel float slopes/offsets: shape [C, n_segments].
+        # In the HW: m_q[c, seg] = (s_in / s_out[c]) * m[seg], where
+        # s_out[c] = s_out_base * f[c].  In our fp simulation we equivalently
+        # produce y_real[c, k] = (m * x + n) / f[c] = m/f[c] * x + n/f[c].
+        slopes_pc = self.slopes.float().unsqueeze(0) / f.unsqueeze(1)   # [C, N]
+        offsets_pc = self.offsets.float().unsqueeze(0) / f.unsqueeze(1) # [C, N]
+
+        if self.hw_config is not None:
+            slopes_pc = _quantize_slopes_mantissa_exp(
+                slopes_pc,
+                self.hw_config.mantissa_bits,
+                self.hw_config.exp_bits)
+            offsets_pc = _quantize_offsets_fixed(
+                offsets_pc,
+                self.hw_config.offset_bits,
+                per_channel=True)
+
+        self.slopes_pc = slopes_pc
+        self.offsets_pc = offsets_pc
 
     def make_learnable(self):
         """Convert slopes/offsets to nn.Parameters for future GPTQ optimisation."""
@@ -278,13 +347,30 @@ class PWLActivation(nn.Module):
         # index into thresholds, which is exactly the segment index.
         seg_idx = torch.searchsorted(self.thresholds, x_f)
 
-        # Choose float or HW-quantized coefficients
-        slopes = self.slopes_hw if self.slopes_hw is not None else self.slopes
-        offsets = self.offsets_hw if self.offsets_hw is not None else self.offsets
+        if self.eq_factors_g is None:
+            # Default path — unchanged.
+            slopes = self.slopes_hw if self.slopes_hw is not None else self.slopes
+            offsets = self.offsets_hw if self.offsets_hw is not None else self.offsets
 
-        s = slopes[seg_idx]
-        o = offsets[seg_idx]
-        y = s * x_f + o
+            s = slopes[seg_idx]
+            o = offsets[seg_idx]
+            y = s * x_f + o
+        else:
+            # Per-channel (gate-side equalization) path.  slopes_pc/offsets_pc
+            # have shape [C, N_seg]; gather per (channel, seg_idx) using
+            # advanced indexing.  seg_idx shape is the same as x (typically
+            # [..., C]); the last dim is the channel, which selects the row
+            # of slopes_pc.
+            slopes_pc = self.slopes_pc
+            offsets_pc = self.offsets_pc
+            C = slopes_pc.shape[0]
+            assert x_f.shape[-1] == C, (
+                f"PWL eq_factors_g expects last dim = {C}, got {x_f.shape[-1]}")
+            # Channel index broadcast to seg_idx shape: [..., C]
+            ch_idx = torch.arange(C, device=x_f.device).expand_as(seg_idx)
+            s = slopes_pc[ch_idx, seg_idx]
+            o = offsets_pc[ch_idx, seg_idx]
+            y = s * x_f + o
 
         y = y.to(x_dtype)
 
@@ -303,6 +389,9 @@ class PWLActivation(nn.Module):
             parts.append(f'in_bits={self.input_quantizer.bits}')
         if self.output_quantizer.bits < 16 or self.output_quantizer.realint:
             parts.append(f'out_bits={self.output_quantizer.bits}')
+        if self.eq_factors_g is not None:
+            f = self.eq_factors_g
+            parts.append(f'eq_g=[{f.min().item():.3f},{f.max().item():.3f}]')
         return ', '.join(parts)
 
 

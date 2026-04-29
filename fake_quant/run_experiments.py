@@ -27,9 +27,7 @@ Runfile mode — run diverse experiments from an external file:
 
 import argparse
 import os
-import re
 import shlex
-import shutil
 import subprocess
 import sys
 import time
@@ -37,67 +35,10 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import experiment_config as cfg
 import runfile_flags as rf
+from parallel_runner import run_parallel_batches
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(SCRIPT_DIR, '..', 'data', 'cached_results')
-
-
-def _read_last_line(path):
-    """Read the last non-empty line from a log file (handles \\r from tqdm)."""
-    try:
-        with open(path, 'rb') as f:
-            f.seek(0, 2)  # end
-            size = f.tell()
-            if size == 0:
-                return ""
-            f.seek(max(0, size - 4096))
-            tail = f.read().decode('utf-8', errors='replace')
-        # tqdm uses \r for in-place updates; split on both \r and \n
-        lines = re.split(r'[\r\n]', tail)
-        for line in reversed(lines):
-            stripped = line.strip()
-            if stripped:
-                return stripped
-    except (OSError, ValueError):
-        pass
-    return ""
-
-
-def _print_status(procs, first_call=False):
-    """Print or refresh the status block for all experiments."""
-    term_width = shutil.get_terminal_size((120, 24)).columns
-    n = len(procs)
-    if not first_call:
-        # Move cursor up to overwrite previous status block
-        sys.stdout.write(f"\033[{n}A")
-
-    for name, proc, log_path in procs:
-        rc = proc.poll()
-        if rc is None:
-            tail = _read_last_line(log_path)
-            if tail:
-                prefix = f"  [running] {name}: "
-                max_tail = term_width - len(prefix)
-                if len(tail) > max_tail:
-                    tail = "..." + tail[-(max_tail - 3):]
-                line = prefix + tail
-            else:
-                line = f"  [running] {name}: starting..."
-        elif rc == 0:
-            tail = _read_last_line(log_path)
-            if tail:
-                prefix = f"  [done]    {name}: "
-                max_tail = term_width - len(prefix)
-                if len(tail) > max_tail:
-                    tail = "..." + tail[-(max_tail - 3):]
-                line = prefix + tail
-            else:
-                line = f"  [done]    {name}"
-        else:
-            line = f"  [FAIL]    {name} (exit code {rc})"
-        # Clear rest of line in case previous line was longer
-        sys.stdout.write(f"\033[K{line}\n")
-    sys.stdout.flush()
 
 
 def parse_args():
@@ -188,15 +129,29 @@ def build_experiment_cmd(mode, gpu, quant_args, extra_flags, args, use_wait=Fals
     return cmd
 
 
-def run_calibration(model, gpu_id):
-    """Run R1/R2 calibration via calibrate_model.sh."""
+def run_calibration(model, gpu_id, refresh=10):
+    """Run R1/R2 calibration via calibrate_model.sh through the shared runner."""
+    from parallel_runner import calibration_fail_line
+
     script = os.path.join(SCRIPT_DIR, '..', 'calibrater', 'calibrate_model.sh')
     model_full = cfg.resolve_model(model)
+    model_name = cfg.model_name_from_path(model_full)
     cmd = ['bash', script, '-m', model_full, '-g', str(gpu_id)]
+    label = f"cal_r1r2_{model_name}"
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    log_path = os.path.join(RESULTS_DIR, f'{label}.log')
     print(f"=== Running calibration: {' '.join(cmd)} ===")
-    ret = subprocess.run(cmd)
-    if ret.returncode != 0:
-        print("Calibration failed!")
+    print(f"  log: {log_path}")
+
+    failed = run_parallel_batches(
+        [(label, cmd)],
+        gpus=[gpu_id],
+        refresh=refresh,
+        log_fn=lambda name: os.path.join(RESULTS_DIR, f'{name}.log'),
+        fail_message_fn=calibration_fail_line,
+    )
+    if failed:
         sys.exit(1)
     print()
 
@@ -243,7 +198,8 @@ def run_calibration_for_runfile(args):
             model_full = cfg.resolve_model(g['model_short'])
             dart_models.add(cfg.model_name_from_path(model_full))
     if dart_models:
-        ensure_r1r2(dart_models, gpus, dry=args.dry, cwd=CALIBRATER_DIR)
+        ensure_r1r2(dart_models, gpus, dry=args.dry, cwd=CALIBRATER_DIR,
+                    log_dir=RESULTS_DIR, refresh=args.refresh)
 
     # Build calibration commands; remember which runfile names each label covers.
     jobs = []
@@ -257,7 +213,8 @@ def run_calibration_for_runfile(args):
         jobs.append((label, cmd))
         label_to_names[label] = list(g['names'])
 
-    results = run_batch(jobs, gpus, dry=args.dry, cwd=CALIBRATER_DIR)
+    results = run_batch(jobs, gpus, dry=args.dry, cwd=CALIBRATER_DIR,
+                        log_dir=RESULTS_DIR, refresh=args.refresh)
 
     if args.dry:
         return
@@ -280,71 +237,6 @@ def run_calibration_for_runfile(args):
 
 # ── Runfile helpers ──────────────────────────────────────────────────────
 # Flag parsing/writing lives in runfile_flags.py (shared with multi_calibration).
-
-
-def _run_parallel_batches(active_cmds, gpus, refresh, log_fn, on_complete=None):
-    """Run a list of (name, cmd) jobs in batches of len(gpus).
-
-    Each batch runs in parallel, waits for all to finish, then starts the next.
-
-    Args:
-        active_cmds: list of (name, cmd) — the non-skipped runs to execute.
-        gpus: list of GPU IDs (determines batch size).
-        refresh: status refresh interval in seconds.
-        log_fn: callable(name) -> log file path.
-        on_complete: optional callable(name, returncode) called when each run finishes.
-
-    Returns total number of failures.
-    """
-    n_gpus = len(gpus)
-    n_batches = (len(active_cmds) + n_gpus - 1) // n_gpus
-    total_failed = 0
-
-    for batch_idx in range(n_batches):
-        batch = active_cmds[batch_idx * n_gpus : (batch_idx + 1) * n_gpus]
-
-        if n_batches > 1:
-            print(f"\n=== Batch {batch_idx + 1}/{n_batches}: "
-                  f"{len(batch)} runs (refreshing every {refresh}s) ===\n")
-        else:
-            print(f"\n=== Waiting for {len(batch)} runs (refreshing every {refresh}s) ===\n")
-
-        procs = []
-        log_files = []
-        for name, cmd in batch:
-            log_path = log_fn(name)
-            log_f = open(log_path, 'w')
-            proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
-            procs.append((name, proc, log_path))
-            log_files.append(log_f)
-
-        _print_status(procs, first_call=True)
-
-        completed = set()
-
-        while any(proc.poll() is None for _, proc, _ in procs):
-            time.sleep(refresh)
-            _print_status(procs)
-            if on_complete:
-                for name, proc, _ in procs:
-                    if name not in completed and proc.poll() is not None:
-                        on_complete(name, proc.returncode)
-                        completed.add(name)
-
-        _print_status(procs)
-
-        # Notify any remaining
-        if on_complete:
-            for name, proc, _ in procs:
-                if name not in completed:
-                    on_complete(name, proc.returncode)
-
-        for lf in log_files:
-            lf.close()
-
-        total_failed += sum(1 for _, proc, _ in procs if proc.returncode != 0)
-
-    return total_failed
 
 
 def run_from_file(args):
@@ -386,10 +278,10 @@ def run_from_file(args):
         for name in cal_error_skipped:
             print(f"  - {name}")
 
-    if done_skipped:
-        print(f"\nSkipping {len(done_skipped)} already-completed line(s):")
-        for flag, name in done_skipped:
-            print(f"  - [{flag}] {name}")
+    # if done_skipped:
+    #     print(f"\nSkipping {len(done_skipped)} already-completed line(s):")
+    #     for flag, name in done_skipped:
+    #         print(f"  - [{flag}] {name}")
 
     if not inference_entries:
         print("\nNo inference runs to execute.")
@@ -450,7 +342,7 @@ def run_from_file(args):
         new_flag = rf.inference_completion_flag(fast_mode) if rc == 0 else rf.FLAG_ERROR
         rf.mark_runfile(runfile, name, new_flag)
 
-    total_failed = _run_parallel_batches(
+    total_failed = run_parallel_batches(
         active_all, gpus, args.refresh,
         log_fn=lambda name: os.path.join(RESULTS_DIR, f'{name}.log'),
         on_complete=on_complete,
@@ -498,7 +390,7 @@ def main():
             model_full = cfg.resolve_model(args.model)
             print(f"bash {script} -m {model_full} -g {cal_gpu}")
         else:
-            run_calibration(args.model, cal_gpu)
+            run_calibration(args.model, cal_gpu, refresh=args.refresh)
 
     # Parse skip set (1-indexed)
     skip_set = set()
@@ -567,7 +459,7 @@ def main():
                 time.sleep(args.refresh)
                 wait_for_gpu(max_used_mb=args.max_used_mb, poll_interval=30)
     else:
-        failed = _run_parallel_batches(
+        failed = run_parallel_batches(
             active_cmds, gpus, args.refresh,
             log_fn=lambda name: os.path.join(RESULTS_DIR, f'{name}_results.log'),
         )

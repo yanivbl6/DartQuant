@@ -166,6 +166,24 @@ def main():
                 pwl_mod.input_quantizer.realint = True
                 pwl_mod.output_quantizer.realint = True
 
+    # --- Branch equalization (--ud_eq / --ugd_eq) ---
+    # Must run AFTER PWL replacement because --ugd_eq attaches eq_factors_g
+    # to layer.mlp.act_fn (the PWLActivation).
+    if (getattr(args, 'ud_eq', False) or getattr(args, 'ugd_eq', False)) and args.act_scales_path:
+        import equalization as eq_module
+        _beq_data = torch.load(args.act_scales_path, map_location='cpu',
+                               weights_only=True)
+        if '__branch_eq_factors__' in _beq_data:
+            _beq_blob = _beq_data['__branch_eq_factors__']
+            _beq_mode = _beq_blob.get('mode', 'unknown')
+            _beq_factors = _beq_blob['factors']
+            logging.info("Applying branch eq factors (mode=%s) for %d layers",
+                         _beq_mode, len(_beq_factors))
+            eq_module.apply_branch_eq(model, _beq_factors)
+        else:
+            logging.warning("--ud_eq/--ugd_eq enabled but no branch eq factors found in %s",
+                            args.act_scales_path)
+
     _has_w_bits_map = bool(getattr(args, 'w_bits_map', None))
     if args.w_bits < 16 or _has_w_bits_map:
         logging.info("Add weight quantization: w_rtn = {}, w_bits = {}, w_groupsize = {}, w_sym = {}, w_clip = {}, w_bits_map = {}".format(
@@ -916,24 +934,43 @@ def main():
             if not getattr(qlayer, 'use_int_gemm', False):
                 continue
             q = qlayer.quantizer
-            # Require per-group activation scales at T1 (static, groupsize > 0).
-            if not q.static or q.groupsize <= 0:
+            if not q.static:
                 continue
-            # Require per-group weight scales at T1 with matching geometry.
+            # Require per-group weight scales (the format the kernel snaps).
             if (qlayer.w_scale is None or qlayer.w_scale.dim() != 2
-                    or qlayer.w_group_size <= 0
-                    or qlayer.w_group_size != q.groupsize):
+                    or qlayer.w_group_size <= 0):
+                continue
+            # Activation can be per-group (must match w_group_size) or per-tensor
+            # (scalar). Per-tensor case still needs MxSy weight-scale snapping.
+            per_group_act = q.groupsize > 0
+            if per_group_act and q.groupsize != qlayer.w_group_size:
                 continue
             dev = qlayer.w_scale.device
-            a_gscale = q.scale.to(dev)                      # [n_groups]
+            if per_group_act:
+                a_gscale = q.scale.to(dev)                  # [n_groups]
+            else:
+                # Per-tensor: a_scale is a scalar (or [1]). Treat as broadcast.
+                a_gscale = q.scale.to(dev).reshape(-1)
+                if a_gscale.numel() != 1:
+                    # Per-channel a_scale doesn't compose with per-group w_scale
+                    # into a single MxSy stored tensor — skip.
+                    continue
             # Undo gscaler prescaling (if any) — hwscale replaces that mechanism.
             w_shift = getattr(qlayer, 'w_shift_bias', 0)
             w_gscale = qlayer.w_scale
             if w_shift > 0:
                 w_gscale = w_gscale * (2.0 ** (-w_shift))
             # Merge and snap to MxSy (+ per-layer FP32 global).
-            raw_merged = a_gscale.unsqueeze(0) * w_gscale   # [N, n_groups]
-            stored, global_scalar = quant_utils.snap_to_hwscale(raw_merged, _hwscale_spec)
+            if per_group_act:
+                raw_merged = a_gscale.unsqueeze(0) * w_gscale   # [N, n_groups]
+            else:
+                raw_merged = a_gscale.item() * w_gscale         # [N, n_groups]
+            # Snap on GPU — model isn't distributed yet so weights are on CPU,
+            # and the bopt search is ~500x slower on CPU than GPU.
+            snap_dev = torch.device('cuda') if torch.cuda.is_available() else dev
+            stored, global_scalar = quant_utils.snap_to_hwscale(
+                raw_merged.to(snap_dev), _hwscale_spec)
+            stored = stored.to(dev)
             # Per-layer diagnostic for auto-bias modes
             _mode = _hwscale_spec.get('bias_auto')
             if _mode:
@@ -948,11 +985,14 @@ def main():
                              _mode, name, z_chosen, global_scalar,
                              _min_nz, _median, _max_val)
             # Stuff the MxSy-snapped merged value into w_scale, compensating
-            # for the a_gscale multiplication the kernel still applies.
-            # Kernel T1: partial * a_gscale * w_scale = partial * (a*w)_snapped.
+            # for the a_scale multiplication the kernel still applies.
+            # Kernel: partial * a_scale * w_scale = partial * (a*w)_snapped.
             # q.scale is KEPT intact — quantize_to_int uses it to scale
             # activations to int8 before the matmul.
-            qlayer.w_scale = (stored / a_gscale.unsqueeze(0)).contiguous()
+            if per_group_act:
+                qlayer.w_scale = (stored / a_gscale.unsqueeze(0)).contiguous()
+            else:
+                qlayer.w_scale = (stored / a_gscale.item()).contiguous()
             qlayer.hwscale_global = float(global_scalar)
             qlayer.w_shift_bias = 0  # hwscale replaces gscaler exponent-bias
             last_global = float(global_scalar)

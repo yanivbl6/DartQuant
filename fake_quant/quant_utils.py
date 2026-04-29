@@ -11,7 +11,7 @@ import fast_hadamard_transform
 
 # Regex accepts either an integer bias (b/l<N>) or the literals 'min' / 'mid'
 # for hwscale's per-layer auto-bias modes.
-_GSCALER_RE = re.compile(r'^M(\d+)[SE](\d+)(?:([bl])(\d+|min|mid))?$')
+_GSCALER_RE = re.compile(r'^M(\d+)[SE](\d+)(?:([bl])?(\d+|min|mid|opt|best))?$')
 
 
 def parse_gscaler(spec):
@@ -23,6 +23,11 @@ def parse_gscaler(spec):
         'M6S4l2'   -> {mantissa_bits: 6, shift_bits: 4, bias: -2}
         'M4S3bmin' -> {... bias_auto: 'min'}  (per-layer, anchor at min_nonzero)
         'M4S3bmid' -> {... bias_auto: 'mid'}  (per-layer, anchor at median_abs)
+        'M6S3bopt' -> {... bias_auto: 'opt'}  (per-layer, MSE-optimal global
+                                                via brute-force search)
+        'M4S4best' -> {... bias_auto: 'best'} (per-layer, MSE-optimal global
+                                                including a fractional mantissa
+                                                — non-power-of-2 globals)
 
     Returns None if spec is None.
     Raises ValueError on invalid format.
@@ -33,12 +38,13 @@ def parse_gscaler(spec):
     if not m:
         raise ValueError(
             f"Invalid --gscaler / --hwscale format: '{spec}'. "
-            f"Expected e.g. M5S3, M6E4b2, M6S4l2, M4S3bmin, M4S3bmid.")
+            f"Expected e.g. M5S3, M6E4b2, M6S4l2, M4S3bmin, M4S3bmid, "
+            f"M6S3bopt, M4S4best.")
     mantissa_bits = int(m.group(1))
     shift_bits = int(m.group(2))
     bias_dir = m.group(3)  # 'b', 'l', or None
     bias_raw = m.group(4)
-    bias_auto = bias_raw if bias_raw in ('min', 'mid') else None
+    bias_auto = bias_raw if bias_raw in ('min', 'mid', 'opt', 'best') else None
     if bias_auto is not None:
         bias_val = None  # computed per-layer at merge time
     else:
@@ -104,6 +110,14 @@ def hwscale_global_from_spec(spec, raw_scale=None):
                                        z = -g.  Floor rounds toward "downward"
                                        side of the asymmetric grid to reduce
                                        clipping on that side.
+    MxSybopt (auto, MSE-optimal)    -> brute-force search z in [z_mid-4, z_mid+4]
+                                       picking the global with min squared
+                                       snap error on raw_scale.  z_mid is the
+                                       same starting point as the 'mid' branch.
+    MxSybest (auto, MSE-optimal,    -> like 'opt' but searches non-power-of-2
+              non-power-of-2)         globals: global = m_frac * 2^(-z), with
+                                       m_frac in {1, 17/16, ..., 31/16}.
+                                       Returns FP32 scalar (may not be 2^-k).
     """
     if spec is None:
         return 1.0
@@ -139,6 +153,90 @@ def hwscale_global_from_spec(spec, raw_scale=None):
                 half_shift = (1 << (S - 1)) if S >= 1 else 0
                 g = median_log - 1 + half_shift
                 z = -g
+        elif mode == 'opt':
+            # MSE-optimal: search z over [z_mid-R, z_mid+R], snap, pick min MSE.
+            # Vectorized across the 9 candidate z values: build [n_z, N] tensor
+            # and run snap once.
+            abs_nz = raw_scale.abs()
+            abs_nz = abs_nz[abs_nz > 0]
+            if abs_nz.numel() == 0:
+                z = 0
+            else:
+                # Subsample for speed: 200k matches full-tensor optimum in tests.
+                _MAX = 200_000
+                if abs_nz.numel() > _MAX:
+                    gen = torch.Generator(device='cpu').manual_seed(0)
+                    idx = torch.randperm(abs_nz.numel(), generator=gen)[:_MAX]
+                    abs_nz_sub = abs_nz[idx.to(abs_nz.device)]
+                else:
+                    abs_nz_sub = abs_nz
+                # Center of search: same as 'mid' branch.
+                median_abs = abs_nz_sub.median().item()
+                median_log = int(math.floor(math.log2(median_abs)))
+                S = spec['shift_bits']
+                half_shift = (1 << (S - 1)) if S >= 1 else 0
+                z_mid = -(median_log - 1 + half_shift)
+                # bias=0 spec for the inner snap (global is what we're searching).
+                bias0_spec = {
+                    'mantissa_bits': spec['mantissa_bits'],
+                    'shift_bits': spec['shift_bits'],
+                    'bias': 0,
+                    'spec': spec['spec'],
+                }
+                R = 4
+                z_candidates = torch.arange(
+                    z_mid - R, z_mid + R + 1, device=abs_nz_sub.device, dtype=torch.float32)
+                g_try = torch.pow(2.0, -z_candidates)              # [n_z]
+                scaled = abs_nz_sub.unsqueeze(0) / g_try.unsqueeze(1)  # [n_z, N]
+                snapped = snap_scale_to_gscaler(scaled, bias0_spec)   # [n_z, N]
+                recovered = snapped * g_try.unsqueeze(1)              # [n_z, N]
+                mse = ((recovered - abs_nz_sub.unsqueeze(0)) ** 2).sum(dim=1)  # [n_z]
+                z = int(z_candidates[int(mse.argmin().item())].item())
+        elif mode == 'best':
+            # MSE-optimal across non-power-of-2 globals: search both z and a
+            # 4-bit fractional mantissa. global = m_frac * 2^(-z), m_frac in
+            # [1, 2). Vectorized across all 9*16=144 candidates in one snap.
+            abs_nz = raw_scale.abs()
+            abs_nz = abs_nz[abs_nz > 0]
+            if abs_nz.numel() == 0:
+                global_scalar = 1.0
+            else:
+                _MAX = 100_000
+                if abs_nz.numel() > _MAX:
+                    gen = torch.Generator(device='cpu').manual_seed(0)
+                    idx = torch.randperm(abs_nz.numel(), generator=gen)[:_MAX]
+                    abs_nz_sub = abs_nz[idx.to(abs_nz.device)]
+                else:
+                    abs_nz_sub = abs_nz
+                median_abs = abs_nz_sub.median().item()
+                median_log = int(math.floor(math.log2(median_abs)))
+                S = spec['shift_bits']
+                half_shift = (1 << (S - 1)) if S >= 1 else 0
+                z_mid = -(median_log - 1 + half_shift)
+                bias0_spec = {
+                    'mantissa_bits': spec['mantissa_bits'],
+                    'shift_bits': spec['shift_bits'],
+                    'bias': 0,
+                    'spec': spec['spec'],
+                }
+                R = 4
+                F_BITS = 4  # 16 fractional-mantissa values, matches fp8
+                F = 1 << F_BITS
+                dev = abs_nz_sub.device
+                z_grid = torch.arange(
+                    z_mid - R, z_mid + R + 1, device=dev, dtype=torch.float32)
+                # frac_grid in [1, 2), uniformly spaced
+                frac_grid = 1.0 + torch.arange(F, device=dev, dtype=torch.float32) / F
+                global_grid = (frac_grid.unsqueeze(0) * torch.pow(2.0, -z_grid).unsqueeze(1)
+                              ).flatten()                         # [n_cand]
+                scaled = abs_nz_sub.unsqueeze(0) / global_grid.unsqueeze(1)  # [n_cand, N]
+                snapped = snap_scale_to_gscaler(scaled, bias0_spec)          # [n_cand, N]
+                recovered = snapped * global_grid.unsqueeze(1)               # [n_cand, N]
+                mse = ((recovered - abs_nz_sub.unsqueeze(0)) ** 2).sum(dim=1)  # [n_cand]
+                global_scalar = float(global_grid[int(mse.argmin().item())].item())
+            if spec.get('bias_dir') == 'l':
+                global_scalar = 1.0 / global_scalar
+            return global_scalar
         else:
             raise ValueError(f"Unknown hwscale auto-bias mode: '{mode}'")
         if spec.get('bias_dir') == 'l':

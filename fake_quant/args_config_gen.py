@@ -49,7 +49,19 @@ def parser_gen():
     parser.add_argument('--oproj_bits', type=int, default=None,
                         help='Override o_proj input activation bits (e.g. 16 for int16 decomposition)')
     parser.add_argument('--eq', action='store_true',
-                        help='Enable per-channel equalization on down_proj inputs')
+                        help='Enable per-channel equalization on down_proj inputs '
+                             '(legacy: online division at down_proj input)')
+    parser.add_argument('--ud_eq', action='store_true',
+                        help='Branch equalization (up + down): per-channel scale on '
+                             'up_proj output, folded into W_up rows and W_down cols. '
+                             'Mutually exclusive with --eq and --ugd_eq.')
+    parser.add_argument('--ugd_eq', action='store_true',
+                        help='Branch equalization (up + gate + down): independent '
+                             'per-channel scales on silu(gate) and up_proj output. '
+                             'With --pwl_act the gate factor rides PWL per-channel '
+                             's_out (HW-accurate); without --pwl_act it is applied '
+                             'via an in-fp EqActivation wrapper (fake-quant). '
+                             'Mutually exclusive with --eq and --ud_eq.')
     parser.add_argument('--quant_out', type=str, default='none',
                         choices=['none', 'up', 'mlp', 'spec', 'speco', 'all', 'r4', 'res', 'mm', 'ex'],
                         help='Output quantization: none, up, mlp, spec, speco, all, r4, res (residuals), mm (Q in attn), ex (all+res+mm)')
@@ -329,6 +341,17 @@ def parser_gen():
                         help='Percent of the average Hessian diagonal to use for dampening.')
 
     args = parser.parse_args()
+
+    # Mutual exclusion: at most one of {--eq, --ud_eq, --ugd_eq}
+    _eq_modes = [name for name in ('eq', 'ud_eq', 'ugd_eq')
+                 if getattr(args, name, False)]
+    if len(_eq_modes) > 1:
+        parser.error(
+            f"--eq, --ud_eq, and --ugd_eq are mutually exclusive "
+            f"(got: {', '.join('--' + m for m in _eq_modes)})")
+    # --ugd_eq supports both PWL and non-PWL: with --pwl_act the gate factor
+    # rides PWL per-channel s_out; without, it's applied via an EqActivation
+    # wrapper that divides silu(gate) output by g[c] in fp.
 
     if args.weights_stats:
         try:
