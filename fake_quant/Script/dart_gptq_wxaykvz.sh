@@ -52,7 +52,7 @@ Options:
   --pwl_output_bits N  PWL output quantizer bit-width             (default: 16)
   --pwl_no_hw_sim      Disable HW precision simulation (pure float PWL)
   --int_gemm           Use integer GEMM with capped accumulator
-  --acc_bits N         Accumulator bit-width                         (default: 32)
+  --acc_bits N         Accumulator bit-width                         (default: 16)
   --acc_block_k N      K-block size for accumulator capping          (default: 32)
   --acc_wrap           Use wrap-around instead of saturation on overflow
   --acc_dtype S        Tier-2 accumulator dtype (e.g. fp16, int24)     (default: float)
@@ -76,6 +76,11 @@ Options:
   --gptaq          Closed-form FP-target GPTQ. Implies --fp16_calib;
                    pre-shifts W by W (C - H) H^-1 from FP-vs-Q activation gap
                    before the GPTQ Cholesky loop.
+  --set N          Preset bundle (default: 0). 1 = auto-fill production-shaped
+                   flags from -w/-a/--int_gemm/--hwscale (gptaq+fp16_calib+
+                   hw_accurate when w<16; static-act+realint+down_bits=16+
+                   kv_ex=8+k=v=8 when a<16; acc_block_k=G+acc_wrap when
+                   --int_gemm; scalewise when --hwscale). Explicit flags win.
   -F               Fast mode (skip lm_eval tasks)
   --very-fast      Very fast mode (skip lm_eval, PPL on wikitext2 only)
   -h               Show this help message
@@ -138,7 +143,7 @@ PWL_INPUT_BITS=16
 PWL_OUTPUT_BITS=16
 PWL_NO_HW_SIM=0
 INT_GEMM=0
-ACC_BITS=32
+ACC_BITS=16
 ACC_BLOCK_K=32
 ACC_WRAP=0
 ACC_DTYPE="float"
@@ -171,6 +176,7 @@ FP16_CALIB=0
 SCALEWISE=0
 FORCE_RECALIB=0
 GPTAQ=0
+PRESET=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -234,6 +240,7 @@ while [[ $# -gt 0 ]]; do
         --scalewise)   SCALEWISE=1;        shift   ;;
         --force_recalib) FORCE_RECALIB=1; shift   ;;
         --gptaq)         GPTAQ=1;           shift   ;;
+        --set)         PRESET="$2";       shift 2 ;;
         --fp4)         FP4="$2";           shift 2 ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
@@ -255,6 +262,42 @@ case "$MODEL" in
     3b) MODEL="${MODEL_BASE}/Llama-3.2-3B-Instruct" ;;
     7b) MODEL="${MODEL_BASE}/Llama-2-7b-hf" ;;
 esac
+
+# --- Apply --set preset (keep in sync with experiment_config.apply_set_preset) ---
+# Expands a single --set N flag into the equivalent set of explicit flags so
+# runfile rows stay readable. Skipped under MODE=full (no quantization). Each
+# rule only fires when the target variable is still at its parser default —
+# explicit flags win.
+if [ "$PRESET" = "1" ] && [ "$MODE" != "full" ]; then
+    # Weight quantization → gptaq + fp16_calib + hw_accurate
+    if [ "$W_BITS" -lt 16 ]; then
+        [ "${GPTAQ:-0}" = "0" ] && GPTAQ=1
+        [ "${FP16_CALIB:-0}" = "0" ] && FP16_CALIB=1
+        [ "${HW_ACCURATE:-0}" = "0" ] && HW_ACCURATE=1
+    fi
+    # Activation quantization → static_act + realint + down_bits=16 + kv_ex=8 + k=v=8
+    if [ "$A_BITS" -lt 16 ]; then
+        [ -z "${DOWN_BITS}" ] && DOWN_BITS=16
+        [ "$KV_BITS" = "4" ] && KV_BITS=8
+        # V_BITS is resolved below from (possibly bumped) KV_BITS
+        [ "$KV_EX" = "0" ] && KV_EX=8
+        [ "${STATIC_ACT:-0}" = "0" ] && STATIC_ACT=1
+        [ "${REALINT:-0}" = "0" ] && REALINT=1
+    else
+        # Weight-only: k=v=kv_ex=16, leave realint alone
+        [ "$KV_BITS" = "4" ] && KV_BITS=16
+        [ "$KV_EX" = "0" ] && KV_EX=16
+    fi
+    # Integer GEMM → acc_block_k follows -G, acc_wrap on
+    if [ "${INT_GEMM:-0}" = "1" ]; then
+        [ "$ACC_BLOCK_K" = "32" ] && ACC_BLOCK_K=$GROUPSIZE
+        [ "${ACC_WRAP:-0}" = "0" ] && ACC_WRAP=1
+    fi
+    # hwscale → scalewise (gated; scalewise without hwscale crashes init_scalewise)
+    if [ -n "${HWSCALE:-}" ] && [ "${SCALEWISE:-0}" = "0" ]; then
+        SCALEWISE=1
+    fi
+fi
 
 # --- Default V_BITS to KV_BITS if not explicitly set ---
 V_BITS=${V_BITS:-$KV_BITS}

@@ -172,7 +172,7 @@ def add_quant_args(parser):
     # Integer GEMM
     parser.add_argument('--int_gemm', action='store_true',
                         help='Integer GEMM with capped accumulator')
-    parser.add_argument('--acc_bits', type=int, default=32)
+    parser.add_argument('--acc_bits', type=int, default=16)
     parser.add_argument('--acc_block_k', type=int, default=32)
     parser.add_argument('--acc_wrap', action='store_true',
                         help='Wrap-around instead of saturation')
@@ -284,6 +284,73 @@ def add_quant_args(parser):
                              'mm (Q in attention), ex (all+res+mm). '
                              'Configures 16-bit symmetric quantizer on matching layers.')
 
+    # Preset bundle: 0 = today's behavior, 1 = "production-shaped" auto-fills.
+    # dest=preset to avoid shadowing the built-in `set` in attribute access.
+    parser.add_argument('--set', dest='preset', type=int, default=0, choices=[0, 1],
+                        help='Preset bundle. 0 (default) = no auto-fill. '
+                             '1 = if w<16 add gptaq+fp16_calib+hw_accurate; '
+                             'if a<16 add static_act+realint+down_bits=16+kv_ex=8+k=v=8; '
+                             'if int_gemm add acc_block_k=G+acc_wrap; '
+                             'if hwscale add scalewise. Explicit user flags win.')
+
+
+def apply_set_preset(args):
+    """Expand --set N into the equivalent set of explicit flags.
+
+    Set 0 (default): no-op.
+    Set 1: auto-fills the production-shaped bundle based on what's already on
+    the line. Idempotent. Detection of "user didn't set this" is by value-
+    equals-default — passing e.g. ``-k 4`` (the parser default) along with
+    ``--set 1`` will still get upgraded to 8. Acceptable for our use cases.
+
+    Keep in sync with the bash apply_set_preset block in
+    fake_quant/Script/dart_gptq_wxaykvz.sh.
+    """
+    if getattr(args, 'preset', 0) != 1:
+        return
+
+    # Weight quantization → gptaq + fp16_calib + hw_accurate
+    if getattr(args, 'w_bits', 16) < 16:
+        if not getattr(args, 'gptaq', False):
+            args.gptaq = True
+        if not getattr(args, 'fp16_calib', False):
+            args.fp16_calib = True
+        if not getattr(args, 'hw_accurate', False):
+            args.hw_accurate = True
+
+    # Activation quantization → static + realint + down_bits=16, k=v=kv_ex=8
+    if getattr(args, 'a_bits', 16) < 16:
+        if getattr(args, 'down_bits', None) is None:
+            args.down_bits = 16
+        if getattr(args, 'k_bits', 4) == 4:
+            args.k_bits = 8
+        # v_bits=None resolves to k_bits later via resolve_v_bits, so leave alone
+        if getattr(args, 'kv_ex', 0) == 0:
+            args.kv_ex = 8
+        if not getattr(args, 'static_act', False):
+            args.static_act = True
+        if not getattr(args, 'realint', False):
+            args.realint = True
+    else:
+        # Weight-only (no activation quant): k=v=kv_ex=16, leave realint alone.
+        if getattr(args, 'k_bits', 4) == 4:
+            args.k_bits = 16
+        # v_bits=None → resolves to k_bits=16 via resolve_v_bits
+        if getattr(args, 'kv_ex', 0) == 0:
+            args.kv_ex = 16
+
+    # Integer GEMM → acc_block_k follows -G, acc_wrap on
+    if getattr(args, 'int_gemm', False):
+        if getattr(args, 'acc_block_k', 32) == 32:
+            args.acc_block_k = getattr(args, 'groupsize', 128)
+        if not getattr(args, 'acc_wrap', False):
+            args.acc_wrap = True
+
+    # hwscale → scalewise (gated: scalewise without hwscale crashes init_scalewise)
+    if getattr(args, 'hwscale', None) is not None:
+        if not getattr(args, 'scalewise', False):
+            args.scalewise = True
+
 
 def resolve_v_bits(args):
     """Default v_bits to k_bits when not explicitly given."""
@@ -362,7 +429,7 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False,
     # Integer GEMM tag (omitted for GPTQ cache — GPTQ doesn't use the accumulator)
     if getattr(args, 'int_gemm', False) and not for_gptq_cache:
         parts = ["_intgemm"]
-        if getattr(args, 'acc_bits', 32) != 32:
+        if getattr(args, 'acc_bits', 16) != 16:
             parts.append(f"acc{args.acc_bits}")
         if getattr(args, 'acc_block_k', 32) != 32:
             parts.append(f"bk{args.acc_block_k}")
@@ -673,6 +740,8 @@ def build_quant_args(args):
     _fp4 = getattr(args, 'fp4', 'none')
     if _fp4 != 'none':
         cmd += ['--fp4', _fp4]
+    if getattr(args, 'preset', 0):
+        cmd += ['--set', str(args.preset)]
     return cmd
 
 
@@ -692,6 +761,7 @@ if __name__ == '__main__':
                          help='Tag for FP16 (pre-GPTQ) calibration cache: only flags '
                               'that affect the FP16 act_scales contents are kept.')
     _args = _parser.parse_args()
+    apply_set_preset(_args)
     resolve_v_bits(_args)
     _args.model = resolve_model(_args.model)
     print(build_quant_tag(_args, for_gptq_cache=_args.for_gptq_cache,

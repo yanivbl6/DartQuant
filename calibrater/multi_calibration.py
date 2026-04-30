@@ -248,17 +248,21 @@ def parse_runfile_for_calibration(path, recalib=False):
     for flag, name, cmd_args in entries:
         tokens = shlex.split(cmd_args)
 
-        # Only calibrate static-act runs
-        if '--static-act' not in tokens:
-            continue
-
         mode = tokens[0]
         rest = tokens[1:]
 
         filtered = _filter_runtime_flags(rest)
         line_args, extra = _parse_runfile_line_args(filtered)
+        cfg.apply_set_preset(line_args)
         cfg.resolve_v_bits(line_args)
         line_args.model = cfg.resolve_model(line_args.model)
+
+        # Only calibrate static-act runs. Check both the literal token
+        # (line uses --static-act explicitly) and the post-expansion namespace
+        # (line uses --set 1 with a<16, which auto-fills static_act=True).
+        if ('--static-act' not in tokens
+                and not getattr(line_args, 'static_act', False)):
+            continue
 
         quant_tag = cfg.build_quant_tag(line_args)
         key = (mode, quant_tag)
@@ -396,6 +400,7 @@ def main():
         print("Error: -m/--model is required (unless using --runfile)")
         sys.exit(1)
 
+    cfg.apply_set_preset(args)
     cfg.resolve_v_bits(args)
     quant_args = cfg.build_quant_args(args)
 

@@ -608,11 +608,17 @@ Examples:
                         choices=['none', 'up', 'mlp', 'spec', 'speco', 'all', 'r4', 'res', 'mm', 'ex'],
                         help='Output quantization: none, up, mlp, spec, speco, all, r4, res (residuals), mm (Q in attn), ex (all+res+mm)')
 
+    # Preset bundle (see experiment_config.apply_set_preset)
+    # dest=preset to avoid shadowing the built-in `set` in attribute access.
+    parser.add_argument('--set', dest='preset', type=int, default=0, choices=[0, 1],
+                        help='Preset bundle (0=off, 1=auto-fill production-shaped flags)')
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    cfg.apply_set_preset(args)
 
     # --- Wait for a clear GPU before any CUDA initialization ---
     if args.wait:

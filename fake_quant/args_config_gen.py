@@ -117,9 +117,9 @@ def parser_gen():
     parser.add_argument('--int_gemm', action=argparse.BooleanOptionalAction, default=False,
                         help='Use integer GEMM with capped accumulator instead of float matmul. '
                              'Requires symmetric activation quantization and a_bits/w_bits <= 8.')
-    parser.add_argument('--acc_bits', type=int, default=32,
+    parser.add_argument('--acc_bits', type=int, default=16,
                         help='Accumulator bit-width for integer GEMM (e.g. 16, 20, 32). '
-                             '32 means no capping. (default: 32)')
+                             '32 means no capping. (default: 16)')
     parser.add_argument('--acc_block_k', type=int, default=32,
                         help='K-dimension block size for accumulator capping granularity. '
                              'Smaller = more frequent capping = more realistic HW simulation. (default: 32)')

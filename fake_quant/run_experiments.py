@@ -366,6 +366,7 @@ def main():
         print("Error: -m/--model is required (unless using --runfile)")
         sys.exit(1)
 
+    cfg.apply_set_preset(args)
     cfg.resolve_v_bits(args)
     quant_args = cfg.build_quant_args(args)
 
