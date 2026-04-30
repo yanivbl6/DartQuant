@@ -46,6 +46,11 @@ class GPTQ:
         tick = time.time()
 
         if not self.quantizer.ready():
+            # For scalewise, this initial whole-W call would snap once over the
+            # entire K-range; the per-group calls below overwrite it. Reset
+            # the K cursor first so the act-scale window is taken from K=0.
+            if getattr(self.quantizer, 'scalewise', False):
+                self.quantizer._k_start = 0
             self.quantizer.find_params(W)
 
         H = self.H
@@ -58,12 +63,18 @@ class GPTQ:
         # exact parameters instead of re-deriving them from fake-quantized
         # values (which fails when not all quantization levels are used in a
         # group, or when the level set is non-uniform like FP4).
+        # Also required for scalewise: the GPTQ-time scale is intentionally
+        # rounded to the M<m>S<s> grid (combined_q / a_group), so recovery
+        # from fake-quantized weights would give a different scale and
+        # break the runtime assumption that qlayer.w_scale * a_scale equals
+        # the rounded combined_q.
         # Skip when actorder=True + static_groups=False: columns are permuted
         # so per-group params in permuted order don't map to final column groups.
         _collect_gptq_params = (
             groupsize != -1
             and (not self.quantizer.sym
-                 or getattr(self.quantizer, 'nvfp4', False))
+                 or getattr(self.quantizer, 'nvfp4', False)
+                 or getattr(self.quantizer, 'scalewise', False))
             and not (actorder and not static_groups)
         )
         _gptq_scales = []  # will be [n_groups] list of [N,1] tensors
@@ -74,6 +85,8 @@ class GPTQ:
             groups = []
             for i in range(0, self.columns, groupsize):
                 quantizer = copy.deepcopy(self.quantizer)
+                if getattr(quantizer, 'scalewise', False):
+                    quantizer._k_start = i
                 quantizer.find_params(W[:, i:(i + groupsize)])
                 groups.append(quantizer)
                 if _collect_gptq_params:
@@ -89,13 +102,61 @@ class GPTQ:
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
 
-        damp = percdamp * torch.mean(torch.diag(H))
+        # Cholesky path with numerical safeguards. Under scalewise the per-group
+        # weight scale can land on the M<m>S<s> grid edge where a few groups
+        # snap to underflow values, which propagates through the GPTQ chain
+        # (later subsets see slightly different activations) and can produce
+        # zero-variance columns in H or NaN entries. Detect and recover by
+        # isolating the contaminated rows/cols (eye-style) and bumping
+        # percdamp until Cholesky succeeds.
         diag = torch.arange(self.columns, device=self.dev)
-        H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
+        H_orig = H.clone()
+        # NaN contamination: a NaN input column produces a NaN row+col in H
+        # (and via outer-product propagation, NaN spreads symmetrically).
+        # A column k is the contamination source when H[k,k] is NaN; the
+        # rest of H[k, :] / H[:, k] inherit NaN but the bad axis is k.
+        # Identify bad axes by NaN diagonal entries, then wipe just those
+        # rows/cols so untouched columns retain their real data.
+        nan_axis = torch.isnan(torch.diagonal(H_orig))
+        if nan_axis.any():
+            n_nan = int(nan_axis.sum().item())
+            logging.warning(
+                "GPTQ: %d column(s) contaminated with NaN; isolating before Cholesky",
+                n_nan)
+            H_orig[nan_axis, :] = 0.0
+            H_orig[:, nan_axis] = 0.0
+            # Replace residual NaNs (cells whose row OR col was bad) with 0.
+            H_orig = torch.where(torch.isnan(H_orig),
+                                  torch.zeros_like(H_orig), H_orig)
+        H_diag = torch.diag(H_orig)
+        # Floor any near-zero diagonal entries so damping has something to
+        # ride on (otherwise dead columns stay at ~0 + percdamp*mean which
+        # may itself be 0 if the whole layer is dead).
+        diag_pos = H_diag[H_diag > 0]
+        diag_floor = (diag_pos.mean().item() * 1e-3) if diag_pos.numel() > 0 else 1e-8
+        Hinv = None
+        last_err = None
+        for retry_damp in (percdamp, percdamp * 5.0, percdamp * 50.0):
+            H = H_orig.clone()
+            damp = retry_damp * torch.mean(torch.diag(H).clamp(min=diag_floor))
+            H[diag, diag] = torch.maximum(
+                H[diag, diag] + damp,
+                torch.tensor(diag_floor, device=self.dev))
+            try:
+                L = torch.linalg.cholesky(H)
+                Hi = torch.cholesky_inverse(L)
+                Hinv = torch.linalg.cholesky(Hi, upper=True)
+                if retry_damp != percdamp:
+                    logging.warning(
+                        "GPTQ: Cholesky required percdamp=%.3g (default %.3g)",
+                        retry_damp, percdamp)
+                break
+            except torch._C._LinAlgError as exc:
+                last_err = exc
+                continue
+        if Hinv is None:
+            raise last_err
+        H = Hinv
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -114,6 +175,8 @@ class GPTQ:
                 if groupsize != -1:
                     if not static_groups:
                         if (i1 + i) % groupsize == 0:
+                            if getattr(self.quantizer, 'scalewise', False):
+                                self.quantizer._k_start = i1 + i
                             self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)])
                             if _collect_gptq_params:
                                 _gptq_scales.append(self.quantizer.scale.clone())
@@ -256,6 +319,9 @@ def gptq_fwrd(model, dataloader, dev, args):
 
             gptq = {}
             w_bits_map = getattr(args, 'w_bits_map', None)
+            scalewise = getattr(args, 'scalewise', False)
+            hwscale_parsed = getattr(args, 'hwscale_parsed', None)
+            fp16_act_scales = getattr(args, 'fp16_act_scales', None)
             for name in subset:
                 # print(f'{name}', end='  ', flush=True)
                 layer_weight_bits = args.w_bits
@@ -277,13 +343,37 @@ def gptq_fwrd(model, dataloader, dev, args):
                     raise ValueError(
                         "--fp4 is symmetric-only; remove --w_asym for FP4 layers"
                     )
+                # Look up the FP16 act scale for this layer (scalewise only)
+                layer_act_scale = None
+                if scalewise and fp16_act_scales is not None:
+                    bare_name = name.replace('.module', '')
+                    qkey = f'model.layers.{i}.{bare_name}.quantizer'
+                    entry = fp16_act_scales.get(qkey)
+                    if entry is not None:
+                        a = entry.get('scale')
+                        # Match the runtime act-scale grouping so the snap
+                        # is at the same granularity as the deployed scale.
+                        # hw_accurate collapses non-down_proj to per-tensor;
+                        # down_proj keeps per-column (reduced to per-K-group
+                        # at runtime, which matches the per-weight-group
+                        # max we take inside find_params).
+                        if (getattr(args, 'hw_accurate', False)
+                                and 'down_proj' not in bare_name):
+                            a = a.flatten().amax().expand(a.flatten().numel())
+                        layer_act_scale = a
                 gptq[name] = GPTQ(subset[name])
                 gptq[name].quantizer = quant_utils.WeightQuantizer()
                 gptq[name].quantizer.configure(
                     layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip,
                     gscaler=getattr(args, 'gscaler_parsed', None),
                     nvfp4=layer_use_fp4,
+                    scalewise=scalewise,
+                    hwscale_spec=hwscale_parsed,
+                    layer_act_scale=layer_act_scale,
                 )
+                if gptq[name].quantizer.scalewise:
+                    gptq[name].quantizer.init_scalewise(
+                        subset[name].weight.data, args.w_groupsize)
 
             def add_batch(name):
                 def tmp(_, inp, out):

@@ -230,6 +230,15 @@ def parser_gen():
                              '(down_proj under hw_accurate; all matching layers under '
                              'hw_align). Trailing bz sets a per-layer FP32 global '
                              'scale = 2^-z applied at T2 (default: None).')
+    parser.add_argument('--fp16_calib', action='store_true', default=False,
+                        help='Inference path: load FP16-derived activation scales '
+                             '(replaces post-GPTQ calibration; tag the act_scales '
+                             'file with __fp16 suffix).')
+    parser.add_argument('--scalewise', action='store_true', default=False,
+                        help='Marker: GPTQ ran with scale-aware rounding. Implies '
+                             '--fp16_calib at inference time.')
+    parser.add_argument('--force_recalib', action='store_true', default=False,
+                        help='Forwarded to calibration; no effect at inference.')
     parser.add_argument('--adaquant', type=str, nargs='?', const='default', default=None,
                         help='Use AdaQuant instead of GPTQ. No value = defaults. '
                              'Inline params string to customise '

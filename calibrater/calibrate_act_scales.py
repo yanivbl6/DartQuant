@@ -542,10 +542,22 @@ Examples:
     # them, so the cal file is intentionally hwscale-agnostic and reused
     # across all hwscale spec values at inference time).
     parser.add_argument('--hwscale', type=str, default=None,
-                        help='[ignored at calibration] hwscale spec (e.g. M4S4bmid). '
-                             'The merged-scale snap is an inference-time step; the '
-                             'cal-tag excludes it so all hwscale variants share one '
-                             'cal file.')
+                        help='hwscale spec (e.g. M4S4bmid). Without --scalewise '
+                             'the merged-scale snap is an inference-time step and '
+                             'the cal-tag excludes it. With --scalewise the spec '
+                             'is folded into the GPTQ + post-GPTQ cal tags.')
+
+    # FP16 / scalewise calibration mode
+    parser.add_argument('--fp16_calib', action='store_true', default=False,
+                        help='Calibrate activation scales on the FP16 (pre-GPTQ) '
+                             'model and use them at inference (replaces post-GPTQ '
+                             'calibration).')
+    parser.add_argument('--scalewise', action='store_true', default=False,
+                        help='Round the merged hwscale inside the GPTQ loop. '
+                             'Forces --fp16_calib pre-pass; requires --hwscale.')
+    parser.add_argument('--force_recalib', action='store_true', default=False,
+                        help='Recompute activation calibration files even if a '
+                             'cached copy already exists.')
 
     # AdaQuant (alternative to GPTQ)
     parser.add_argument('--adaquant', type=str, nargs='?', const='default', default=None,
@@ -641,9 +653,18 @@ def main():
     args.o_per_head = (args.mode in ('quarot', 'dart'))
     args.w_clip = True
 
+    # --- Validate scalewise / fp16_calib combinations ---
+    if args.scalewise and not args.hwscale:
+        raise SystemExit(
+            "--scalewise requires --hwscale <spec> (the spec to round scales to).")
+    if args.scalewise:
+        # scalewise always needs FP16 act_scales available before GPTQ runs.
+        args.fp16_calib = True
+
     # --- Build quant tag (centralized in experiment_config) ---
     quant_tag = cfg.build_quant_tag(args, for_cal_cache=True)
     gptq_cache_tag = cfg.build_quant_tag(args, for_gptq_cache=True, for_cal_cache=True)
+    fp16_cal_tag = cfg.build_quant_tag(args, for_fp16_cal_cache=True)
 
     # Resolve GGUF path (needed for weight loading, separate from tag)
     gguf_path = None
@@ -657,6 +678,9 @@ def main():
         args.save_path = f"../data/act_scales/{model_name}/{save_prefix}_{quant_tag}.pt"
     if args.gptq_checkpoint_path is None:
         args.gptq_checkpoint_path = f"../data/gptq_checkpoints/{save_prefix}_{model_name}_{gptq_cache_tag}"
+    args.fp16_act_scales_path = (
+        f"../data/act_scales/{model_name}/{save_prefix}_{fp16_cal_tag}__fp16.pt"
+    )
 
     # --- Print resolved config ---
     print(f"Mode:       {args.mode}")
@@ -666,6 +690,10 @@ def main():
     print(f"R2 path:    {args.r2_path}")
     print(f"GPTQ ckpt:  {args.gptq_checkpoint_path}")
     print(f"Save path:  {args.save_path}")
+    if args.fp16_calib or args.scalewise:
+        print(f"FP16 cal:   {args.fp16_act_scales_path}")
+    if args.scalewise:
+        print(f"Scalewise:  ON (hwscale={args.hwscale})")
     if gguf_path:
         print(f"GGUF:       {gguf_path}")
     print()
@@ -864,6 +892,86 @@ def main():
         eq_module.apply_branch_eq(model, branch_eq_factors)
         print("Branch equalization fully applied (weights + gate-side)")
 
+    # --- Configure output quantization (--quant_out) BEFORE FP16 cal/GPTQ ---
+    # Original placement was post-GPTQ. Pulled forward so the FP16 calibration
+    # phase observes ALL quantizers (out, pre, residual, Q, SMQ). Without this,
+    # the FP16 cal file is missing scales for those layers and inference falls
+    # back to scale=0 → catastrophic outputs.
+    quant_out = getattr(args, 'quant_out', 'none')
+    if quant_out != 'none':
+        qlayers_qo = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        for name, qlayer in qlayers_qo.items():
+            if quant_utils.should_quant_out(name, quant_out):
+                if qlayer.out_quantizer.maxq == 0:
+                    qlayer.out_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+                    qlayer.out_quantizer.realint = True
+            if quant_utils.should_quant_pre(name, quant_out):
+                qlayer.pre_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+                qlayer.pre_quantizer.realint = True
+        quant_utils.link_adjacent_quantizers(model)
+
+    if quant_utils.needs_residual_quant(quant_out):
+        quant_utils.setup_residual_quantizers(model)
+
+    if quant_utils.needs_mm_quant(quant_out):
+        layers_mm = model.model.layers
+        rope_fn_mm = model_utils.get_rope_function_name(model)
+        for layer_mm in layers_mm:
+            wrapper_attr = f'{rope_fn_mm}_qk_rotation_wrapper'
+            if hasattr(layer_mm.self_attn, wrapper_attr):
+                wrapper = getattr(layer_mm.self_attn, wrapper_attr)
+                wrapper.q_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
+                wrapper.q_quantizer.realint = True
+
+    if args.smq > 0:
+        import smq_utils
+        smq_utils.enable_smq(args.smq)
+        print(f"Enabled softmax output quantization: {args.smq} bits")
+
+    # --- FP16 (pre-GPTQ) activation calibration ---
+    # When --fp16_calib (implied by --scalewise), observe activation min/max
+    # against the FP16 model AFTER rotations/eq but BEFORE weight quantization.
+    # The resulting scales serve two purposes:
+    #   (a) at inference (--fp16_calib path): they are the deployment scales;
+    #   (b) inside scalewise GPTQ: they let GPTQ pre-round
+    #       round_M4S4(group_scale * act_scale) so its Hessian-aware loop
+    #       absorbs scale-rounding error too.
+    fp16_act_scales = None
+    if args.fp16_calib:
+        if (os.path.exists(args.fp16_act_scales_path)
+                and not args.force_recalib):
+            print(f"Loading cached FP16 act_scales from: "
+                  f"{args.fp16_act_scales_path}")
+            fp16_act_scales = torch.load(
+                args.fp16_act_scales_path, map_location='cpu',
+                weights_only=False)
+        else:
+            print("Running FP16 (pre-GPTQ) activation calibration...")
+            fp16_dataloader = data_utils.get_loaders(
+                args.calib_dataset, nsamples=args.nsamples,
+                seed=args.seed, model=args.model,
+                seqlen=model.seqlen, eval_mode=False)
+            fp16_act_scales = calibrate_act_scales(
+                model, fp16_dataloader, args)
+            # Mirror the post-GPTQ save path so downstream loaders find the
+            # equalization factors at the expected keys.
+            if eq_factors is not None:
+                fp16_act_scales['__eq_factors__'] = {
+                    k: v.cpu() for k, v in eq_factors.items()}
+            if branch_eq_factors is not None:
+                fp16_act_scales['__branch_eq_factors__'] = {
+                    'mode': branch_eq_mode,
+                    'factors': {
+                        i: {k: v.cpu() for k, v in entry.items()}
+                        for i, entry in branch_eq_factors.items()
+                    },
+                }
+            os.makedirs(os.path.dirname(args.fp16_act_scales_path),
+                        exist_ok=True)
+            torch.save(fp16_act_scales, args.fp16_act_scales_path)
+            print(f"Saved FP16 act_scales to: {args.fp16_act_scales_path}")
+            utils.cleanup_memory(verbos=True)
+
     # --- Weight quantization (GPTQ or AdaQuant) ---
     # Must happen before activation calibration so we measure activations
     # flowing through quantized weights (matching actual inference).
@@ -990,6 +1098,19 @@ def main():
                 gptq_args.lsb_mac_shift = getattr(args, 'lsb_mac_shift', 0)
                 # Forward FP4 mode so GPTQ snaps to FP4 levels on selected layers
                 gptq_args.fp4 = getattr(args, 'fp4', 'none')
+                # Scalewise: pre-round combined hwscale inside the GPTQ loop
+                gptq_args.scalewise = getattr(args, 'scalewise', False)
+                gptq_args.hwscale_parsed = (
+                    quant_utils.parse_gscaler(args.hwscale)
+                    if gptq_args.scalewise else None)
+                gptq_args.fp16_act_scales = (
+                    fp16_act_scales if gptq_args.scalewise else None)
+                # Forward runtime act-scale grouping so scalewise rounds at
+                # the same granularity as the deployed merged scale
+                # (hw_accurate → per-tensor for non-down-proj layers,
+                # hw_align → per-K-group, default → per-K-group).
+                gptq_args.hw_accurate = getattr(args, 'hw_accurate', False)
+                gptq_args.hw_align = getattr(args, 'hw_align', False)
 
                 gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
 
@@ -1081,35 +1202,8 @@ def main():
     #  so cal sees the runtime act_fn and the eq gate-side rescale can ride
     #  PWL per-channel n_q for --ugd_eq + --pwl_act.)
 
-    # --- Configure output quantization (--quant_out) ---
-    # Must happen AFTER GPTQ/checkpoint loading, which overwrites buffers via load_state_dict.
-    quant_out = getattr(args, 'quant_out', 'none')
-    if quant_out != 'none':
-        qlayers_qo = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
-        for name, qlayer in qlayers_qo.items():
-            if quant_utils.should_quant_out(name, quant_out):
-                if qlayer.out_quantizer.maxq == 0:
-                    qlayer.out_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
-                    qlayer.out_quantizer.realint = True
-            if quant_utils.should_quant_pre(name, quant_out):
-                qlayer.pre_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
-                qlayer.pre_quantizer.realint = True
-        quant_utils.link_adjacent_quantizers(model)
-
-    # Setup residual quantizers (--quant_out res/ex)
-    if quant_utils.needs_residual_quant(quant_out):
-        quant_utils.setup_residual_quantizers(model)
-
-    # Setup Q quantizer in attention (--quant_out mm/ex)
-    if quant_utils.needs_mm_quant(quant_out):
-        layers = model.model.layers
-        rope_fn = model_utils.get_rope_function_name(model)
-        for layer in layers:
-            wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
-            if hasattr(layer.self_attn, wrapper_attr):
-                wrapper = getattr(layer.self_attn, wrapper_attr)
-                wrapper.q_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
-                wrapper.q_quantizer.realint = True
+    # (--quant_out / residual / Q quantizer / SMQ setup was moved earlier,
+    #  before FP16 calibration — see block above the FP16-cal phase.)
 
     # --- Enable integer GEMM on ActQuantWrappers ---
     if args.int_gemm:
@@ -1147,47 +1241,53 @@ def main():
             print(f"    done.", flush=True)
         print(f"Integer GEMM prepared for {n_ig} layers", flush=True)
 
-    # --- Enable softmax output quantization ---
-    if args.smq > 0:
-        import smq_utils
-        smq_utils.enable_smq(args.smq)
-        print(f"Enabled softmax output quantization: {args.smq} bits")
+    # (SMQ enable was moved earlier, before FP16 calibration.)
 
-    # --- Get calibration data ---
-    dataloader = data_utils.get_loaders(
-        args.calib_dataset, nsamples=args.nsamples,
-        seed=args.seed, model=args.model,
-        seqlen=model.seqlen, eval_mode=False)
+    # --- Post-GPTQ activation calibration ---
+    # When --fp16_calib is set the FP16 act_scales (computed before GPTQ) are
+    # the deployment scales — skip the post-GPTQ calibration entirely.
+    # Also skip if a cached file already exists and --force_recalib is off.
+    if args.fp16_calib:
+        print("--fp16_calib: skipping post-GPTQ activation calibration "
+              "(FP16 act_scales are the deployment scales).")
+    elif (os.path.exists(args.save_path) and not args.force_recalib):
+        print(f"Cached post-GPTQ act_scales found, reusing: {args.save_path}")
+    else:
+        # --- Get calibration data ---
+        dataloader = data_utils.get_loaders(
+            args.calib_dataset, nsamples=args.nsamples,
+            seed=args.seed, model=args.model,
+            seqlen=model.seqlen, eval_mode=False)
 
-    # --- Run activation scale calibration ---
-    act_scales = calibrate_act_scales(model, dataloader, args)
+        # --- Run activation scale calibration ---
+        act_scales = calibrate_act_scales(model, dataloader, args)
 
-    # --- Include equalization factors in saved output ---
-    if eq_factors is not None:
-        act_scales['__eq_factors__'] = {k: v.cpu() for k, v in eq_factors.items()}
-        print(f"Including equalization factors for {len(eq_factors)} layers")
-    if branch_eq_factors is not None:
-        act_scales['__branch_eq_factors__'] = {
-            'mode': branch_eq_mode,
-            'factors': {
-                i: {k: v.cpu() for k, v in entry.items()}
-                for i, entry in branch_eq_factors.items()
-            },
-        }
-        print(f"Including branch equalization factors (mode={branch_eq_mode}) "
-              f"for {len(branch_eq_factors)} layers")
+        # --- Include equalization factors in saved output ---
+        if eq_factors is not None:
+            act_scales['__eq_factors__'] = {k: v.cpu() for k, v in eq_factors.items()}
+            print(f"Including equalization factors for {len(eq_factors)} layers")
+        if branch_eq_factors is not None:
+            act_scales['__branch_eq_factors__'] = {
+                'mode': branch_eq_mode,
+                'factors': {
+                    i: {k: v.cpu() for k, v in entry.items()}
+                    for i, entry in branch_eq_factors.items()
+                },
+            }
+            print(f"Including branch equalization factors (mode={branch_eq_mode}) "
+                  f"for {len(branch_eq_factors)} layers")
 
-    # --- Save ---
-    save_dir = os.path.dirname(args.save_path)
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-    torch.save(act_scales, args.save_path)
-    print(f"\nSaved {len(act_scales)} activation scale entries to {args.save_path}")
-    for k in sorted(act_scales.keys()):
-        if k.startswith('__'):
-            continue
-        s = act_scales[k]['scale']
-        print(f"  {k}: scale shape={list(s.shape)}, range=[{s.min():.6f}, {s.max():.6f}]")
+        # --- Save ---
+        save_dir = os.path.dirname(args.save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        torch.save(act_scales, args.save_path)
+        print(f"\nSaved {len(act_scales)} activation scale entries to {args.save_path}")
+        for k in sorted(act_scales.keys()):
+            if k.startswith('__'):
+                continue
+            s = act_scales[k]['scale']
+            print(f"  {k}: scale shape={list(s.shape)}, range=[{s.min():.6f}, {s.max():.6f}]")
 
 
 if __name__ == '__main__':

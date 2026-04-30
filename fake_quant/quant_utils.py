@@ -1370,6 +1370,9 @@ class WeightQuantizer(torch.nn.Module):
         groupsize=-1, static_groups=False,
         gscaler=None,
         nvfp4=False,
+        scalewise=False,
+        hwscale_spec=None,
+        layer_act_scale=None,
     ):
         # FP4 is symmetric, per-channel, 4-bit; MSE search disabled (its loop
         # uses uniform-integer rounding that doesn't apply to FP4 levels).
@@ -1397,6 +1400,79 @@ class WeightQuantizer(torch.nn.Module):
 
         self.groupsize = groupsize
         self.static_groups = static_groups
+
+        # ── scalewise: pre-round combined hwscale inside the GPTQ loop ──
+        self.scalewise = bool(scalewise) and (hwscale_spec is not None) \
+            and (layer_act_scale is not None) and (bits < 16)
+        self.hwscale_spec = hwscale_spec
+        # Per-input-channel activation scale tensor (length K). Stored as fp32
+        # and detached on configure; sliced in find_params per weight group.
+        if layer_act_scale is None:
+            self.layer_act_scale = None
+        else:
+            self.layer_act_scale = layer_act_scale.detach().to(torch.float32)
+        # Layer-wide hwscale global scalar — set lazily by init_scalewise(W).
+        self._scalewise_global = None
+        # Cursor advanced by find_params to track which K-window is active.
+        self._k_start = 0
+
+    @torch.no_grad()
+    def init_scalewise(self, W, w_groupsize):
+        """Precompute the per-layer hwscale global scalar before fasterquant.
+
+        Mirrors the runtime hwscale snap (see ``snap_to_hwscale``): one global
+        FP32 scalar absorbs the bulk of the magnitude, the per-group residual
+        is what M<m>S<s> bias=0 represents. The global is shared across all
+        K-groups within a layer, so we compute it from the FULL pre-GPTQ
+        combined scale tensor here, then reuse it inside every per-group
+        find_params call.
+
+        Requires the act-scale grouping to match ``w_groupsize`` — at runtime
+        the deployed combined scales are stored at this granularity.
+        """
+        if not self.scalewise:
+            return
+        if w_groupsize is None or w_groupsize <= 0:
+            raise ValueError(
+                "scalewise requires a positive weight groupsize that matches "
+                "the runtime hwscale grouping (acc_block_k). Got "
+                f"groupsize={w_groupsize}.")
+        K = W.shape[1]
+        if K % w_groupsize != 0:
+            raise ValueError(
+                f"K={K} not divisible by w_groupsize={w_groupsize}")
+        if self.layer_act_scale.numel() != K:
+            raise ValueError(
+                f"layer_act_scale length {self.layer_act_scale.numel()} "
+                f"does not match weight K dim {K}")
+        n_groups = K // w_groupsize
+        # Float per-group weight scale, shape [n_out, n_groups], using the
+        # same sym/asym/MSE-disabled logic find_params uses by default
+        # (compute_initial: scale = amax / maxq for sym; abs-range / maxq
+        # for asym). MSE search isn't used here — it'd give a different
+        # global per group which is fine since global is computed from the
+        # full distribution anyway.
+        Wg = W.float().reshape(W.shape[0], n_groups, w_groupsize)
+        if self.sym or getattr(self, 'nvfp4', False):
+            wmax = Wg.abs().amax(dim=2).clamp(min=1e-5)
+            w_scale = wmax / float(self.maxq)
+        else:
+            wmin = Wg.amin(dim=2)
+            wmax = Wg.amax(dim=2)
+            w_scale = (wmax - wmin).clamp(min=1e-5) / float(self.maxq)
+        a_per_group = self.layer_act_scale.to(W.device).reshape(
+            n_groups, w_groupsize).amax(dim=1)              # [n_groups]
+        raw = w_scale * a_per_group.unsqueeze(0)            # [n_out, n_groups]
+        self._scalewise_global = float(
+            hwscale_global_from_spec(self.hwscale_spec, raw_scale=raw))
+        # Pre-build the bias-0 spec used inside find_params.
+        self._scalewise_bias0_spec = {
+            'mantissa_bits': self.hwscale_spec['mantissa_bits'],
+            'shift_bits': self.hwscale_spec['shift_bits'],
+            'bias': 0,
+            'spec': self.hwscale_spec['spec'],
+        }
+        self._k_start = 0
 
     def find_params(self, x):
         if self.bits == 16:
@@ -1454,7 +1530,32 @@ class WeightQuantizer(torch.nn.Module):
             self.scale = self.scale.repeat(tmp)
             self.zero = self.zero.repeat(tmp)
 
-        if self.gscaler is not None:
+        if self.scalewise and self._scalewise_global is not None:
+            # Pre-round the merged (group_scale × act_scale) to its M<m>S<s>
+            # representation here so the GPTQ loop's Hessian-aware error
+            # compensation absorbs scale-rounding error along with weight
+            # rounding. Mirrors snap_to_hwscale() but reuses a precomputed
+            # per-layer global so the global is consistent across all groups.
+            # Caller (fasterquant) sets ``_k_start`` to the K-position of this
+            # weight slice before calling find_params.
+            x_dev = self.scale.device
+            k_end = min(self._k_start + shape[-1], self.layer_act_scale.numel())
+            a_window = self.layer_act_scale[self._k_start:k_end].to(x_dev)
+            a_group = a_window.amax().clamp(min=1e-12)        # scalar
+            raw = self.scale * a_group                        # [n_out]
+            scaled = raw / self._scalewise_global
+            stored = snap_scale_to_gscaler(scaled, self._scalewise_bias0_spec)
+            combined_q = stored * self._scalewise_global
+            # Effective per-group weight scale that GPTQ will quantize against:
+            # equals combined_q / a_group, so dequant * a_group reproduces the
+            # rounded combined scale exactly at runtime.
+            self.scale = combined_q / a_group
+            # Asymmetric: zero point was computed against the un-rounded
+            # scale; rebuild it for the new scale so the int code lands at
+            # the right level.
+            if not self.sym:
+                self.zero = torch.round(-xmin / self.scale.clamp(min=1e-12))
+        elif self.gscaler is not None:
             self.scale = snap_scale_to_gscaler(self.scale, self.gscaler)
 
         shape = [-1] + [1] * (len(shape) - 1)

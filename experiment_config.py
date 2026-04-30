@@ -221,6 +221,21 @@ def add_quant_args(parser):
                              'to M<m>S<s>[b<z>|l<z>|bmin] at model load. Inference-only '
                              '(untouched: GPTQ/cal caches). bmin = per-layer auto bias.')
 
+    # FP16 / scalewise calibration mode
+    parser.add_argument('--fp16_calib', action='store_true', default=False,
+                        help='Calibrate activation scales on the FP16 (pre-GPTQ) model '
+                             'and use them at inference (replaces post-GPTQ calibration). '
+                             'Cache key strips post-quantization-only flags so the same '
+                             'FP16 cal file is shared across w_bits/groupsize/hwscale variants.')
+    parser.add_argument('--scalewise', action='store_true', default=False,
+                        help='Round the merged hwscale (group_scale * act_scale) to its '
+                             'M<m>S<s> representation INSIDE the GPTQ loop, so '
+                             'Hessian-aware compensation absorbs scale-rounding error. '
+                             'Forces an FP16 calibration pre-pass; requires --hwscale.')
+    parser.add_argument('--force_recalib', action='store_true', default=False,
+                        help='Recompute activation calibration files even if a cached '
+                             'copy already exists on disk.')
+
     # AdaQuant (alternative to GPTQ)
     parser.add_argument('--adaquant', type=str, nargs='?', const='default', default=None,
                         help='Use AdaQuant instead of GPTQ. No value = defaults. '
@@ -270,7 +285,8 @@ def resolve_v_bits(args):
 
 # ── Quant-tag and path helpers ───────────────────────────────────────────────
 
-def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
+def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False,
+                    for_fp16_cal_cache=False):
     """Build the canonical quant-tag string from parsed args.
 
     This is the SINGLE SOURCE OF TRUTH for tag construction.
@@ -279,7 +295,16 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
 
     If *for_gptq_cache* is True, the gptq_strength suffix is omitted so that
     all strength values share the same GPTQ checkpoint cache.
+
+    If *for_fp16_cal_cache* is True, the tag is restricted to flags that affect
+    FP16 (pre-GPTQ) activation calibration output. All post-quantization-only
+    flags are stripped so a single FP16 cal file is shared across configs.
     """
+    # The FP16 cal cache strips weight-quantization details entirely — only
+    # observer-placement flags (a/k/v_bits) and pre-calibration transforms
+    # (eq family, fp32) matter for the FP16 act_scales values.
+    if for_fp16_cal_cache:
+        return _build_fp16_cal_tag(args)
     w_asym = getattr(args, 'w_asym', False) and not args.sym
     if args.sym:
         sym_tag = "wSym_kSym_vSym"
@@ -377,9 +402,21 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
     # Group scaler tag
     if getattr(args, 'gscaler', None):
         tag += f"_G-scaler-{args.gscaler}"
-    # hwscale tag (merged per-group a*w scale, result-only — GPTQ/cal caches unchanged)
-    if getattr(args, 'hwscale', None) and not (for_gptq_cache or for_cal_cache):
-        tag += f"_hws-{args.hwscale}"
+    # hwscale / scalewise tag.
+    # Default behaviour: hwscale is result-only (GPTQ/cal caches unchanged).
+    # With --scalewise, the merged scale is rounded INSIDE the GPTQ loop, so
+    # the GPTQ checkpoint and the post-GPTQ calibration depend on the hwscale
+    # spec; fold it into those caches as `_scalewise-<spec>`. The result tag
+    # keeps the existing `_hws-<spec>` plus a `_scalewise` marker.
+    _hwscale = getattr(args, 'hwscale', None)
+    _scalewise = getattr(args, 'scalewise', False)
+    if _hwscale:
+        if _scalewise and (for_gptq_cache or for_cal_cache):
+            tag += f"_scalewise-{_hwscale}"
+        elif not (for_gptq_cache or for_cal_cache):
+            tag += f"_hws-{_hwscale}"
+            if _scalewise:
+                tag += "_scalewise"
     # AdaQuant tag
     _aq = getattr(args, 'adaquant', None)
     if _aq is not None:
@@ -397,13 +434,21 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
     # Real integer quantization tag
     if getattr(args, 'realint', False):
         tag += "_RINT"
-    # Hardware-aligned activation scales (affects calibration + result, not GPTQ)
-    # hw_accurate reuses the same calibration as hw_align (per-column scales are
-    # identical; the per-tensor collapse is runtime-only).
-    if (getattr(args, 'hw_align', False) or getattr(args, 'hw_accurate', False)) and not for_gptq_cache:
+    # Hardware-aligned activation scales.
+    # Default (no --scalewise): hw_align affects calibration+result but not
+    # GPTQ; hw_accurate is runtime-only (collapses to per-tensor at int_gemm).
+    # Under --scalewise: GPTQ rounds the merged scale at the runtime grouping
+    # (per-tensor for hw_accurate non-down_proj, per-K-group otherwise), so
+    # the GPTQ output depends on which alignment mode is active. Fold the
+    # corresponding markers into the GPTQ + cal cache tags.
+    _hw_align_flag = getattr(args, 'hw_align', False)
+    _hw_accurate_flag = getattr(args, 'hw_accurate', False)
+    _aligned_in_cache = _scalewise and (for_gptq_cache or for_cal_cache)
+    if (_hw_align_flag or _hw_accurate_flag) and (
+            not for_gptq_cache or _aligned_in_cache):
         tag += "_aligned"
-    # Hardware-accurate activation scales (affects result, not GPTQ/calibration)
-    if getattr(args, 'hw_accurate', False) and not (for_gptq_cache or for_cal_cache):
+    if _hw_accurate_flag and (
+            not (for_gptq_cache or for_cal_cache) or _aligned_in_cache):
         tag += "_hwacc"
     # Output quantization tag (activation-side, not relevant for GPTQ cache)
     _qo = getattr(args, 'quant_out', 'none')
@@ -429,6 +474,33 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False):
     return tag
 
 
+def _build_fp16_cal_tag(args):
+    """FP16 calibration tag: only flags that affect the FP16 act_scales contents.
+
+    Kept: a/k/v_bits (gate observer placement), eq family (applied pre-cal),
+    fp32 (changes activation dtype seen by hooks). Mode + R1/R2 are encoded
+    by the directory layout (mode prefixed onto the filename) and the
+    rotation matrices loaded before this tag is materialized — they don't
+    need to live in the tag itself.
+
+    Dropped: w_bits, groupsize, sym, w_asym, kv_ex, proj_ex, no_r4, late_rot4,
+    down_bits, oproj_bits, pwl_*, gscaler, hwscale, scalewise, hw_align,
+    hw_accurate, gptq_strength, int_gemm/acc_*, smq, gguf, imitate_gguf, fp4,
+    adaquant, sim_version, quant_out, stochastic_quant, ig_compare,
+    semi_int_gemm, realint.
+    """
+    parts = [f"a{args.a_bits}k{args.k_bits}v{args.v_bits}"]
+    if getattr(args, 'eq', False):
+        parts.append("eq")
+    if getattr(args, 'ud_eq', False):
+        parts.append("udeq")
+    if getattr(args, 'ugd_eq', False):
+        parts.append("ugdeq")
+    if getattr(args, 'fp32', False):
+        parts.append("FP32")
+    return "_".join(parts)
+
+
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 
 
@@ -436,6 +508,19 @@ def resolve_act_scales_path(model_path, mode, quant_tag):
     """Resolve calibration .pt file path."""
     model_name = model_name_from_path(model_path)
     return os.path.join(_DATA_DIR, 'act_scales', model_name, f'{mode}_{quant_tag}.pt')
+
+
+def resolve_fp16_act_scales_path(model_path, mode, fp16_cal_tag):
+    """Resolve FP16 calibration .pt file path.
+
+    Distinct filename suffix `__fp16` so it never collides with a post-GPTQ
+    cal file that happens to have the same tag.
+    """
+    model_name = model_name_from_path(model_path)
+    return os.path.join(
+        _DATA_DIR, 'act_scales', model_name,
+        f'{mode}_{fp16_cal_tag}__fp16.pt',
+    )
 
 
 def resolve_gptq_checkpoint_dir(model_path, mode, quant_tag, w_bits, imitate_gguf=False):
@@ -547,6 +632,12 @@ def build_quant_args(args):
         cmd.append('--hw_align')
     if getattr(args, 'hw_accurate', False):
         cmd.append('--hw_accurate')
+    if getattr(args, 'fp16_calib', False):
+        cmd.append('--fp16_calib')
+    if getattr(args, 'scalewise', False):
+        cmd.append('--scalewise')
+    if getattr(args, 'force_recalib', False):
+        cmd.append('--force_recalib')
     _fp4 = getattr(args, 'fp4', 'none')
     if _fp4 != 'none':
         cmd += ['--fp4', _fp4]
@@ -565,8 +656,12 @@ if __name__ == '__main__':
                          help='Omit gptq_strength from tag (for shared GPTQ cache)')
     _parser.add_argument('--for_cal_cache', action='store_true',
                          help='Tag for calibration cache (late_rot4 maps to normal R4 tag)')
+    _parser.add_argument('--for_fp16_cal_cache', action='store_true',
+                         help='Tag for FP16 (pre-GPTQ) calibration cache: only flags '
+                              'that affect the FP16 act_scales contents are kept.')
     _args = _parser.parse_args()
     resolve_v_bits(_args)
     _args.model = resolve_model(_args.model)
     print(build_quant_tag(_args, for_gptq_cache=_args.for_gptq_cache,
-                          for_cal_cache=_args.for_cal_cache))
+                          for_cal_cache=_args.for_cal_cache,
+                          for_fp16_cal_cache=_args.for_fp16_cal_cache))

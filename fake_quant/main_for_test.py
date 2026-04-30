@@ -297,6 +297,17 @@ def main():
             # 精度补偿：
             if args.w_ft:
                 w_fine_tuning.w_ft(model, trainloader, utils.DEV, args)
+            # Scalewise: GPTQ needs the FP16 act_scales to pre-round combined
+            # group_scale × act_scale to its M<m>S<s> grid before the GPTQ
+            # column loop. Loaded from the FP16 cal file (args.act_scales_path
+            # is auto-routed to the __fp16.pt file when --fp16_calib is set).
+            if (getattr(args, 'scalewise', False) and args.act_scales_path
+                    and getattr(args, 'fp16_act_scales', None) is None):
+                logging.info(
+                    "scalewise: loading FP16 act_scales for GPTQ pre-rounding from %s",
+                    args.act_scales_path)
+                args.fp16_act_scales = torch.load(
+                    args.act_scales_path, map_location='cpu', weights_only=True)
             quantizers = gptq_utils.gptq_fwrd(model, trainloader, utils.DEV, args)
             save_dict["w_quantizers"] = quantizers
 
@@ -968,12 +979,24 @@ def main():
             # Snap on GPU — model isn't distributed yet so weights are on CPU,
             # and the bopt search is ~500x slower on CPU than GPU.
             snap_dev = torch.device('cuda') if torch.cuda.is_available() else dev
-            stored, global_scalar = quant_utils.snap_to_hwscale(
-                raw_merged.to(snap_dev), _hwscale_spec)
-            stored = stored.to(dev)
+            if getattr(args, 'scalewise', False):
+                # GPTQ already baked the M<m>S<s> rounding into the weights.
+                # Re-snapping here would re-round combined_q against a freshly
+                # computed runtime global, drifting every per-group scale by
+                # ~1e-3 multiplicatively. Since this drift is uniform across
+                # all values that share a layer, it would compound across
+                # depth — skip the snap and use the recovered combined value
+                # directly (qlayer.w_scale already equals combined_q / a_scale
+                # from prepare_int_gemm).
+                global_scalar = 1.0
+                stored = raw_merged   # diagnostic-only; not stored back
+            else:
+                stored, global_scalar = quant_utils.snap_to_hwscale(
+                    raw_merged.to(snap_dev), _hwscale_spec)
+                stored = stored.to(dev)
             # Per-layer diagnostic for auto-bias modes
             _mode = _hwscale_spec.get('bias_auto')
-            if _mode:
+            if _mode and not getattr(args, 'scalewise', False):
                 z_chosen = int(round(-_math.log2(global_scalar))) if global_scalar > 0 else 0
                 _abs_nz = raw_merged.abs()
                 _abs_nz = _abs_nz[_abs_nz > 0]
@@ -989,11 +1012,17 @@ def main():
             # Kernel: partial * a_scale * w_scale = partial * (a*w)_snapped.
             # q.scale is KEPT intact — quantize_to_int uses it to scale
             # activations to int8 before the matmul.
-            if per_group_act:
-                qlayer.w_scale = (stored / a_gscale.unsqueeze(0)).contiguous()
+            if not getattr(args, 'scalewise', False):
+                if per_group_act:
+                    qlayer.w_scale = (stored / a_gscale.unsqueeze(0)).contiguous()
+                else:
+                    qlayer.w_scale = (stored / a_gscale.item()).contiguous()
+                qlayer.hwscale_global = float(global_scalar)
             else:
-                qlayer.w_scale = (stored / a_gscale.item()).contiguous()
-            qlayer.hwscale_global = float(global_scalar)
+                # qlayer.w_scale stays at combined_q / a_scale (set by
+                # prepare_int_gemm); kernel computes a_scale * w_scale * 1.0
+                # = combined_q exactly.
+                qlayer.hwscale_global = 1.0
             qlayer.w_shift_bias = 0  # hwscale replaces gscaler exponent-bias
             last_global = float(global_scalar)
             n_merged += 1

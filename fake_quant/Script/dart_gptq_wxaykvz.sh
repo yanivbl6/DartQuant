@@ -164,6 +164,9 @@ R4_STATS_BATCHES=0
 STOCHASTIC_QUANT=0
 SEMI_INT_GEMM=""
 FP4="none"
+FP16_CALIB=0
+SCALEWISE=0
+FORCE_RECALIB=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -223,6 +226,9 @@ while [[ $# -gt 0 ]]; do
         --semi_int_gemm) SEMI_INT_GEMM="$2"; shift 2 ;;
         --hw_align)    HW_ALIGN=1;         shift   ;;
         --hw_accurate) HW_ACCURATE=1;     shift   ;;
+        --fp16_calib)  FP16_CALIB=1;       shift   ;;
+        --scalewise)   SCALEWISE=1;        shift   ;;
+        --force_recalib) FORCE_RECALIB=1; shift   ;;
         --fp4)         FP4="$2";           shift 2 ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
@@ -436,6 +442,20 @@ if [ "$HW_ACCURATE" == "1" ]; then
     HW_ALIGN_FLAG="--hw_accurate"
 fi
 
+FP16_CALIB_FLAG=""
+if [ "$FP16_CALIB" == "1" ]; then
+    FP16_CALIB_FLAG="--fp16_calib"
+fi
+SCALEWISE_FLAG=""
+if [ "$SCALEWISE" == "1" ]; then
+    SCALEWISE_FLAG="--scalewise"
+    # scalewise implies fp16_calib so the deployment scales are FP16-derived.
+    FP16_CALIB=1
+    FP16_CALIB_FLAG="--fp16_calib"
+fi
+FORCE_RECALIB_FLAG=""
+[ "$FORCE_RECALIB" == "1" ] && FORCE_RECALIB_FLAG="--force_recalib"
+
 R4_STATS_FLAG=""
 if [ -n "$R4_STATS" ]; then
     mkdir -p "$(dirname "$R4_STATS")"
@@ -503,6 +523,8 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ -n "$SEMI_INT_GEMM" ] && TAG_ARGS="${TAG_ARGS} --semi_int_gemm ${SEMI_INT_GEMM}"
 [ "$HW_ALIGN" == "1" ] && TAG_ARGS="${TAG_ARGS} --hw_align"
 [ "$HW_ACCURATE" == "1" ] && TAG_ARGS="${TAG_ARGS} --hw_accurate"
+[ "$FP16_CALIB" == "1" ] && TAG_ARGS="${TAG_ARGS} --fp16_calib"
+[ "$SCALEWISE" == "1" ] && TAG_ARGS="${TAG_ARGS} --scalewise"
 [ "$FP4" != "none" ] && TAG_ARGS="${TAG_ARGS} --fp4 ${FP4}"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -523,6 +545,12 @@ fi
 CAL_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS} --for_cal_cache)
 if [ $? -ne 0 ] || [ -z "$CAL_TAG" ]; then
     CAL_TAG="$QUANT_TAG"  # fallback
+fi
+
+# FP16 calibration cache tag (only flags that affect FP16 act-scales contents)
+FP16_CAL_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS} --for_fp16_cal_cache)
+if [ $? -ne 0 ] || [ -z "$FP16_CAL_TAG" ]; then
+    FP16_CAL_TAG="$CAL_TAG"  # fallback
 fi
 
 # --- Static vs Dynamic check flags ---
@@ -560,7 +588,13 @@ STATIC_ACT_FLAG=""
 STATIC_TAG=""
 if [ "$STATIC_ACT" == "1" ]; then
     ACT_SCALES_DIR="../data/act_scales/${MODEL_NAME}"
-    ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${CAL_TAG}.pt"
+    if [ "$FP16_CALIB" == "1" ]; then
+        # FP16 calibration replaces post-GPTQ calibration; deploy with the
+        # FP16-derived act_scales (filename has __fp16 suffix).
+        ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${FP16_CAL_TAG}__fp16.pt"
+    else
+        ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${CAL_TAG}.pt"
+    fi
     if [ ! -f "$ACT_SCALES_FILE" ]; then
         echo "Static act scales not found at ${ACT_SCALES_FILE}"
         echo "Run calibration first:"
@@ -650,6 +684,9 @@ python main_for_test.py \
     ${STOCHASTIC_QUANT_FLAG} \
     ${SEMI_INT_GEMM_FLAG} \
     ${HW_ALIGN_FLAG} \
+    ${FP16_CALIB_FLAG} \
+    ${SCALEWISE_FLAG} \
+    ${FORCE_RECALIB_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     $([ "$NO_R4" == "1" ] && echo "--no_r4") \
