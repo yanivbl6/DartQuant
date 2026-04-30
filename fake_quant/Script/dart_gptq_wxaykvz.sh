@@ -73,6 +73,9 @@ Options:
   --fp32           Run model in float32 instead of float16 (isolate precision effects)
   --realint        Force real integer quantize/dequantize even at 16 bits
   --fp4 MODE       FP4 weight quantization: all, down, none                (default: none)
+  --gptaq          Closed-form FP-target GPTQ. Implies --fp16_calib;
+                   pre-shifts W by W (C - H) H^-1 from FP-vs-Q activation gap
+                   before the GPTQ Cholesky loop.
   -F               Fast mode (skip lm_eval tasks)
   --very-fast      Very fast mode (skip lm_eval, PPL on wikitext2 only)
   -h               Show this help message
@@ -167,6 +170,7 @@ FP4="none"
 FP16_CALIB=0
 SCALEWISE=0
 FORCE_RECALIB=0
+GPTAQ=0
 
 # --- Parse options ---
 while [[ $# -gt 0 ]]; do
@@ -229,6 +233,7 @@ while [[ $# -gt 0 ]]; do
         --fp16_calib)  FP16_CALIB=1;       shift   ;;
         --scalewise)   SCALEWISE=1;        shift   ;;
         --force_recalib) FORCE_RECALIB=1; shift   ;;
+        --gptaq)         GPTAQ=1;           shift   ;;
         --fp4)         FP4="$2";           shift 2 ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
@@ -456,6 +461,14 @@ fi
 FORCE_RECALIB_FLAG=""
 [ "$FORCE_RECALIB" == "1" ] && FORCE_RECALIB_FLAG="--force_recalib"
 
+GPTAQ_FLAG=""
+if [ "$GPTAQ" == "1" ]; then
+    GPTAQ_FLAG="--gptaq"
+    # GPTAQ requires the FP16 forward trajectory; force --fp16_calib on.
+    FP16_CALIB=1
+    FP16_CALIB_FLAG="--fp16_calib"
+fi
+
 R4_STATS_FLAG=""
 if [ -n "$R4_STATS" ]; then
     mkdir -p "$(dirname "$R4_STATS")"
@@ -525,6 +538,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ "$HW_ACCURATE" == "1" ] && TAG_ARGS="${TAG_ARGS} --hw_accurate"
 [ "$FP16_CALIB" == "1" ] && TAG_ARGS="${TAG_ARGS} --fp16_calib"
 [ "$SCALEWISE" == "1" ] && TAG_ARGS="${TAG_ARGS} --scalewise"
+[ "$GPTAQ" == "1" ] && TAG_ARGS="${TAG_ARGS} --gptaq"
 [ "$FP4" != "none" ] && TAG_ARGS="${TAG_ARGS} --fp4 ${FP4}"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -687,6 +701,7 @@ python main_for_test.py \
     ${FP16_CALIB_FLAG} \
     ${SCALEWISE_FLAG} \
     ${FORCE_RECALIB_FLAG} \
+    ${GPTAQ_FLAG} \
     --kv_ex ${KV_EX} \
     --proj_ex ${PROJ_EX} \
     $([ "$NO_R4" == "1" ] && echo "--no_r4") \

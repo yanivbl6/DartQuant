@@ -20,6 +20,9 @@ class GPTQ:
         self.rows = W.shape[0]
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
+        # GPTAQ cross-correlation X_FP @ X_Q^T (allocated lazily by
+        # add_cross_batch — None ⇒ plain GPTQ path).
+        self.C = None
         self.nsamples = 0
 
     def add_batch(self, inp, out):
@@ -36,6 +39,102 @@ class GPTQ:
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         # self.H += 2 / self.nsamples * inp.matmul(inp.t())
         self.H += inp.matmul(inp.t())
+
+    def add_cross_batch(self, inp_fp, inp_q):
+        """GPTAQ-mode batch update — accumulates both H (= X_Q X_Q^T running
+        mean) and C (= X_FP X_Q^T running mean) in lockstep on a single
+        nsamples bump. Use this INSTEAD of add_batch when running GPTAQ; the
+        two modes must not be mixed for a given GPTQ instance.
+
+        inp_fp/inp_q: same shape ([B, S, in_features] or [B*S, in_features]),
+        same per-sample order — token j of inp_q must be the Q-trajectory
+        counterpart of token j of inp_fp.
+        """
+        if self.C is None:
+            self.C = torch.zeros((self.columns, self.columns), device=self.dev)
+        if len(inp_q.shape) == 2:
+            inp_q = inp_q.unsqueeze(0)
+        if len(inp_fp.shape) == 2:
+            inp_fp = inp_fp.unsqueeze(0)
+        tmp = inp_q.shape[0]
+        assert inp_fp.shape[0] == tmp, \
+            f"FP/Q batch mismatch: {inp_fp.shape[0]} vs {tmp}"
+        if len(inp_q.shape) == 3:
+            inp_q = inp_q.reshape((-1, inp_q.shape[-1]))
+        if len(inp_fp.shape) == 3:
+            inp_fp = inp_fp.reshape((-1, inp_fp.shape[-1]))
+        assert inp_fp.shape == inp_q.shape, \
+            f"FP/Q token mismatch: {inp_fp.shape} vs {inp_q.shape}"
+        inp_q = inp_q.t()
+        inp_fp = inp_fp.t()
+        self.H *= self.nsamples / (self.nsamples + tmp)
+        self.C *= self.nsamples / (self.nsamples + tmp)
+        self.nsamples += tmp
+        scale = math.sqrt(2 / self.nsamples)
+        inp_q_s = scale * inp_q.float()
+        inp_fp_s = scale * inp_fp.float()
+        self.H += inp_q_s.matmul(inp_q_s.t())
+        self.C += inp_fp_s.matmul(inp_q_s.t())
+
+    def pre_shift_fp_target(self, percdamp=0.01):
+        """GPTAQ closed-form pre-shift on self.layer.weight.
+
+        Solves   W' = W + W (C - H) H^-1   so the per-Linear loss
+        ||W·X_FP - W'·X_Q||² is minimised before the GPTQ Cholesky loop
+        runs. See plan: enchanted-stargazing-token.md ("Algorithm").
+
+        Mutates self.layer.weight in place. No-op when self.C is None
+        (GPTAQ inactive) or when add_cross_batch was never called.
+        """
+        if self.C is None or self.nsamples == 0:
+            return
+        # Two views of H: H_raw is the un-regularised statistic that goes
+        # into (C - H); H_reg is the same matrix with NaN scrub + diagonal
+        # floor + percdamp applied, used only for the solve. Mixing them
+        # breaks the identity case (X_FP == X_Q ⇒ C == H_raw ⇒ no shift).
+        H_raw = self.H.clone()
+        C = self.C.clone()
+        nan_axis = torch.isnan(torch.diagonal(H_raw))
+        if nan_axis.any():
+            n_nan = int(nan_axis.sum().item())
+            logging.warning(
+                "GPTAQ pre-shift: %d column(s) contaminated with NaN; isolating",
+                n_nan)
+            H_raw[nan_axis, :] = 0.0
+            H_raw[:, nan_axis] = 0.0
+            H_raw = torch.where(torch.isnan(H_raw),
+                                torch.zeros_like(H_raw), H_raw)
+            C[nan_axis, :] = 0.0
+            C[:, nan_axis] = 0.0
+            C = torch.where(torch.isnan(C), torch.zeros_like(C), C)
+        diag = torch.arange(self.columns, device=self.dev)
+        H_diag = torch.diag(H_raw)
+        diag_pos = H_diag[H_diag > 0]
+        diag_floor = (diag_pos.mean().item() * 1e-3) if diag_pos.numel() > 0 else 1e-8
+        damp = percdamp * torch.mean(H_diag.clamp(min=diag_floor))
+        H_reg = H_raw.clone()
+        H_reg[diag, diag] = torch.maximum(
+            H_reg[diag, diag] + damp,
+            torch.tensor(diag_floor, device=self.dev))
+        # Solve H_reg · Y^T = (C - H_raw)^T  ⇒  Y = (C - H_raw) · H_reg^-1.
+        # NB: (C - H_raw) is what carries the FP/Q gap signal — when the
+        # trajectories agree it is exactly zero and the shift vanishes.
+        M_rhs = (C - H_raw).t()
+        try:
+            Y_t = torch.linalg.solve(H_reg, M_rhs)
+        except torch._C._LinAlgError as exc:
+            logging.warning(
+                "GPTAQ pre-shift: linalg.solve failed (%s); skipping pre-shift",
+                exc)
+            return
+        Y = Y_t.t()
+        W = self.layer.weight.data.float()
+        delta = W @ Y                            # [rows, columns]
+        if torch.isnan(delta).any():
+            logging.warning(
+                "GPTAQ pre-shift: NaN in delta; skipping pre-shift")
+            return
+        self.layer.weight.data = (W + delta).to(self.layer.weight.data.dtype)
 
     def fasterquant(
         self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False,

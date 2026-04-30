@@ -268,6 +268,63 @@ def main():
                             from int_acc_gemm import save_gptq_w_params
                             save_gptq_w_params(model, _adaquant_ckpt)
 
+        elif getattr(args, 'gptaq', False):  # GPTAQ Weight Quantization
+            import gptaq_utils
+            _gptaq_ckpt = None
+            if args.gptq_checkpoint_path:
+                # Parallel directory for GPTAQ caches — distinguishes
+                # FP-target weights from plain GPTQ output.
+                w_suffix = 'w0' if _has_w_bits_map else f'w{args.w_bits}'
+                _gptaq_ckpt = os.path.join(
+                    args.gptq_checkpoint_path.replace(
+                        'gptq_checkpoints', 'gptaq_checkpoints'),
+                    f'{model.model_name}_{w_suffix}',
+                )
+            if (_gptaq_ckpt and os.path.isdir(_gptaq_ckpt) and any(
+                    f.endswith('.pth') for f in os.listdir(_gptaq_ckpt))):
+                logging.info("Loading GPTAQ checkpoint from: %s", _gptaq_ckpt)
+                utils.load_model_in_parts(model, _gptaq_ckpt)
+                if args.w_asym and args.int_gemm:
+                    from int_acc_gemm import load_gptq_w_params
+                    load_gptq_w_params(model, _gptaq_ckpt)
+                logging.info("GPTAQ checkpoint loaded – skipping quantization.")
+            else:
+                assert "llama" in args.model, "Only llama is supported for GPTAQ!"
+                trainloader = data_utils.get_loaders(
+                    args.cal_dataset, nsamples=args.nsamples,
+                    seed=args.seed, model=args.model,
+                    seqlen=model.seqlen, eval_mode=False,
+                )
+                # GPTAQ requires the FP16 act_scales loaded into args so the
+                # downstream scalewise + per-Linear scale lookups work; reuse
+                # the same load path the plain-GPTQ branch uses for scalewise.
+                if (args.act_scales_path
+                        and getattr(args, 'fp16_act_scales', None) is None):
+                    logging.info(
+                        "GPTAQ: loading FP16 act_scales from %s",
+                        args.act_scales_path)
+                    args.fp16_act_scales = torch.load(
+                        args.act_scales_path, map_location='cpu', weights_only=True)
+                quantizers = gptaq_utils.gptaq_fwrd(
+                    model, trainloader, utils.DEV, args)
+                save_dict["w_quantizers"] = quantizers
+                # Auto-save GPTAQ checkpoint (parallel to GPTQ behaviour).
+                if _gptaq_ckpt:
+                    if os.path.isdir(_gptaq_ckpt) and any(
+                            f.endswith('.pth') for f in os.listdir(_gptaq_ckpt)):
+                        logging.info(
+                            "GPTAQ checkpoint already exists (written by "
+                            "another run) – skipping save: %s", _gptaq_ckpt)
+                    else:
+                        os.makedirs(_gptaq_ckpt, exist_ok=True)
+                        logging.info("Saving GPTAQ checkpoint to: %s", _gptaq_ckpt)
+                        utils.save_model_in_parts(
+                            model, _gptaq_ckpt,
+                            prefix=f'{model.model_name}_part')
+                        if args.w_asym and args.int_gemm:
+                            from int_acc_gemm import save_gptq_w_params
+                            save_gptq_w_params(model, _gptaq_ckpt)
+
         elif gptq_strength > 0.0 and _gptq_ckpt and os.path.isdir(_gptq_ckpt) and any(
                 f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
             logging.info("Loading GPTQ checkpoint from: {}".format(_gptq_ckpt))

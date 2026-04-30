@@ -242,6 +242,14 @@ def add_quant_args(parser):
                              'Inline params string to customise '
                              '(e.g., "lr.0.001_ep.20_optWSX_adam_cos")')
 
+    # GPTAQ — closed-form FP-target variant of GPTQ
+    parser.add_argument('--gptaq', action='store_true', default=False,
+                        help='Closed-form GPTAQ: pre-shift W by W (C - H) H^-1 from '
+                             'the FP-vs-Q activation gap, then run GPTQ on the shifted '
+                             'W. Same per-Linear iteration as GPTQ; reuses the GPTQ '
+                             'Cholesky path. Requires --fp16_calib (for the FP forward '
+                             'trajectory).')
+
     # Simulation version (for A/B comparisons, does not affect the run)
     parser.add_argument('--sim_version', type=int, default=0,
                         help='Simulation version tag for A/B comparisons (0=omitted from tag)')
@@ -423,6 +431,12 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False,
         tag += "_adaquant"
         if _aq != 'default':
             tag += f"-{_aq}"
+    # GPTAQ tag — distinguishes the closed-form FP-target variant from plain
+    # GPTQ. Applied to result/GPTQ-cache/post-GPTQ cal tags. Skipped for the
+    # FP16 cal cache (the FP16 cal file is GPTAQ-independent — it's just the
+    # FP-trajectory activation scales).
+    if getattr(args, 'gptaq', False) and not for_fp16_cal_cache:
+        tag += "_gptaq"
     # Simulation version tag (non-gptq only, for A/B comparisons)
     if not for_gptq_cache:
         _sv = getattr(args, 'sim_version', 0)
@@ -545,6 +559,22 @@ def resolve_adaquant_checkpoint_dir(model_path, mode, quant_tag, w_bits, imitate
     )
 
 
+def resolve_gptaq_checkpoint_dir(model_path, mode, quant_tag, w_bits, imitate_gguf=False):
+    """Resolve GPTAQ checkpoint directory (containing .pth files).
+
+    Parallel to resolve_gptq_checkpoint_dir but under data/gptaq_checkpoints/
+    so GPTAQ-quantized weights don't collide with GPTQ checkpoints that share
+    the same quant tag stem.
+    """
+    model_name = model_name_from_path(model_path)
+    w_suffix = 'w0' if imitate_gguf else f'w{w_bits}'
+    return os.path.join(
+        _DATA_DIR, 'gptaq_checkpoints',
+        f'{mode}_{model_name}_{quant_tag}',
+        f'{model_name}_{w_suffix}',
+    )
+
+
 def build_quant_args(args):
     """Serialize parsed quant args back to a CLI arg list for forwarding."""
     cmd = ['-w', str(args.w_bits),
@@ -638,6 +668,8 @@ def build_quant_args(args):
         cmd.append('--scalewise')
     if getattr(args, 'force_recalib', False):
         cmd.append('--force_recalib')
+    if getattr(args, 'gptaq', False):
+        cmd.append('--gptaq')
     _fp4 = getattr(args, 'fp4', 'none')
     if _fp4 != 'none':
         cmd += ['--fp4', _fp4]

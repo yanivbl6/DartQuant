@@ -565,6 +565,12 @@ Examples:
                              'Inline params string to customise '
                              '(e.g., "lr.0.001_ep.20_optWSX_adam_cos")')
 
+    # GPTAQ — closed-form FP-target variant of GPTQ
+    parser.add_argument('--gptaq', action='store_true', default=False,
+                        help='Closed-form GPTAQ: pre-shift W from the FP-vs-Q '
+                             'activation gap before the GPTQ Cholesky loop. '
+                             'Implies --fp16_calib (FP-trajectory inputs).')
+
     # GPU waiting
     parser.add_argument('--wait', action='store_true',
                         help='Wait for a clear GPU (polls nvidia-smi, overrides CUDA_VISIBLE_DEVICES)')
@@ -660,6 +666,12 @@ def main():
     if args.scalewise:
         # scalewise always needs FP16 act_scales available before GPTQ runs.
         args.fp16_calib = True
+    if getattr(args, 'gptaq', False):
+        # GPTAQ requires the FP forward trajectory; --fp16_calib is the
+        # mechanism that makes that available.
+        args.fp16_calib = True
+    if getattr(args, 'gptaq', False) and args.adaquant is not None:
+        raise SystemExit("--gptaq and --adaquant are mutually exclusive.")
 
     # --- Build quant tag (centralized in experiment_config) ---
     quant_tag = cfg.build_quant_tag(args, for_cal_cache=True)
@@ -677,7 +689,11 @@ def main():
     if args.save_path is None:
         args.save_path = f"../data/act_scales/{model_name}/{save_prefix}_{quant_tag}.pt"
     if args.gptq_checkpoint_path is None:
-        args.gptq_checkpoint_path = f"../data/gptq_checkpoints/{save_prefix}_{model_name}_{gptq_cache_tag}"
+        # Route to gptaq_checkpoints/ when --gptaq is set so the FP-target
+        # weights don't collide with plain GPTQ output sharing the same tag.
+        _ckpt_root = ('gptaq_checkpoints' if getattr(args, 'gptaq', False)
+                      else 'gptq_checkpoints')
+        args.gptq_checkpoint_path = f"../data/{_ckpt_root}/{save_prefix}_{model_name}_{gptq_cache_tag}"
     args.fp16_act_scales_path = (
         f"../data/act_scales/{model_name}/{save_prefix}_{fp16_cal_tag}__fp16.pt"
     )
@@ -1100,11 +1116,17 @@ def main():
                 gptq_args.fp4 = getattr(args, 'fp4', 'none')
                 # Scalewise: pre-round combined hwscale inside the GPTQ loop
                 gptq_args.scalewise = getattr(args, 'scalewise', False)
+                gptq_args.gptaq = getattr(args, 'gptaq', False)
                 gptq_args.hwscale_parsed = (
                     quant_utils.parse_gscaler(args.hwscale)
                     if gptq_args.scalewise else None)
+                # GPTAQ also needs the FP16 act_scales (for the scalewise
+                # lookup if --scalewise is on, and for symmetry with the
+                # inference-side load). Pass them whenever the FP16 cal
+                # has been produced this run.
                 gptq_args.fp16_act_scales = (
-                    fp16_act_scales if gptq_args.scalewise else None)
+                    fp16_act_scales
+                    if (gptq_args.scalewise or gptq_args.gptaq) else None)
                 # Forward runtime act-scale grouping so scalewise rounds at
                 # the same granularity as the deployed merged scale
                 # (hw_accurate → per-tensor for non-down-proj layers,
@@ -1112,7 +1134,11 @@ def main():
                 gptq_args.hw_accurate = getattr(args, 'hw_accurate', False)
                 gptq_args.hw_align = getattr(args, 'hw_align', False)
 
-                gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
+                if gptq_args.gptaq:
+                    import gptaq_utils
+                    gptaq_utils.gptaq_fwrd(model, trainloader, 'cuda', gptq_args)
+                else:
+                    gptq_utils.gptq_fwrd(model, trainloader, 'cuda', gptq_args)
 
                 # Guard against parallel runs with the same GPTQ cache tag:
                 # if another process saved while we were running, skip saving.

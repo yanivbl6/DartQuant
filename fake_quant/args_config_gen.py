@@ -243,6 +243,11 @@ def parser_gen():
                         help='Use AdaQuant instead of GPTQ. No value = defaults. '
                              'Inline params string to customise '
                              '(e.g., "lr.0.001_ep.20_optWSX_adam_cos")')
+    parser.add_argument('--gptaq', action='store_true', default=False,
+                        help='Closed-form GPTAQ: pre-shift W by W (C - H) H^-1 from '
+                             'the FP-vs-Q activation gap, then run GPTQ on the shifted '
+                             'W. Requires --fp16_calib (FP-trajectory inputs come from '
+                             'the FP forward of the same calibration set).')
 
     # General Quantization Arguments
     parser.add_argument('--w_bits_down_proj', type=int, default=None,
@@ -364,6 +369,14 @@ def parser_gen():
         parser.error(
             f"--eq, --ud_eq, and --ugd_eq are mutually exclusive "
             f"(got: {', '.join('--' + m for m in _eq_modes)})")
+
+    # --gptaq needs the FP forward trajectory; --fp16_calib is the existing
+    # mechanism that produces it. Refuse the combination if it's missing.
+    if args.gptaq and not (args.fp16_calib or args.scalewise):
+        parser.error("--gptaq requires --fp16_calib (or --scalewise, which "
+                     "implies --fp16_calib)")
+    if args.gptaq and args.adaquant is not None:
+        parser.error("--gptaq and --adaquant are mutually exclusive")
     # --ugd_eq supports both PWL and non-PWL: with --pwl_act the gate factor
     # rides PWL per-channel s_out; without, it's applied via an EqActivation
     # wrapper that divides silu(gate) output by g[c] in fp.
