@@ -107,6 +107,21 @@ class GPTQ:
             C[nan_axis, :] = 0.0
             C[:, nan_axis] = 0.0
             C = torch.where(torch.isnan(C), torch.zeros_like(C), C)
+
+        # Guard 1: skip when (C - H) is at numerical-noise level relative to
+        # H. When trajectories coincide (e.g. block 0, where X_FP == X_Q
+        # exactly) the mathematical shift is zero, but cuBLAS computes A·A^T
+        # and A·B^T via different reduction orders, leaving a tiny residual
+        # that H^-1 then amplifies into a real weight perturbation.
+        CH_norm = (C - H_raw).norm()
+        H_norm = H_raw.norm().clamp(min=1e-12)
+        rel_noise = (CH_norm / H_norm).item()
+        if rel_noise < 1e-3:
+            logging.info(
+                "GPTAQ pre-shift: skip — (C-H)/H rel norm %.2e below 1e-3",
+                rel_noise)
+            return
+
         diag = torch.arange(self.columns, device=self.dev)
         H_diag = torch.diag(H_raw)
         diag_pos = H_diag[H_diag > 0]
@@ -134,6 +149,23 @@ class GPTQ:
             logging.warning(
                 "GPTAQ pre-shift: NaN in delta; skipping pre-shift")
             return
+
+        # Guard 2: cap |delta|/|W| at MAX_REL. Ill-conditioned H (low-rank
+        # along low-activation channels — common in down_proj with 8192-dim
+        # input) makes the solve return a Y whose columns can have large
+        # eigenvalues, and delta = W·Y overwhelms W. Scale the shift down
+        # so the legitimate direction survives without blowing up magnitude.
+        MAX_REL = 0.1
+        delta_norm = delta.norm()
+        W_norm = W.norm().clamp(min=1e-12)
+        rel = (delta_norm / W_norm).item()
+        if rel > MAX_REL:
+            scale = MAX_REL / rel
+            logging.warning(
+                "GPTAQ pre-shift: |delta|/|W|=%.3f > %.2f; scaling by %.3f",
+                rel, MAX_REL, scale)
+            delta = delta * scale
+
         self.layer.weight.data = (W + delta).to(self.layer.weight.data.dtype)
 
     def fasterquant(
