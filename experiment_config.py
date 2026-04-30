@@ -309,16 +309,15 @@ def apply_set_preset(args):
     if getattr(args, 'preset', 0) != 1:
         return
 
-    # Weight quantization → gptaq + fp16_calib + hw_accurate
+    # Weight quantization → gptaq + fp16_calib (hw_accurate moved to act branch
+    # because it operates on static activation scales — no a-quant, no scales).
     if getattr(args, 'w_bits', 16) < 16:
         if not getattr(args, 'gptaq', False):
             args.gptaq = True
         if not getattr(args, 'fp16_calib', False):
             args.fp16_calib = True
-        if not getattr(args, 'hw_accurate', False):
-            args.hw_accurate = True
 
-    # Activation quantization → static + realint + down_bits=16, k=v=kv_ex=8
+    # Activation quantization → static + realint + hw_accurate + down_bits=16, k=v=kv_ex=8
     if getattr(args, 'a_bits', 16) < 16:
         if getattr(args, 'down_bits', None) is None:
             args.down_bits = 16
@@ -331,8 +330,10 @@ def apply_set_preset(args):
             args.static_act = True
         if not getattr(args, 'realint', False):
             args.realint = True
+        if not getattr(args, 'hw_accurate', False):
+            args.hw_accurate = True
     else:
-        # Weight-only (no activation quant): k=v=kv_ex=16, leave realint alone.
+        # Weight-only (no activation quant): k=v=kv_ex=16, leave realint/hw_accurate alone.
         if getattr(args, 'k_bits', 4) == 4:
             args.k_bits = 16
         # v_bits=None → resolves to k_bits=16 via resolve_v_bits

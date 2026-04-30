@@ -269,13 +269,12 @@ esac
 # rule only fires when the target variable is still at its parser default —
 # explicit flags win.
 if [ "$PRESET" = "1" ] && [ "$MODE" != "full" ]; then
-    # Weight quantization → gptaq + fp16_calib + hw_accurate
+    # Weight quantization → gptaq + fp16_calib (hw_accurate is activation-only)
     if [ "$W_BITS" -lt 16 ]; then
         [ "${GPTAQ:-0}" = "0" ] && GPTAQ=1
         [ "${FP16_CALIB:-0}" = "0" ] && FP16_CALIB=1
-        [ "${HW_ACCURATE:-0}" = "0" ] && HW_ACCURATE=1
     fi
-    # Activation quantization → static_act + realint + down_bits=16 + kv_ex=8 + k=v=8
+    # Activation quantization → static_act + realint + hw_accurate + down_bits=16 + kv_ex=8 + k=v=8
     if [ "$A_BITS" -lt 16 ]; then
         [ -z "${DOWN_BITS}" ] && DOWN_BITS=16
         [ "$KV_BITS" = "4" ] && KV_BITS=8
@@ -283,8 +282,9 @@ if [ "$PRESET" = "1" ] && [ "$MODE" != "full" ]; then
         [ "$KV_EX" = "0" ] && KV_EX=8
         [ "${STATIC_ACT:-0}" = "0" ] && STATIC_ACT=1
         [ "${REALINT:-0}" = "0" ] && REALINT=1
+        [ "${HW_ACCURATE:-0}" = "0" ] && HW_ACCURATE=1
     else
-        # Weight-only: k=v=kv_ex=16, leave realint alone
+        # Weight-only: k=v=kv_ex=16, leave realint/hw_accurate alone
         [ "$KV_BITS" = "4" ] && KV_BITS=16
         [ "$KV_EX" = "0" ] && KV_EX=16
     fi
