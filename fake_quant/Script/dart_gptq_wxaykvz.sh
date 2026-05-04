@@ -288,15 +288,24 @@ if [ "$PRESET" = "1" ] && [ "$MODE" != "full" ]; then
         [ "$KV_BITS" = "4" ] && KV_BITS=16
         [ "$KV_EX" = "0" ] && KV_EX=16
     fi
-    # Integer GEMM → acc_block_k follows -G, acc_wrap on
+    # Integer GEMM → acc_wrap on (acc_block_k flip is always-on, see below)
     if [ "${INT_GEMM:-0}" = "1" ]; then
-        [ "$ACC_BLOCK_K" = "32" ] && ACC_BLOCK_K=$GROUPSIZE
         [ "${ACC_WRAP:-0}" = "0" ] && ACC_WRAP=1
     fi
     # hwscale → scalewise (gated; scalewise without hwscale crashes init_scalewise)
     if [ -n "${HWSCALE:-}" ] && [ "${SCALEWISE:-0}" = "0" ]; then
         SCALEWISE=1
     fi
+fi
+
+# --- int_gemm acc_block_k flip (always-on, not preset-gated) ---
+# Mirrors experiment_config.apply_set_preset: with w_groupsize < 32 the default
+# acc_block_k=32 always fails the args_config_gen assert at inference, so
+# silent-correct here. Must run regardless of --set so cal and inference agree
+# on the tag (TAG_ARGS uses the corrected ACC_BLOCK_K).
+if [ "${INT_GEMM:-0}" = "1" ] && [ "$ACC_BLOCK_K" = "32" ] \
+        && [ -n "$GROUPSIZE" ] && [ "$GROUPSIZE" -gt 0 ] && [ "$GROUPSIZE" != "32" ]; then
+    ACC_BLOCK_K=$GROUPSIZE
 fi
 
 # --- Default V_BITS to KV_BITS if not explicitly set ---
@@ -497,9 +506,10 @@ fi
 SCALEWISE_FLAG=""
 if [ "$SCALEWISE" == "1" ]; then
     SCALEWISE_FLAG="--scalewise"
-    # scalewise implies fp16_calib so the deployment scales are FP16-derived.
-    FP16_CALIB=1
-    FP16_CALIB_FLAG="--fp16_calib"
+    # NOTE: scalewise no longer auto-sets FP16_CALIB. FP16 cal still runs
+    # internally (scalewise consumes its scales inside the GPTQ loop), but
+    # whether FP16 vs post-GPTQ scales are deployed at inference is now
+    # purely the user's --fp16_calib choice.
 fi
 FORCE_RECALIB_FLAG=""
 [ "$FORCE_RECALIB" == "1" ] && FORCE_RECALIB_FLAG="--force_recalib"
@@ -507,9 +517,9 @@ FORCE_RECALIB_FLAG=""
 GPTAQ_FLAG=""
 if [ "$GPTAQ" == "1" ]; then
     GPTAQ_FLAG="--gptaq"
-    # GPTAQ requires the FP16 forward trajectory; force --fp16_calib on.
-    FP16_CALIB=1
-    FP16_CALIB_FLAG="--fp16_calib"
+    # NOTE: gptaq no longer auto-sets FP16_CALIB. Same reasoning as scalewise:
+    # FP16 cal runs whenever consumers need it (gptaq's FP-target pre-shift
+    # uses FP16 act_scales), independent of which file is deployed.
 fi
 
 R4_STATS_FLAG=""
@@ -641,16 +651,22 @@ if [ -n "$WEIGHTS_STATS" ]; then
 fi
 
 # --- Static activation scales (after all tag components are finalized) ---
+# Two distinct paths under the new (decoupled) cal flow:
+#   - ACT_SCALES_FILE      = DEPLOYMENT scales loaded into act quantizers.
+#                            FP16 file when --fp16_calib, else post-GPTQ file.
+#   - FP16_ACT_SCALES_FILE = always the FP16 file (consumed by gptaq/scalewise
+#                            inside the GPTQ loop if invoked at inference).
 STATIC_ACT_FLAG=""
 STATIC_TAG=""
+ACT_SCALES_DIR="../data/act_scales/${MODEL_NAME}"
+FP16_ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${FP16_CAL_TAG}__fp16.pt"
+POSTGPTQ_ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${CAL_TAG}.pt"
+FP16_ACT_SCALES_FLAG=""
 if [ "$STATIC_ACT" == "1" ]; then
-    ACT_SCALES_DIR="../data/act_scales/${MODEL_NAME}"
     if [ "$FP16_CALIB" == "1" ]; then
-        # FP16 calibration replaces post-GPTQ calibration; deploy with the
-        # FP16-derived act_scales (filename has __fp16 suffix).
-        ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${FP16_CAL_TAG}__fp16.pt"
+        ACT_SCALES_FILE="${FP16_ACT_SCALES_FILE}"
     else
-        ACT_SCALES_FILE="${ACT_SCALES_DIR}/${SAVE_PREFIX}_${CAL_TAG}.pt"
+        ACT_SCALES_FILE="${POSTGPTQ_ACT_SCALES_FILE}"
     fi
     if [ ! -f "$ACT_SCALES_FILE" ]; then
         echo "Static act scales not found at ${ACT_SCALES_FILE}"
@@ -660,6 +676,11 @@ if [ "$STATIC_ACT" == "1" ]; then
     fi
     STATIC_ACT_FLAG="--act_scales_path ${ACT_SCALES_FILE}"
     STATIC_TAG="static_"
+fi
+# Forward FP16 path whenever the file exists (gptaq/scalewise need it inside
+# the GPTQ loop if running at inference). Independent of --static-act.
+if [ -f "$FP16_ACT_SCALES_FILE" ]; then
+    FP16_ACT_SCALES_FLAG="--fp16_act_scales_path ${FP16_ACT_SCALES_FILE}"
 fi
 
 if [ "$FAST" == "0" ]; then
@@ -720,6 +741,7 @@ python main_for_test.py \
     ${K_ASYM_FLAG} \
     ${V_ASYM_FLAG} \
     ${STATIC_ACT_FLAG} \
+    ${FP16_ACT_SCALES_FLAG} \
     ${PWL_ACT_FLAG} \
     ${INT_GEMM_FLAG} \
     ${SMQ_FLAG} \

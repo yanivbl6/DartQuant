@@ -1,4 +1,5 @@
 import math
+import os
 import time
 import tqdm
 import torch
@@ -85,8 +86,14 @@ class GPTQ:
 
         Mutates self.layer.weight in place. No-op when self.C is None
         (GPTAQ inactive) or when add_cross_batch was never called.
+
+        Set DART_DISABLE_PRESHIFT=1 to ablate the pre-shift entirely
+        (turns gptaq into vanilla GPTQ for diagnostic A/B comparison).
         """
         if self.C is None or self.nsamples == 0:
+            return
+        if os.environ.get('DART_DISABLE_PRESHIFT') == '1':
+            logging.warning("GPTAQ pre-shift: ABLATED via DART_DISABLE_PRESHIFT=1")
             return
         # Two views of H: H_raw is the un-regularised statistic that goes
         # into (C - H); H_reg is the same matrix with NaN scrub + diagonal
@@ -117,10 +124,14 @@ class GPTQ:
         H_norm = H_raw.norm().clamp(min=1e-12)
         rel_noise = (CH_norm / H_norm).item()
         if rel_noise < 1e-3:
-            logging.info(
+            logging.warning(
                 "GPTAQ pre-shift: skip — (C-H)/H rel norm %.2e below 1e-3",
                 rel_noise)
             return
+        # Diagnostic: log the rel_noise when it doesn't trigger the guard
+        # so we can tune the threshold. (warning level so it survives
+        # calibrate_act_scales' default Python logging level.)
+        logging.warning("GPTAQ pre-shift diag: rel_noise=%.4e", rel_noise)
 
         diag = torch.arange(self.columns, device=self.dev)
         H_diag = torch.diag(H_raw)
@@ -159,6 +170,8 @@ class GPTQ:
         delta_norm = delta.norm()
         W_norm = W.norm().clamp(min=1e-12)
         rel = (delta_norm / W_norm).item()
+        # Diagnostic: log every call so we can tune the threshold.
+        logging.warning("GPTAQ pre-shift diag: |delta|/|W|=%.4e", rel)
         if rel > MAX_REL:
             scale = MAX_REL / rel
             logging.warning(

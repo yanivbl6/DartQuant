@@ -84,8 +84,15 @@ def parser_gen():
     parser.add_argument('--a_residual', action=argparse.BooleanOptionalAction, default=False,
                         help='Whether use residual quant for activation quantization (default: False)')
     parser.add_argument('--act_scales_path', type=str, default=None,
-                        help='Path to pre-calibrated activation scales (.pt). '
-                             'When set, static quantization is used instead of dynamic.')
+                        help='Path to pre-calibrated activation scales (.pt) — the '
+                             'DEPLOYMENT scales (FP16 or post-GPTQ depending on '
+                             '--fp16_calib). When set, static quantization is used '
+                             'instead of dynamic.')
+    parser.add_argument('--fp16_act_scales_path', type=str, default=None,
+                        help='Path to FP16 (pre-GPTQ) activation scales (.pt). Always '
+                             'the FP16 file regardless of --fp16_calib. Used by '
+                             'gptaq/scalewise inside the GPTQ loop. Distinct from '
+                             '--act_scales_path which selects deployment scales.')
     parser.add_argument('--selective-dyn', type=str, default=None,
                         help='Comma-separated layer name patterns to force dynamic quantization. '
                              'E.g., "v_proj,o_proj" matches any layer whose name contains those substrings.')
@@ -370,11 +377,11 @@ def parser_gen():
             f"--eq, --ud_eq, and --ugd_eq are mutually exclusive "
             f"(got: {', '.join('--' + m for m in _eq_modes)})")
 
-    # --gptaq needs the FP forward trajectory; --fp16_calib is the existing
-    # mechanism that produces it. Refuse the combination if it's missing.
-    if args.gptaq and not (args.fp16_calib or args.scalewise):
-        parser.error("--gptaq requires --fp16_calib (or --scalewise, which "
-                     "implies --fp16_calib)")
+    # NOTE: --gptaq used to require --fp16_calib, but FP16 cal now runs whenever
+    # gptaq/scalewise/fp16_calib is set (consumer-driven), independent of which
+    # cal file is loaded as deployment scales at inference. So --gptaq alone
+    # (without explicit --fp16_calib) is now a valid combo: FP16 cal still
+    # runs (for the pre-shift), post-GPTQ cal also runs and is deployed.
     if args.gptaq and args.adaquant is not None:
         parser.error("--gptaq and --adaquant are mutually exclusive")
     # --ugd_eq supports both PWL and non-PWL: with --pwl_act the gate factor
@@ -419,6 +426,13 @@ def parser_gen():
     if args.int_gemm:
         assert args.a_bits <= 8, 'Integer GEMM requires activation bits <= 8'
         assert args.w_bits <= 8, 'Integer GEMM requires weight bits <= 8'
+        # Mirror experiment_config.apply_set_preset: when int_gemm is on and
+        # acc_block_k is at the default (32), follow w_groupsize so the kernel
+        # K-block aligns with weight groups. Without this, a runfile that omits
+        # --acc_block_k under int_gemm asserts here even though calibration
+        # (which goes through apply_set_preset) handled it correctly.
+        if args.acc_block_k == 32 and args.w_groupsize > 0 and args.w_groupsize != 32:
+            args.acc_block_k = args.w_groupsize
         if args.w_groupsize > 0:
             assert args.acc_block_k <= args.w_groupsize, (
                 f'acc_block_k ({args.acc_block_k}) must be <= w_groupsize ({args.w_groupsize}) '

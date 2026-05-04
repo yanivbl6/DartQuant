@@ -291,6 +291,24 @@ def calibrate_act_scales(model, dataloader, args):
             qlayer._cal_input = None
             qlayer._cal_output = None
 
+        # OPTION A bits-switch: if k_quantizer was configured at observation-only
+        # bits=16 for FP16 cal (so K passthrough doesn't distort the cal forward),
+        # switch it to args.k_bits BEFORE the save loop. The save loop reads
+        # qtz.bits to compute scale = abs_max / maxq — saving at bits=16 (maxq
+        # 32767) when inference is at bits=8 (maxq 127) would produce a scale
+        # 256× too small → catastrophic clipping. The collector's min/max are
+        # pre-quantization (the QK hook captures before applying k_quantizer),
+        # so they're correct for any target bits.
+        _wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
+        if hasattr(layer.self_attn, _wrapper_attr):
+            _wrap = getattr(layer.self_attn, _wrapper_attr)
+            _kq = _wrap.k_quantizer
+            if (_kq.bits == 16 and getattr(_kq, 'realint', False)
+                    and getattr(args, 'k_bits', 16) < 16):
+                _kq.configure(bits=args.k_bits, groupsize=-1,
+                              sym=not args.k_asym, clip_ratio=args.k_clip_ratio)
+                _kq.realint = True
+
         # Compute scale/zero from collected min/max
         for cname, stats in collectors.items():
             cmin = stats['min']
@@ -497,8 +515,9 @@ Examples:
     # Integer GEMM / Capped Accumulator
     parser.add_argument('--int_gemm', action='store_true',
                         help='Run calibration with integer GEMM active')
-    parser.add_argument('--acc_bits', type=int, default=32,
-                        help='Accumulator bit-width (default: 32 = no capping)')
+    parser.add_argument('--acc_bits', type=int, default=16,
+                        help='Accumulator bit-width (default: 16; matches '
+                             'inference-side default in experiment_config.py)')
     parser.add_argument('--acc_block_k', type=int, default=32,
                         help='K-block size for accumulator capping (default: 32)')
     parser.add_argument('--acc_wrap', action='store_true',
@@ -665,19 +684,21 @@ def main():
     args.o_per_head = (args.mode in ('quarot', 'dart'))
     args.w_clip = True
 
-    # --- Validate scalewise / fp16_calib combinations ---
+    # --- Validate scalewise + hwscale ---
     if args.scalewise and not args.hwscale:
         raise SystemExit(
             "--scalewise requires --hwscale <spec> (the spec to round scales to).")
-    if args.scalewise:
-        # scalewise always needs FP16 act_scales available before GPTQ runs.
-        args.fp16_calib = True
-    if getattr(args, 'gptaq', False):
-        # GPTAQ requires the FP forward trajectory; --fp16_calib is the
-        # mechanism that makes that available.
-        args.fp16_calib = True
     if getattr(args, 'gptaq', False) and args.adaquant is not None:
         raise SystemExit("--gptaq and --adaquant are mutually exclusive.")
+    # FP16 cal is needed when any consumer is on; post-GPTQ cal is needed when
+    # FP16 is not the deployment choice. The new combo (scalewise/gptaq + no
+    # --fp16_calib) runs both.
+    needs_fp16_cal = (args.scalewise
+                      or getattr(args, 'gptaq', False)
+                      or args.fp16_calib)
+    needs_postgptq_cal = not args.fp16_calib
+    args._needs_fp16_cal = needs_fp16_cal
+    args._needs_postgptq_cal = needs_postgptq_cal
 
     # --- Build quant tag (centralized in experiment_config) ---
     quant_tag = cfg.build_quant_tag(args, for_cal_cache=True)
@@ -712,8 +733,10 @@ def main():
     print(f"R2 path:    {args.r2_path}")
     print(f"GPTQ ckpt:  {args.gptq_checkpoint_path}")
     print(f"Save path:  {args.save_path}")
-    if args.fp16_calib or args.scalewise:
+    if needs_fp16_cal:
         print(f"FP16 cal:   {args.fp16_act_scales_path}")
+    if needs_postgptq_cal:
+        print(f"Post-GPTQ cal: {args.save_path}")
     if args.scalewise:
         print(f"Scalewise:  ON (hwscale={args.hwscale})")
     if gguf_path:
@@ -843,7 +866,11 @@ def main():
             bits=layer_input_bits, groupsize=layer_groupsize,
             sym=layer_a_sym, clip_ratio=layer_a_clip, residual=residual)
 
-        if getattr(args, 'realint', False):
+        if getattr(args, 'realint', False) and 'lm_head' not in name:
+            # Skip lm_head: layer_input_bits=16 above + realint=True would mark
+            # its quantizer as "active" without giving it a cal scale (lm_head
+            # is outside the per-layer cal hook scope), tripping the static-
+            # deployment invariant at inference. lm_head is FP at the output.
             qlayers[name].quantizer.realint = True
             # Only set realint on out_quantizer if it was already configured (bits < 16)
             if qlayers[name].out_quantizer.maxq != 0:
@@ -914,11 +941,23 @@ def main():
         eq_module.apply_branch_eq(model, branch_eq_factors)
         print("Branch equalization fully applied (weights + gate-side)")
 
-    # --- Configure output quantization (--quant_out) BEFORE FP16 cal/GPTQ ---
-    # Original placement was post-GPTQ. Pulled forward so the FP16 calibration
-    # phase observes ALL quantizers (out, pre, residual, Q, SMQ). Without this,
-    # the FP16 cal file is missing scales for those layers and inference falls
-    # back to scale=0 → catastrophic outputs.
+    # --- Configure --quant_out / residual / mm / SMQ BEFORE FP16 cal ---
+    # Reason: the FP16 cal pass uses the same per-layer hooks as post-GPTQ
+    # cal, gated on `bits<16 or realint`. To capture observation scales for
+    # out/pre/res/mm during FP16 cal (needed for fp16dep deployments AND
+    # for T2 auto-resolver in any deployment), these quantizers must be
+    # configured BEFORE the FP16 cal forward runs. At bits=16+realint=True
+    # the wrapper engages the quantizer (no-op math at that grid resolution
+    # but with cal hook firing and `_cal_output` set), which is exactly
+    # what observation requires.
+    #
+    # Historical note: this block was previously POST-FP16-cal because it
+    # was thought to cause a 760K PPL regression. The actual cause was the
+    # static-loader applying these scales as static at deployment for
+    # quantizers configured at bits<16 (active fake-quant). At bits=16
+    # (the configuration here), even FP16-distribution scales loaded as
+    # static are essentially a no-op — the 65k-level grid swallows any
+    # cal-vs-deploy distribution drift. So observing in FP16 cal is safe.
     quant_out = getattr(args, 'quant_out', 'none')
     if quant_out != 'none':
         qlayers_qo = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
@@ -935,6 +974,47 @@ def main():
     if quant_utils.needs_residual_quant(quant_out):
         quant_utils.setup_residual_quantizers(model)
 
+    # --- Add K-cache wrapper BEFORE FP16 cal (Option A) ---
+    # k_quantizer / mm.q_quantizer live on the QKRotationWrapper. To capture
+    # their scales during FP16 cal we need the wrapper to exist beforehand.
+    # The wrapper add is non-idempotent (asserts not hasattr), so we move it
+    # here and delete the original post-GPTQ position.
+    #
+    # OPTION A bits-switch: configure k_quantizer at bits=16+realint=True for
+    # FP16 cal (observation-only — pre-quant K min/max are captured by the QK
+    # hook regardless of bits, and at bits=16 the round-trip is a no-op so
+    # subsequent layers still see undistorted FP16 distributions). Right
+    # before the save loop in `calibrate_act_scales`, we switch back to
+    # args.k_bits so the saved scale uses maxq for the inference bit-width.
+    if args.k_bits < 16 or getattr(args, 'realint', False):
+        rope_function_name_kv = model_utils.get_rope_function_name(model)
+        layers_kv = model_utils.get_layers(model)
+        k_quant_config = {
+            'k_bits': args.k_bits, 'k_groupsize': args.k_groupsize,
+            'k_sym': not args.k_asym, 'k_clip_ratio': args.k_clip_ratio,
+            'use_r3': (args.mode in ('quarot', 'dart')) and (args.kv_ex == 0),
+        }
+        for layer in layers_kv:
+            rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
+                layer.self_attn, rope_function_name_kv,
+                config=model.config, **k_quant_config)
+        for layer in layers_kv:
+            wrapper_attr = f'{rope_function_name_kv}_qk_rotation_wrapper'
+            if hasattr(layer.self_attn, wrapper_attr):
+                wrapper = getattr(layer.self_attn, wrapper_attr)
+                if needs_fp16_cal and args.k_bits < 16:
+                    # Observation-only state for FP16 cal forward.
+                    wrapper.k_quantizer.configure(
+                        bits=16, groupsize=-1,
+                        sym=not args.k_asym, clip_ratio=args.k_clip_ratio)
+                    wrapper.k_quantizer.realint = True
+                elif getattr(args, 'realint', False):
+                    wrapper.k_quantizer.realint = True
+
+    # --- mm.q_quantizer setup (--quant_out=mm/ex) BEFORE FP16 cal ---
+    # Wrapper now exists (just added above). q_quantizer at bits=16+realint=True
+    # is both observation AND inference state (no bits-switch needed since
+    # there's no smaller "real" bit-width for q_quantizer in current configs).
     if quant_utils.needs_mm_quant(quant_out):
         layers_mm = model.model.layers
         rope_fn_mm = model_utils.get_rope_function_name(model)
@@ -951,15 +1031,13 @@ def main():
         print(f"Enabled softmax output quantization: {args.smq} bits")
 
     # --- FP16 (pre-GPTQ) activation calibration ---
-    # When --fp16_calib (implied by --scalewise), observe activation min/max
-    # against the FP16 model AFTER rotations/eq but BEFORE weight quantization.
-    # The resulting scales serve two purposes:
-    #   (a) at inference (--fp16_calib path): they are the deployment scales;
-    #   (b) inside scalewise GPTQ: they let GPTQ pre-round
-    #       round_M4S4(group_scale * act_scale) so its Hessian-aware loop
-    #       absorbs scale-rounding error too.
+    # Triggered whenever a consumer needs FP16 scales: scalewise/gptaq use them
+    # inside the GPTQ loop (pre-round combined scale; FP-target pre-shift); and
+    # --fp16_calib uses them as the inference deployment scales. Decoupled
+    # from --fp16_calib so the new combo (scalewise/gptaq + post-GPTQ
+    # deployment) still produces this file for GPTQ consumption.
     fp16_act_scales = None
-    if args.fp16_calib:
+    if needs_fp16_cal:
         if (os.path.exists(args.fp16_act_scales_path)
                 and not args.force_recalib):
             print(f"Loading cached FP16 act_scales from: "
@@ -993,6 +1071,31 @@ def main():
             torch.save(fp16_act_scales, args.fp16_act_scales_path)
             print(f"Saved FP16 act_scales to: {args.fp16_act_scales_path}")
             utils.cleanup_memory(verbos=True)
+
+    # --- Hoisted K-quantizer bits-switch (cache-hit safety) ---
+    # The per-layer switch inside calibrate_act_scales() flips k_quantizer
+    # from bits=16 (FP16-cal observation state) back to args.k_bits before
+    # the save loop. When the FP16 cal cache hits, calibrate_act_scales()
+    # never runs, so the switch never fires — and the post-GPTQ cal forward
+    # below would then run layer 0 with K at bits=16, polluting layer-0
+    # downstream observers (o_proj.input, _attn_res, _mlp_res, mm.q_quantizer)
+    # with stats from a K distribution that doesn't match inference.
+    # Fire the switch once here so the post-GPTQ cal (and GPTQ) start in the
+    # correct K state regardless of cache hit/miss. Idempotent: the per-layer
+    # switch self-disables once bits != 16.
+    if needs_fp16_cal and args.k_bits < 16:
+        rope_fn_kpost = model_utils.get_rope_function_name(model)
+        for layer in model.model.layers:
+            wrapper = getattr(
+                layer.self_attn, f'{rope_fn_kpost}_qk_rotation_wrapper', None)
+            if wrapper is None:
+                continue
+            kq = wrapper.k_quantizer
+            if kq.bits == 16 and getattr(kq, 'realint', False):
+                kq.configure(
+                    bits=args.k_bits, groupsize=-1,
+                    sym=not args.k_asym, clip_ratio=args.k_clip_ratio)
+                kq.realint = True
 
     # --- Weight quantization (GPTQ or AdaQuant) ---
     # Must happen before activation calibration so we measure activations
@@ -1045,7 +1148,7 @@ def main():
                 aq_args.w_bits_map = getattr(args, 'w_bits_map', None)
                 aq_args.int_gemm = getattr(args, 'int_gemm', False)
                 aq_args.a_bits = getattr(args, 'a_bits', 16)
-                aq_args.acc_bits = getattr(args, 'acc_bits', 32)
+                aq_args.acc_bits = getattr(args, 'acc_bits', 16)
                 aq_args.acc_block_k = getattr(args, 'acc_block_k', 32)
                 aq_args.acc_wrap = getattr(args, 'acc_wrap', False)
                 aq_args.int_gemm_use_triton = True
@@ -1110,7 +1213,7 @@ def main():
                 # Forward int_gemm args so GPTQ enables capped accumulator between groups
                 gptq_args.int_gemm = getattr(args, 'int_gemm', False)
                 gptq_args.a_bits = getattr(args, 'a_bits', 16)
-                gptq_args.acc_bits = getattr(args, 'acc_bits', 32)
+                gptq_args.acc_bits = getattr(args, 'acc_bits', 16)
                 gptq_args.acc_block_k = getattr(args, 'acc_block_k', 32)
                 gptq_args.acc_wrap = getattr(args, 'acc_wrap', False)
                 gptq_args.int_gemm_use_triton = True
@@ -1210,32 +1313,13 @@ def main():
 
         print(f"Weight stats written to {ws_path} (effective sparsity: {effective_sparsity:.6f})")
 
-    # Add K-cache quantization wrappers
-    if args.k_bits < 16 or getattr(args, 'realint', False):
-        rope_function_name = model_utils.get_rope_function_name(model)
-        layers = model_utils.get_layers(model)
-        # QKRotationWrapper clamps k_groupsize to a valid divisor of head_dim
-        k_quant_config = {
-            'k_bits': args.k_bits, 'k_groupsize': args.k_groupsize,
-            'k_sym': not args.k_asym, 'k_clip_ratio': args.k_clip_ratio,
-            'use_r3': (args.mode in ('quarot', 'dart')) and (args.kv_ex == 0),
-        }
-        for layer in layers:
-            rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
-                layer.self_attn, rope_function_name,
-                config=model.config, **k_quant_config)
-        if getattr(args, 'realint', False):
-            for layer in layers:
-                wrapper_attr = f'{rope_function_name}_qk_rotation_wrapper'
-                if hasattr(layer.self_attn, wrapper_attr):
-                    getattr(layer.self_attn, wrapper_attr).k_quantizer.realint = True
+    # K-cache wrapper add + mm.q_quantizer setup were moved to BEFORE FP16 cal
+    # (see Option A block above). They're idempotent-incompatible (assert not
+    # hasattr), so we don't re-trigger them here.
 
     # (PWL replacement was moved earlier — before the eq pre-pass and GPTQ —
     #  so cal sees the runtime act_fn and the eq gate-side rescale can ride
     #  PWL per-channel n_q for --ugd_eq + --pwl_act.)
-
-    # (--quant_out / residual / Q quantizer / SMQ setup was moved earlier,
-    #  before FP16 calibration — see block above the FP16-cal phase.)
 
     # --- Enable integer GEMM on ActQuantWrappers ---
     if args.int_gemm:
@@ -1273,18 +1357,49 @@ def main():
             print(f"    done.", flush=True)
         print(f"Integer GEMM prepared for {n_ig} layers", flush=True)
 
-    # (SMQ enable was moved earlier, before FP16 calibration.)
+    # (--quant_out / residual / mm / SMQ setup was done BEFORE FP16 cal —
+    #  see the block above the FP16-cal-phase entry. Both cal passes share
+    #  that single setup so they observe the same quantizer set.)
 
     # --- Post-GPTQ activation calibration ---
-    # When --fp16_calib is set the FP16 act_scales (computed before GPTQ) are
-    # the deployment scales — skip the post-GPTQ calibration entirely.
-    # Also skip if a cached file already exists and --force_recalib is off.
-    if args.fp16_calib:
-        print("--fp16_calib: skipping post-GPTQ activation calibration "
-              "(FP16 act_scales are the deployment scales).")
+    # Runs whenever post-GPTQ scales are the deployment choice (i.e. when
+    # --fp16_calib is OFF). Decoupled from FP16 cal so the new combo
+    # (scalewise/gptaq + post-GPTQ deployment) reaches this branch.
+    if not needs_postgptq_cal:
+        print("--fp16_calib: FP16 act_scales are the deployment scales; "
+              "skipping post-GPTQ activation calibration.")
     elif (os.path.exists(args.save_path) and not args.force_recalib):
         print(f"Cached post-GPTQ act_scales found, reusing: {args.save_path}")
     else:
+        # PROMOTE: when both passes ran, lock pre_quantizer to STATIC mode
+        # using the FP16-derived scales BEFORE the post-GPTQ forward. Without
+        # this, pre_quantizer runs dynamic during cal but static at inference
+        # → matmul output distribution shifts → cal'd out_quantizer scale
+        # clips wrong (the 631K PPL bug bisected on `--quant_out ex` with
+        # both pre_quantizer and out_quantizer active on down_proj).
+        promoted_pre_keys = []
+        if needs_fp16_cal and fp16_act_scales is not None:
+            for li, layer in enumerate(model.model.layers):
+                qlayers = quant_utils.find_qlayers(
+                    layer, layers=[quant_utils.ActQuantWrapper])
+                for name, qlayer in qlayers.items():
+                    pq = qlayer.pre_quantizer
+                    if not (pq.bits < 16 or pq.realint):
+                        continue
+                    qkey = f'model.layers.{li}.{name}.pre_quantizer'
+                    entry = fp16_act_scales.get(qkey)
+                    if entry is None:
+                        continue
+                    pq.scale = entry['scale'].to(next(qlayer.parameters()).device,
+                                                 dtype=torch.float32)
+                    pq.zero = entry['zero'].to(next(qlayer.parameters()).device,
+                                               dtype=torch.float32)
+                    pq.static = True
+                    promoted_pre_keys.append(qkey)
+            if promoted_pre_keys:
+                print(f"PROMOTE: pinned {len(promoted_pre_keys)} pre_quantizer(s) "
+                      f"to static mode with FP16 scales before post-GPTQ cal.")
+
         # --- Get calibration data ---
         dataloader = data_utils.get_loaders(
             args.calib_dataset, nsamples=args.nsamples,
@@ -1293,6 +1408,19 @@ def main():
 
         # --- Run activation scale calibration ---
         act_scales = calibrate_act_scales(model, dataloader, args)
+
+        # --- Overlay FP16 pre_quantizer scales (if PROMOTE ran) ---
+        # The post-GPTQ cal of out_quantizer was done with pre_quantizer in
+        # static mode using FP16 scales. For inference consistency,
+        # pre_quantizer must use those same FP16 scales — so the saved
+        # post-GPTQ file overrides any pre_quantizer entries collected during
+        # phase B with the FP16 values.
+        if promoted_pre_keys and fp16_act_scales is not None:
+            for qkey in promoted_pre_keys:
+                if qkey in fp16_act_scales:
+                    act_scales[qkey] = fp16_act_scales[qkey]
+            print(f"Overlaid {len(promoted_pre_keys)} pre_quantizer scales "
+                  f"from FP16 cal into post-GPTQ dict.")
 
         # --- Include equalization factors in saved output ---
         if eq_factors is not None:

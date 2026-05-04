@@ -306,6 +306,17 @@ def apply_set_preset(args):
     Keep in sync with the bash apply_set_preset block in
     fake_quant/Script/dart_gptq_wxaykvz.sh.
     """
+    # int_gemm acc_block_k flip is always-on (not preset-gated): with
+    # w_groupsize < 32 the default acc_block_k=32 always fails the
+    # args_config_gen assert at inference, so silent-correct it here so cal
+    # and inference compute the same tag (otherwise cal saves without `bk*`
+    # and inference looks up `bk{groupsize}` → file mismatch).
+    if getattr(args, 'int_gemm', False):
+        if (getattr(args, 'acc_block_k', 32) == 32
+                and getattr(args, 'groupsize', 128) > 0
+                and args.groupsize != 32):
+            args.acc_block_k = args.groupsize
+
     if getattr(args, 'preset', 0) != 1:
         return
 
@@ -340,10 +351,8 @@ def apply_set_preset(args):
         if getattr(args, 'kv_ex', 0) == 0:
             args.kv_ex = 16
 
-    # Integer GEMM → acc_block_k follows -G, acc_wrap on
+    # Integer GEMM → acc_wrap on (acc_block_k flip is now always-on, above)
     if getattr(args, 'int_gemm', False):
-        if getattr(args, 'acc_block_k', 32) == 32:
-            args.acc_block_k = getattr(args, 'groupsize', 128)
         if not getattr(args, 'acc_wrap', False):
             args.acc_wrap = True
 
@@ -553,23 +562,42 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False,
         tag += "_FP4"
     elif _fp4 == 'down':
         tag += "_FP4-DOWN"
+    # Deployment-side choice of activation scales: --fp16_calib loads FP16 cal
+    # at inference, otherwise post-GPTQ cal. Both cal artifacts can coexist on
+    # disk under the new (decoupled) cal flow, so two inference runs that
+    # differ only on this flag must produce different result files. Suffix
+    # appears in the result tag only — GPTQ/cal/fp16-cal tags don't depend on
+    # which deployment file is selected.
+    if (getattr(args, 'fp16_calib', False)
+            and not (for_gptq_cache or for_cal_cache or for_fp16_cal_cache)):
+        tag += "_fp16dep"
     return tag
 
 
 def _build_fp16_cal_tag(args):
-    """FP16 calibration tag: only flags that affect the FP16 act_scales contents.
+    """FP16 calibration tag: every flag that affects the contents (and shape)
+    of the FP16 act_scales dict.
 
-    Kept: a/k/v_bits (gate observer placement), eq family (applied pre-cal),
-    fp32 (changes activation dtype seen by hooks). Mode + R1/R2 are encoded
-    by the directory layout (mode prefixed onto the filename) and the
-    rotation matrices loaded before this tag is materialized — they don't
-    need to live in the tag itself.
+    Two kinds of contamination to prevent:
+      (a) Forward-path differences during FP16 cal — the same observer sees a
+          different distribution. Sources: online rotations (R3 via kv_ex,
+          R4 via no_r4), pre-cal weight transforms (GGUF, equalization),
+          pre-cal forward swaps (PWL replaces silu before observers fire).
+      (b) Observer-set differences — the cached file may be missing entries
+          that this run needs. Sources: --quant_out (which out/pre/res/mm
+          quantizers exist), --smq (softmax/k-cache observers),
+          --down_bits=16 (skips the down_proj input observer), --kv_ex /
+          --proj_ex (bit-extended quantizer config).
 
-    Dropped: w_bits, groupsize, sym, w_asym, kv_ex, proj_ex, no_r4, late_rot4,
-    down_bits, oproj_bits, pwl_*, gscaler, hwscale, scalewise, hw_align,
-    hw_accurate, gptq_strength, int_gemm/acc_*, smq, gguf, imitate_gguf, fp4,
-    adaquant, sim_version, quant_out, stochastic_quant, ig_compare,
-    semi_int_gemm, realint.
+    Encoded via flags listed below. R1/R2 are not toggled in current runs
+    (R1 always on for quarot/dart, R2 always offline) so they're skipped per
+    convention; if that ever changes they must be added here.
+
+    Dropped (don't run during FP16 cal forward): w_bits, groupsize, sym,
+    w_asym, w_clip, w_rtn, late_rot4, oproj_bits, gscaler, hwscale,
+    scalewise, hw_align, hw_accurate, gptq_strength, int_gemm/acc_*, fp4,
+    adaquant, sim_version, stochastic_quant, ig_compare, semi_int_gemm,
+    realint.
     """
     parts = [f"a{args.a_bits}k{args.k_bits}v{args.v_bits}"]
     if getattr(args, 'eq', False):
@@ -578,6 +606,54 @@ def _build_fp16_cal_tag(args):
         parts.append("udeq")
     if getattr(args, 'ugd_eq', False):
         parts.append("ugdeq")
+    if getattr(args, 'no_r4', False):
+        parts.append("noR4")
+    # kv_ex carries R3 state — kv_ex>0 disables R3 in main_for_test, so this
+    # flag implicitly encodes whether the attention online R3 Hadamard runs
+    # during cal forward. Also affects k/v cache quantizer config (observers).
+    if getattr(args, 'kv_ex', 0):
+        parts.append(f"kvex{args.kv_ex}")
+    if getattr(args, 'proj_ex', 0):
+        parts.append(f"projex{args.proj_ex}")
+    # down_bits=16 skips the down_proj input observer — different observer
+    # set than down_bits<16. Encode whenever set explicitly.
+    if getattr(args, 'down_bits', None) is not None:
+        parts.append(f"down{args.down_bits}")
+    # PWL replaces silu before FP16 observers fire (calibrate_act_scales:863-877).
+    if getattr(args, 'pwl_act', False):
+        pwl = ["pwl"]
+        if getattr(args, 'pwl_n_segments', 9) != 9:
+            pwl.append(f"{args.pwl_n_segments}p")
+        if getattr(args, 'pwl_input_bits', 16) != 16:
+            pwl.append(f"in{args.pwl_input_bits}")
+        if getattr(args, 'pwl_output_bits', 16) != 16:
+            pwl.append(f"out{args.pwl_output_bits}")
+        if getattr(args, 'pwl_no_hw_sim', False):
+            pwl.append("nohw")
+        parts.append("".join(pwl))
+    # quant_out determines which out/pre/res/mm observers exist
+    # (calibrate_act_scales:921-950 — runs before FP16 cal).
+    _qo = getattr(args, 'quant_out', 'none')
+    if _qo != 'none':
+        parts.append(f"qout-{_qo}")
+    # smq adds softmax/k-cache observers (calibrate_act_scales:952-955).
+    if getattr(args, 'smq', 0) > 0:
+        parts.append(f"smq{args.smq}")
+    # GGUF rewrites weights before any cal — different activations through
+    # FP16 observers. Mirrors build_quant_tag's encoding.
+    if getattr(args, 'gguf', None):
+        gguf_path = resolve_gguf_path(args.gguf, args.model)
+        basename = os.path.basename(gguf_path).replace('.gguf', '')
+        gparts = basename.split('-')
+        qtype = '-'.join(p for p in gparts if p.startswith('Q')) or 'gguf'
+        parts.append(f"gguf-{qtype.replace('_', '-')}")
+    if getattr(args, 'imitate_gguf', None):
+        gguf_path = resolve_gguf_path(args.imitate_gguf, args.model)
+        basename = os.path.basename(gguf_path).replace('.gguf', '')
+        gparts = basename.split('-')
+        first_q = next((i for i, p in enumerate(gparts) if p.startswith('Q')), None)
+        imit_label = '-'.join(gparts[first_q:]) if first_q is not None else 'gguf'
+        parts.append(f"imitate-{imit_label.replace('_', '-')}")
     if getattr(args, 'fp32', False):
         parts.append("FP32")
     return "_".join(parts)

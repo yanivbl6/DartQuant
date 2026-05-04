@@ -296,15 +296,18 @@ def main():
                     seqlen=model.seqlen, eval_mode=False,
                 )
                 # GPTAQ requires the FP16 act_scales loaded into args so the
-                # downstream scalewise + per-Linear scale lookups work; reuse
-                # the same load path the plain-GPTQ branch uses for scalewise.
-                if (args.act_scales_path
+                # downstream scalewise + per-Linear scale lookups work. Use
+                # --fp16_act_scales_path which is always the FP16 file (decoupled
+                # from --fp16_calib's deployment choice). Falls back to
+                # --act_scales_path for backward compatibility.
+                _fp16_path = (getattr(args, 'fp16_act_scales_path', None)
+                              or args.act_scales_path)
+                if (_fp16_path
                         and getattr(args, 'fp16_act_scales', None) is None):
                     logging.info(
-                        "GPTAQ: loading FP16 act_scales from %s",
-                        args.act_scales_path)
+                        "GPTAQ: loading FP16 act_scales from %s", _fp16_path)
                     args.fp16_act_scales = torch.load(
-                        args.act_scales_path, map_location='cpu', weights_only=True)
+                        _fp16_path, map_location='cpu', weights_only=True)
                 quantizers = gptaq_utils.gptaq_fwrd(
                     model, trainloader, utils.DEV, args)
                 save_dict["w_quantizers"] = quantizers
@@ -356,15 +359,18 @@ def main():
                 w_fine_tuning.w_ft(model, trainloader, utils.DEV, args)
             # Scalewise: GPTQ needs the FP16 act_scales to pre-round combined
             # group_scale × act_scale to its M<m>S<s> grid before the GPTQ
-            # column loop. Loaded from the FP16 cal file (args.act_scales_path
-            # is auto-routed to the __fp16.pt file when --fp16_calib is set).
-            if (getattr(args, 'scalewise', False) and args.act_scales_path
+            # column loop. Loaded from --fp16_act_scales_path (always the FP16
+            # file, decoupled from --fp16_calib's deployment choice). Falls back
+            # to --act_scales_path for backward compatibility.
+            _fp16_path = (getattr(args, 'fp16_act_scales_path', None)
+                          or args.act_scales_path)
+            if (getattr(args, 'scalewise', False) and _fp16_path
                     and getattr(args, 'fp16_act_scales', None) is None):
                 logging.info(
                     "scalewise: loading FP16 act_scales for GPTQ pre-rounding from %s",
-                    args.act_scales_path)
+                    _fp16_path)
                 args.fp16_act_scales = torch.load(
-                    args.act_scales_path, map_location='cpu', weights_only=True)
+                    _fp16_path, map_location='cpu', weights_only=True)
             quantizers = gptq_utils.gptq_fwrd(model, trainloader, utils.DEV, args)
             save_dict["w_quantizers"] = quantizers
 
@@ -525,7 +531,10 @@ def main():
                                               clip_ratio=layer_a_clip,
                                               residual=residual)
 
-            if getattr(args, 'realint', False):
+            if getattr(args, 'realint', False) and 'lm_head' not in name:
+                # Skip lm_head: it has bits=16 + no cal-side hook coverage,
+                # so realint=True would mark it active-but-dynamic and trip
+                # the static-deployment invariant. lm_head stays FP.
                 qlayers[name].quantizer.realint = True
                 # Only set realint on out_quantizer if it was already configured (bits < 16)
                 if qlayers[name].out_quantizer.maxq != 0:
@@ -534,7 +543,10 @@ def main():
             # Configure output quantization (--quant_out)
             quant_out = getattr(args, 'quant_out', 'none')
             if quant_out != 'none' and quant_utils.should_quant_out(name, quant_out):
-                # Don't override existing out_quantizer (e.g. v_proj V-cache)
+                # Don't override existing out_quantizer (e.g. v_proj V-cache).
+                # The maxq==0 gate is reliable because GPTQ ckpt save/load
+                # filters ActQuantizer buffers (utils._QUANTIZER_ATTR_NAMES),
+                # so cal-time state never leaks across sessions.
                 if qlayers[name].out_quantizer.maxq == 0:
                     qlayers[name].out_quantizer.configure(bits=16, groupsize=-1, sym=True, clip_ratio=1.0)
                     qlayers[name].out_quantizer.realint = True  # Force actual quant at 16 bits
@@ -704,73 +716,143 @@ def main():
         logging.info("Loading static activation scales from: {}".format(args.act_scales_path))
         act_scales = torch.load(args.act_scales_path, map_location='cpu', weights_only=True)
 
-        # Apply to ActQuantWrapper quantizers (input + output/v_proj)
+        # Apply to ActQuantWrapper quantizers (input + output/v_proj).
+        #
+        # Pattern: when the artifact has an entry, ALWAYS populate scale/zero
+        # (so downstream consumers like resolve_auto_acc_dtype can read them).
+        # Set static=True ONLY when the quantizer is "active" (bits<16 OR
+        # realint). For inactive quantizers (bits=16/realint=False, the
+        # default state), the wrapper's forward short-circuits anyway, so the
+        # populated scale is harmless metadata; T2 auto-resolver still reads
+        # it to derive per-layer frac_bits from the calibrated output magnitude.
+        def _load_active(q, key):
+            """Populate scale/zero from artifact; flip static iff active."""
+            if key in act_scales:
+                q.scale = act_scales[key]['scale']
+                q.zero = act_scales[key]['zero']
+                if q.bits < 16 or q.realint:
+                    q.static = True
+
         qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
         for name, qlayer in qlayers.items():
-            q_key = f'{name}.quantizer'
-            if q_key in act_scales and (qlayer.quantizer.bits < 16 or qlayer.quantizer.realint):
-                qlayer.quantizer.scale = act_scales[q_key]['scale']
-                qlayer.quantizer.zero = act_scales[q_key]['zero']
-                qlayer.quantizer.static = True
+            _load_active(qlayer.quantizer,     f'{name}.quantizer')
+            _load_active(qlayer.out_quantizer, f'{name}.out_quantizer')
+            _load_active(qlayer.pre_quantizer, f'{name}.pre_quantizer')
 
-            oq_key = f'{name}.out_quantizer'
-            if oq_key in act_scales and (qlayer.out_quantizer.bits < 16 or qlayer.out_quantizer.realint):
-                qlayer.out_quantizer.scale = act_scales[oq_key]['scale']
-                qlayer.out_quantizer.zero = act_scales[oq_key]['zero']
-                qlayer.out_quantizer.static = True
-
-            pq_key = f'{name}.pre_quantizer'
-            if pq_key in act_scales and (qlayer.pre_quantizer.bits < 16 or qlayer.pre_quantizer.realint):
-                qlayer.pre_quantizer.scale = act_scales[pq_key]['scale']
-                qlayer.pre_quantizer.zero = act_scales[pq_key]['zero']
-                qlayer.pre_quantizer.static = True
-
-        # Apply to QKRotationWrapper k_quantizers
+        # Apply to QKRotationWrapper k/q quantizers
         layers = model_utils.get_layers(model)
         for i, layer in enumerate(layers):
             rope_fn = model_utils.get_rope_function_name(model)
             wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
             if hasattr(layer.self_attn, wrapper_attr):
                 wrapper = getattr(layer.self_attn, wrapper_attr)
-                kq_key = f'layer.{i}.k_quantizer'
-                if kq_key in act_scales and (wrapper.k_quantizer.bits < 16 or wrapper.k_quantizer.realint):
-                    wrapper.k_quantizer.scale = act_scales[kq_key]['scale']
-                    wrapper.k_quantizer.zero = act_scales[kq_key]['zero']
-                    wrapper.k_quantizer.static = True
-                qq_key = f'layer.{i}.q_quantizer'
-                if qq_key in act_scales and (wrapper.q_quantizer.bits < 16 or wrapper.q_quantizer.realint):
-                    wrapper.q_quantizer.scale = act_scales[qq_key]['scale']
-                    wrapper.q_quantizer.zero = act_scales[qq_key]['zero']
-                    wrapper.q_quantizer.static = True
+                _load_active(wrapper.k_quantizer, f'layer.{i}.k_quantizer')
+                _load_active(wrapper.q_quantizer, f'layer.{i}.q_quantizer')
 
         # Apply to residual quantizers
         for i, layer in enumerate(layers):
             for tag in ('_attn_res_quantizer', '_mlp_res_quantizer'):
                 rq = getattr(layer, tag, None)
                 if rq is not None:
-                    rq_key = f'layer.{i}.{tag}'
-                    if rq_key in act_scales and (rq.bits < 16 or rq.realint):
-                        rq.scale = act_scales[rq_key]['scale']
-                        rq.zero = act_scales[rq_key]['zero']
-                        rq.static = True
+                    _load_active(rq, f'layer.{i}.{tag}')
 
         # Apply to PWLActivation quantizers (if PWL is enabled)
         if args.pwl_act:
             import pwl_utils
-            pwl_modules = pwl_utils.find_pwl_activations(model)
-            for name, pwl_mod in pwl_modules.items():
-                iq_key = f'{name}.input_quantizer'
-                if iq_key in act_scales and (pwl_mod.input_quantizer.bits < 16 or pwl_mod.input_quantizer.realint):
-                    pwl_mod.input_quantizer.scale = act_scales[iq_key]['scale']
-                    pwl_mod.input_quantizer.zero = act_scales[iq_key]['zero']
-                    pwl_mod.input_quantizer.static = True
-                oq_key = f'{name}.output_quantizer'
-                if oq_key in act_scales and (pwl_mod.output_quantizer.bits < 16 or pwl_mod.output_quantizer.realint):
-                    pwl_mod.output_quantizer.scale = act_scales[oq_key]['scale']
-                    pwl_mod.output_quantizer.zero = act_scales[oq_key]['zero']
-                    pwl_mod.output_quantizer.static = True
+            for name, pwl_mod in pwl_utils.find_pwl_activations(model).items():
+                _load_active(pwl_mod.input_quantizer,  f'{name}.input_quantizer')
+                _load_active(pwl_mod.output_quantizer, f'{name}.output_quantizer')
 
         logging.info("Static activation scales applied to all quantizers.")
+
+        # ====================================================================
+        # >>>>>>>>>>>>>>>>>>>>> CRITICAL DEPLOYMENT INVARIANT <<<<<<<<<<<<<<<<<
+        # ====================================================================
+        # Once --act_scales_path is set we are in STATIC deployment. Every
+        # ACTIVE quantizer (bits < 16 OR realint=True) MUST end up with
+        # static=True. A quantizer that silently falls back to DYNAMIC mode
+        # at this point is a HARD FAILURE — its scale is then computed
+        # per-batch from observed activations, NOT from the calibration
+        # artifact, which:
+        #   - invalidates static-deployment results (cal/inference scale
+        #     mismatch — config nominally says "static" but a subset of the
+        #     graph is silently dynamic)
+        #   - breaks T2 auto-resolver (resolve_auto_acc_dtype requires
+        #     static out_quantizer scales — RuntimeError on layer 0)
+        #   - silently passes PPL eval because dynamic quantization produces
+        #     a valid-looking number that has nothing to do with the
+        #     deployment config the user asked for
+        #
+        # HISTORICAL INCIDENT (2026-05-04): the v62 production runs all
+        # silently ran out_quantizer / pre_quantizer / res_quantizer in
+        # DYNAMIC mode because the FP16 cal artifact correctly omits those
+        # entries (post-fix) AND the post-GPTQ cal hooks only fire when
+        # bits<16 or realint=True at cal-time — but the moved-block setup
+        # in calibrate_act_scales.py uses bits=16 (passthrough) for
+        # quant_out=ex layers, so Phase B never observes their output
+        # magnitudes either. Net result: cal files lack out/pre/res entries
+        # and the loader below silently leaves them dynamic. The whole
+        # v62 PPL table was retrospectively INVALIDATED by this discovery.
+        #
+        # If you need dynamic for debug: run WITHOUT --static-act (drop
+        # --act_scales_path). Do NOT add an opt-out flag here — the silence
+        # IS the bug.
+        # ====================================================================
+        _stragglers = []
+        for name, qlayer in qlayers.items():
+            for sub, label in (
+                (qlayer.quantizer, 'quantizer'),
+                (qlayer.out_quantizer, 'out_quantizer'),
+                (qlayer.pre_quantizer, 'pre_quantizer'),
+            ):
+                _active = (sub.bits < 16) or getattr(sub, 'realint', False)
+                if _active and not getattr(sub, 'static', False):
+                    _stragglers.append(f'{name}.{label} (bits={sub.bits}, '
+                                        f'realint={getattr(sub, "realint", False)})')
+        for i, layer in enumerate(layers):
+            rope_fn = model_utils.get_rope_function_name(model)
+            wrapper_attr = f'{rope_fn}_qk_rotation_wrapper'
+            if hasattr(layer.self_attn, wrapper_attr):
+                wrapper = getattr(layer.self_attn, wrapper_attr)
+                for sub, label in ((wrapper.k_quantizer, 'k_quantizer'),
+                                    (wrapper.q_quantizer, 'q_quantizer')):
+                    _active = (sub.bits < 16) or getattr(sub, 'realint', False)
+                    if _active and not getattr(sub, 'static', False):
+                        _stragglers.append(f'layer.{i}.{label} (bits={sub.bits}, '
+                                            f'realint={getattr(sub, "realint", False)})')
+            for tag in ('_attn_res_quantizer', '_mlp_res_quantizer'):
+                rq = getattr(layer, tag, None)
+                if rq is not None:
+                    _active = (rq.bits < 16) or getattr(rq, 'realint', False)
+                    if _active and not getattr(rq, 'static', False):
+                        _stragglers.append(f'layer.{i}.{tag} (bits={rq.bits}, '
+                                            f'realint={getattr(rq, "realint", False)})')
+        if args.pwl_act:
+            import pwl_utils
+            for name, pwl_mod in pwl_utils.find_pwl_activations(model).items():
+                for sub, label in ((pwl_mod.input_quantizer, 'input_quantizer'),
+                                    (pwl_mod.output_quantizer, 'output_quantizer')):
+                    _active = (sub.bits < 16) or getattr(sub, 'realint', False)
+                    if _active and not getattr(sub, 'static', False):
+                        _stragglers.append(f'{name}.{label} (bits={sub.bits}, '
+                                            f'realint={getattr(sub, "realint", False)})')
+        if _stragglers:
+            _msg = (
+                "STATIC DEPLOYMENT INVARIANT VIOLATED: --act_scales_path is "
+                f"set but {len(_stragglers)} active quantizer(s) ended up "
+                "DYNAMIC after static-scale loading. Their scales would be "
+                "computed per-batch at inference, contradicting the "
+                "deployment config. This silently produced INVALID results "
+                "in the v62 production runs (see 2026-05-04 incident "
+                "comment above). Fix the calibration so these entries are "
+                "captured, OR drop --static-act for an explicit dynamic "
+                "debug run.\n\nDynamic stragglers:\n  - "
+                + "\n  - ".join(_stragglers[:20])
+                + (f"\n  ... and {len(_stragglers)-20} more"
+                    if len(_stragglers) > 20 else "")
+            )
+            raise RuntimeError(_msg)
+        logging.info("Static-deployment invariant: all active quantizers verified static.")
 
     # --- Hardware-aligned activation scales: convert ALL static quantizers to per-group ---
     if getattr(args, 'hw_align', False) and args.act_scales_path:

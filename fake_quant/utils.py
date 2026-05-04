@@ -149,6 +149,41 @@ import os
 import logging
 
 
+# ActQuantizer-related attribute names that hold cal-time state. These are
+# registered buffers on ActQuantizer instances embedded inside ActQuantWrapper,
+# QKRotationWrapper, PWLActivation, etc. They MUST NOT persist into the GPTQ
+# checkpoint — the checkpoint stores weights, not cal artifacts. Cal-time
+# state is re-derived each session from the act_scales artifact and the
+# moved-block setup in calibrate_act_scales.py / main_for_test.py.
+#
+# Bug context (2026-05-04): without this filter, a GPTQ checkpoint saved
+# AFTER any calibration step would persist out_quantizer.maxq=32767 (from
+# bits=16+sym=True configure). On load, that maxq buffer would be restored,
+# making the moved-block's `if maxq == 0` gate fail — the gate skips the
+# `realint=True` line, so cal hooks don't fire and the cal artifact silently
+# omits out_quantizer entries. Static-scale loader then leaves quantizers
+# DYNAMIC, contradicting --static-act. The whole v62 PPL table was
+# retrospectively invalidated by this. The fix below cleans both ends:
+# new ckpts get filtered at save (A); pre-existing ckpts get sanitized at
+# load (B). The moved-block can then trust `maxq == 0` again.
+_QUANTIZER_ATTR_NAMES = (
+    'quantizer', 'out_quantizer', 'pre_quantizer',
+    'input_quantizer', 'output_quantizer',
+    'k_quantizer', 'q_quantizer',
+    '_attn_res_quantizer', '_mlp_res_quantizer',
+)
+_QUANTIZER_BUFFER_NAMES = ('maxq', 'scale', 'zero')
+
+
+def _is_quantizer_state(key):
+    """True if state_dict key holds ActQuantizer cal-time buffer state."""
+    parts = key.split('.')
+    for i in range(len(parts) - 1):
+        if parts[i] in _QUANTIZER_ATTR_NAMES and parts[i+1] in _QUANTIZER_BUFFER_NAMES:
+            return True
+    return False
+
+
 def save_model_in_parts(model, save_qmodel_path, prefix='model_part', num_digits=5, target_file_size=10 * 1024**3):
     """
     将模型按文件大小（例如 10GB）分块保存为多个文件。
@@ -158,7 +193,14 @@ def save_model_in_parts(model, save_qmodel_path, prefix='model_part', num_digits
     :param prefix: 文件名前缀（默认 'model_part'）
     :param num_digits: 文件序号的位数（默认 5 位数）
     """
-    state_dict = model.state_dict()
+    # Strip ActQuantizer cal-time buffers from the saved state_dict — see
+    # _QUANTIZER_ATTR_NAMES comment for context.
+    full_sd = model.state_dict()
+    state_dict = {k: v for k, v in full_sd.items() if not _is_quantizer_state(k)}
+    n_filtered = len(full_sd) - len(state_dict)
+    if n_filtered > 0:
+        logging.info(f"save_model_in_parts: filtered {n_filtered}/{len(full_sd)} "
+                     f"ActQuantizer cal-time buffers from checkpoint")
 
     # 计算模型每个参数的大小（根据参数的数据类型自动计算）
     total_size = 0
@@ -210,14 +252,25 @@ def load_model_in_parts(model, folder_path):
     # 获取文件夹中的所有 .pth 文件，按名称排序（确保加载顺序正确）
     model_files = sorted([f for f in os.listdir(folder_path) if f.endswith('.pth')])
 
+    n_total_filtered = 0
     # 逐个加载分块
     with tqdm(total=len(model_files), desc="Loading Model Parts", unit="part") as pbar:
         for file_name in model_files:
             part = torch.load(os.path.join(folder_path, file_name), map_location='cpu')  # 加载分块
+
+            # Strip ActQuantizer cal-time buffers from any pre-A-fix checkpoint
+            # so they don't pollute the live cal-time setup. See
+            # _QUANTIZER_ATTR_NAMES comment in this file.
+            n_before = len(part)
+            part = {k: v for k, v in part.items() if not _is_quantizer_state(k)}
+            n_total_filtered += (n_before - len(part))
 
             model.load_state_dict(part, strict=False)  # 更新模型的参数（实时赋值）
 
             del part  # 释放已加载分块的内存
             pbar.update(1)  # 更新进度条
 
+    if n_total_filtered > 0:
+        logging.info(f"load_model_in_parts: filtered {n_total_filtered} stale "
+                     f"ActQuantizer cal-time buffers from checkpoint at {folder_path}")
     logging.info("模型加载完成。")
