@@ -639,6 +639,12 @@ def main():
     args = parse_args()
     cfg.apply_set_preset(args)
 
+    # Cal collects FP activation distributions; T2 accumulator capping is an
+    # inference-time hardware constraint and must NOT bleed into cal forward.
+    # Without this override, helpers that don't strip --acc_dtype produce
+    # cal artifacts inconsistent with the (no-T2-in-cal) baselines.
+    args.acc_dtype = 'float'
+
     # --- Wait for a clear GPU before any CUDA initialization ---
     if args.wait:
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'utils'))
