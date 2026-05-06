@@ -177,7 +177,8 @@ def add_quant_args(parser):
     parser.add_argument('--acc_wrap', action='store_true',
                         help='Wrap-around instead of saturation')
     parser.add_argument('--acc_dtype', type=str, default='float',
-                        help='Tier-2 accumulator dtype (e.g. fp16, int24)')
+                        help='Tier-2 accumulator dtype (e.g. fp16, int24, int24a0). '
+                             'Prefix with "w" for T2 wraparound (wint24a0).')
     parser.add_argument('--lsb_mac_shift', type=int, default=0,
                         help='Right-shift tl.dot by N bits in LSB int16 kernel (default: 0)')
     parser.add_argument('--t1_msb_scan', action='store_true',
@@ -451,7 +452,7 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False,
         # so the cal file itself CANNOT be captured with intXaY active
         # (circular dep). Strip the t2 tag for cal-cache only in this case;
         # preserve historical per-t2 cal files for manual intNpM / fp16 etc.
-        _is_auto_t2 = bool(re.match(r'^int\d+a\d+$', acc_dtype_str.lower().strip()))
+        _is_auto_t2 = bool(re.match(r'^w?int\d+a\d+$', acc_dtype_str.lower().strip()))
         if (acc_dtype_str.lower().strip() not in ('float', 'fp32')
                 and not (for_cal_cache and _is_auto_t2)):
             parts.append(f"t2{acc_dtype_str}")

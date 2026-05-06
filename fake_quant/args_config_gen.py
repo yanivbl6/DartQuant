@@ -136,6 +136,8 @@ def parser_gen():
     parser.add_argument('--acc_dtype', type=str, default='float',
                         help='Tier-2 accumulator dtype for integer GEMM. '
                              'Accepts int<N> (e.g. int16, int24, int32), float/fp32, half/fp16, bfloat/bf16. '
+                             'Prefix with "w" (e.g. wint24, wint24a0) for two\'s-complement wraparound '
+                             'on T2 overflow instead of saturation. '
                              'Non-float32 requires static activation scales or a16. (default: float)')
     parser.add_argument('--lsb_mac_shift', type=int, default=0,
                         help='Right-shift tl.dot by N bits in LSB int16 kernel (default: 0)')

@@ -38,9 +38,23 @@ def parse_acc_dtype(s):
             resolve_auto_acc_dtype(...) before the first forward so every
             qlayer.acc_dtype is rewritten to a concrete int<N>p<M> /
             int<N>pm<M>.
+    Wrap:   wint<...>    — same as int<...> but the T2 accumulator wraps
+            modulo 2^N at the K-loop boundary instead of saturating. Only
+            valid on int kinds; reject wfloat/wbf16/etc. Use is_wrap_acc_dtype
+            to query the flag. The returned 3-tuple is unchanged from the
+            non-wrap form so all parse_acc_dtype callsites stay agnostic.
     Also:   float/fp32, half/fp16, bfloat/bf16.
     """
     s = s.lower().strip()
+    # Strip optional 'w' wraparound prefix — only legal on int forms.
+    if s.startswith('w'):
+        rest = s[1:]
+        if not rest.startswith('int'):
+            raise ValueError(
+                f"Unknown acc_dtype: '{s}'. The 'w' (wraparound) prefix is "
+                f"only valid on int<N>... forms (got '{s}')."
+            )
+        s = rest
     aliases = {
         'float': ('float', 32, 0), 'fp32': ('float', 32, 0),
         'half': ('float', 16, 0), 'fp16': ('float', 16, 0),
@@ -63,23 +77,30 @@ def parse_acc_dtype(s):
     if m:
         return ('int', int(m.group(1)), 0)
     raise ValueError(
-        f"Unknown acc_dtype: '{s}'. Must be int<N>[p<M>], int<N>pm<M>, "
-        "int<N>a<Y> (e.g. int25, int32p4, int20pm2, int24a1), "
+        f"Unknown acc_dtype: '{s}'. Must be [w]int<N>[p<M>], [w]int<N>pm<M>, "
+        "[w]int<N>a<Y> (e.g. int25, int32p4, wint20pm2, wint24a1), "
         "or float/fp32, half/fp16, bfloat/bf16"
     )
 
 
+def is_wrap_acc_dtype(s):
+    """True iff the dtype string carries the 'w' (T2 wraparound) prefix."""
+    if not isinstance(s, str):
+        return False
+    return s.lower().strip().startswith('wint')
+
+
 def parse_acc_dtype_auto(s):
-    """Return (total_bits, safety_bits) for 'int<N>a<Y>', else None.
+    """Return (total_bits, safety_bits) for 'int<N>a<Y>' or 'wint<N>a<Y>', else None.
 
     The auto form indicates per-layer T1→T2 shift resolution from
     calibration. `safety_bits` is reserved headroom beyond the observed
     output MSB. `total_bits` is the full T2 accumulator width (the X-bit
-    clamp remains in force exactly as for any 'int<N>p<M>' run).
+    clamp/wrap remains in force exactly as for any 'int<N>p<M>' run).
     """
     if not isinstance(s, str):
         return None
-    m = re.match(r'^int(\d+)a(\d+)$', s.lower().strip())
+    m = re.match(r'^w?int(\d+)a(\d+)$', s.lower().strip())
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
@@ -102,6 +123,11 @@ def resolve_auto_acc_dtype(qlayers, total_bits, safety_bits):
             continue
         if 'lm_head' in name:
             continue
+        # Preserve the wraparound prefix when rewriting the dtype string —
+        # qlayer.acc_dtype currently holds the user-supplied 'wint<N>a<Y>' (or
+        # 'int<N>a<Y>') form; the post-rewrite form must keep the same prefix
+        # so the kernel sees the same wrap/saturation choice the user picked.
+        _wrap_prefix = 'w' if is_wrap_acc_dtype(getattr(qlayer, 'acc_dtype', '')) else ''
 
         oq = qlayer.out_quantizer
         # scale may be [N] (per-channel from calibration) or [1] (per-tensor
@@ -180,9 +206,9 @@ def resolve_auto_acc_dtype(qlayers, total_bits, safety_bits):
         # preserves integer range. Warn loudly — this degrades accuracy
         # but beats silent saturation. Encode as int<N>pm<|frac|>.
         if frac_bits >= 0:
-            qlayer.acc_dtype = f'int{total_bits}p{frac_bits}'
+            qlayer.acc_dtype = f'{_wrap_prefix}int{total_bits}p{frac_bits}'
         else:
-            qlayer.acc_dtype = f'int{total_bits}pm{-frac_bits}'
+            qlayer.acc_dtype = f'{_wrap_prefix}int{total_bits}pm{-frac_bits}'
             logging.warning(
                 "[int_acc_auto] %s: negative shift frac_bits=%d — "
                 "%d LSB(s) dropped at T1->T2. abs_max=%.3g, eff_I=%d, "
@@ -250,9 +276,11 @@ if _HAS_TRITON:
         ACC_WRAP: tl.constexpr,     # True = two's-complement wrap-around; False = saturation
         ACC_RANGE: tl.constexpr,    # = ACC_MAX - ACC_MIN + 1 (= 2^acc_bits)
         # Tier-2 accumulator dtype control
-        T2_IS_INT: tl.constexpr,    # True = integer tier-2 (simulated via clamp)
+        T2_IS_INT: tl.constexpr,    # True = integer tier-2 (simulated via clamp/wrap)
         T2_MAX: tl.constexpr,       # tier-2 int clamp max (ignored if T2_IS_INT=False)
         T2_MIN: tl.constexpr,       # tier-2 int clamp min (ignored if T2_IS_INT=False)
+        T2_WRAP: tl.constexpr,      # True = wrap modulo 2^bits at end of K-loop; False = saturate per step
+        T2_RANGE: tl.constexpr,     # = T2_MAX - T2_MIN + 1 (only used when T2_WRAP)
         T2_IS_FP16: tl.constexpr,   # True = fp16 tier-2
         T2_IS_BF16: tl.constexpr,   # True = bfloat16 tier-2
         # Fixed-point fractional bits for integer tier-2 (int32p4 → 4)
@@ -380,8 +408,13 @@ if _HAS_TRITON:
                 scaled = contrib * T2_FRAC_SCALE
                 # Round-to-nearest (not truncate) for faithful fixed-point
                 acc += (scaled + tl.where(scaled >= 0, 0.5, -0.5)).to(tl.int32)
-                # Clamp to tier-2 accumulator range
-                acc = tl.minimum(tl.maximum(acc, T2_MIN), T2_MAX)
+                if T2_WRAP:
+                    # Wrap-mode: skip the per-step clamp. The int32 accumulator
+                    # carries full precision; a single modulo at end of K-loop
+                    # brings it back into the simulated bit-width.
+                    pass
+                else:
+                    acc = tl.minimum(tl.maximum(acc, T2_MIN), T2_MAX)
             elif T2_IS_FP16:
                 acc += contrib.to(tl.float16)
             elif T2_IS_BF16:
@@ -392,6 +425,14 @@ if _HAS_TRITON:
             # Advance pointers
             a_ptrs += ACC_BLOCK_K * stride_ak
             b_ptrs += ACC_BLOCK_K * stride_bk
+
+        # T2 wraparound: apply the modulo once after the K-loop, while still
+        # in int32 storage. Cast constexprs to int32 explicitly to dodge the
+        # uint32 inference Triton applies to large positive constexprs.
+        if T2_IS_INT and T2_WRAP:
+            _T2_MIN_I32 = tl.full((1,), T2_MIN, dtype=tl.int32)
+            _T2_RANGE_I32 = tl.full((1,), T2_RANGE, dtype=tl.int32)
+            acc = ((acc - _T2_MIN_I32) % _T2_RANGE_I32 + _T2_RANGE_I32) % _T2_RANGE_I32 + _T2_MIN_I32
 
         # Convert to float, then undo frac bits and gscaler prescaling together.
         # Reverses the in-loop shift for all signs: positive T2_FRAC_BITS scales
@@ -534,6 +575,8 @@ def int_gemm_capped_reference(
     # Tier-2 accumulator setup
     t2_dtype, t2_clamp_max, t2_clamp_min = _t2_acc_dtype_info(acc_dtype)
     t2_is_int = t2_clamp_max is not None
+    t2_wrap = is_wrap_acc_dtype(acc_dtype) and t2_is_int
+    t2_range = (t2_clamp_max - t2_clamp_min + 1) if t2_is_int else 0
     _, _, t2_frac_bits = parse_acc_dtype(acc_dtype)
     # 2^t2_frac_bits, sign-agnostic. Negative frac_bits yields 2^-|N| < 1
     # → in-loop right-shift; zero → pass-through (1.0).
@@ -593,9 +636,14 @@ def int_gemm_capped_reference(
             # precision; negative shift physically right-shifts the partial
             # (drops LSBs) before the T2 add; zero is a pass-through.
             output += (contrib * t2_frac_scale).round().long()
-            output = output.clamp(t2_clamp_min, t2_clamp_max)
+            if not t2_wrap:
+                output = output.clamp(t2_clamp_min, t2_clamp_max)
         else:
             output += contrib.to(t2_dtype)
+
+    # T2 wraparound: apply the modulo once after the K-loop while still in int.
+    if t2_wrap:
+        output = (output - t2_clamp_min) % t2_range + t2_clamp_min
 
     # Convert to float, then undo frac bits and gscaler prescaling together.
     # Sign-agnostic: positive total_shift scales down; negative scales up.
@@ -939,15 +987,39 @@ def _triton_int_gemm(
     # tl.minimum/tl.maximum constexprs survive float32 promotion in Triton.
     _F32_SAFE = 2 ** 30
 
-    acc_max = min(2 ** (acc_bits - 1) - 1, _F32_SAFE)
-    acc_min = -acc_max
-    acc_range = acc_max - acc_min + 1
+    # [fixed v681] Proper two's-complement signed range (asymmetric:
+    # min = -2^(N-1)) so the T1 wrap modulo divisor matches the reference
+    # impl. Prior code used `acc_min = -acc_max` (symmetric), which produced
+    # an off-by-1 range and made Triton/ref diverge by thousands at small
+    # acc_bits when ACC_WRAP was on. _F32_SAFE clamps the constexprs into
+    # the fp32-promotable region; bits>30 retains the same approximation T1
+    # has always carried at acc_bits=32.
+    _true_acc_max = 2 ** (acc_bits - 1) - 1
+    _true_acc_min = -(2 ** (acc_bits - 1))
+    acc_max = min(_true_acc_max, _F32_SAFE)              # [fixed v681]
+    acc_min = max(_true_acc_min, -_F32_SAFE)             # [fixed v681]
+    acc_range = acc_max - acc_min + 1                    # [fixed v681]
 
-    # Tier-2 accumulator constexprs
+    # Tier-2 accumulator constexprs.
+    # [fixed v681] Use proper two's-complement signed range
+    # (asymmetric: min=-2^(N-1)) so the T2 wrap-modulo divisor matches the
+    # reference impl. Prior code used `t2_min = -t2_max` (symmetric), which
+    # silently disagreed with the reference and made wint<N> Triton/ref
+    # parity diverge by hundreds at small bit widths. For bits>30 the
+    # _F32_SAFE clip kicks in and we accept the same approximation T1 has.
     t2_kind, t2_bits, t2_frac_bits = parse_acc_dtype(acc_dtype)
     t2_is_int = (t2_kind == 'int')
-    t2_max = min(2 ** (t2_bits - 1) - 1, _F32_SAFE) if t2_is_int else 0
-    t2_min = -t2_max if t2_is_int else 0
+    if t2_is_int:
+        _true_max = 2 ** (t2_bits - 1) - 1
+        _true_min = -(2 ** (t2_bits - 1))
+        t2_max = min(_true_max, _F32_SAFE)               # [fixed v681]
+        t2_min = max(_true_min, -_F32_SAFE)              # [fixed v681]
+        t2_range = t2_max - t2_min + 1                   # [fixed v681]
+    else:
+        t2_max = 0
+        t2_min = 0
+        t2_range = 0
+    t2_wrap = is_wrap_acc_dtype(acc_dtype) and t2_is_int
     t2_is_fp16 = (t2_kind == 'float' and t2_bits == 16)
     t2_is_bf16 = (t2_kind == 'bfloat')
     output = torch.empty(M, N, dtype=torch.float32, device=a_int.device)
@@ -1014,6 +1086,8 @@ def _triton_int_gemm(
         T2_IS_INT=t2_is_int,
         T2_MAX=t2_max,
         T2_MIN=t2_min,
+        T2_WRAP=t2_wrap,
+        T2_RANGE=t2_range,
         T2_IS_FP16=t2_is_fp16,
         T2_IS_BF16=t2_is_bf16,
         T2_FRAC_BITS=t2_frac_bits,
@@ -1037,7 +1111,9 @@ def _triton_int_gemm(
 # ---------------------------------------------------------------------------
 # D. Weight preparation — extract int8 + scales from fake-quantized weights
 # ---------------------------------------------------------------------------
-def _recover_int_and_scale(W_fq: torch.Tensor, maxq: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def _recover_int_and_scale(W_fq: torch.Tensor, maxq: int,
+                            nvfp4: bool = False
+                            ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Recover integer representation and scale from fake-quantized weights.
 
     Symmetric quantization maps integers in ``[-(maxq+1), maxq]`` (e.g.
@@ -1050,10 +1126,16 @@ def _recover_int_and_scale(W_fq: torch.Tensor, maxq: int) -> Tuple[torch.Tensor,
     ``abs_max / (maxq + 1)`` — and keeping the one with smaller round-trip
     reconstruction error per row.
 
+    For ``nvfp4`` the level set is ``{0, ±1, ±2, ±3, ±4, ±6, ±8, ±12}`` and
+    the canonical scale is ``abs_max / 12``. Recovery clamps to ``[-12, 12]``
+    (the codes are still int8-storable) and uses just one candidate scale,
+    since FP4 has no MSE shrink path.
+
     Parameters
     ----------
     W_fq : [N, G] fake-quantized weight slice (float)
-    maxq : positive half of the symmetric range (e.g. 7 for 4-bit)
+    maxq : positive half of the symmetric range (7 for int4 sym, 12 for FP4)
+    nvfp4 : when True, use FP4 single-candidate recovery (clamp [-12, 12])
 
     Returns
     -------
@@ -1061,6 +1143,12 @@ def _recover_int_and_scale(W_fq: torch.Tensor, maxq: int) -> Tuple[torch.Tensor,
     scale : [N, 1] float32 per-row scale
     """
     abs_max = W_fq.abs().amax(dim=1, keepdim=True).clamp(min=1e-10)
+
+    if nvfp4:
+        # FP4 has no MSE-shrink path → single candidate scale.
+        scale = abs_max / maxq
+        q = torch.clamp(torch.round(W_fq / scale), -maxq, maxq)
+        return q.to(torch.int8), scale
 
     # Candidate A: assume max absolute integer is maxq (common case)
     scale_a = abs_max / maxq
@@ -1278,8 +1366,15 @@ def prepare_int_weights(
         return w_int, w_scale, w_zp
 
     # --- Fallback: re-derive scale/zero from fake-quantized values ---
-    logging.info("  prepare_int_weights: RECOVERY path (w_sym=%s, w_bits=%d)", w_sym, w_bits)
-    if w_sym:
+    logging.info("  prepare_int_weights: RECOVERY path (w_sym=%s, w_bits=%d, nvfp4=%s)",
+                 w_sym, w_bits, nvfp4)
+    if nvfp4:
+        # FP4: codes ∈ {0,±1,±2,±3,±4,±6,±8,±12}, scale = amax / 12.
+        # Recovery clamps to [-12, 12]; mismatches are an upstream bug.
+        maxq = 12
+        recover_fn = lambda W_, _maxq: _recover_int_and_scale(
+            W_, _maxq, nvfp4=True)
+    elif w_sym:
         maxq = 2 ** (w_bits - 1) - 1
         recover_fn = _recover_int_and_scale
     else:

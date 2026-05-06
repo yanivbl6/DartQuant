@@ -523,7 +523,8 @@ Examples:
     parser.add_argument('--acc_wrap', action='store_true',
                         help='Use wrap-around instead of saturation on accumulator overflow')
     parser.add_argument('--acc_dtype', type=str, default='float',
-                        help='Tier-2 accumulator dtype (e.g. fp16, int24). Default: float')
+                        help='Tier-2 accumulator dtype (e.g. fp16, int24, int24a0). '
+                             'Prefix with "w" (e.g. wint24a0) for T2 wraparound. Default: float')
     parser.add_argument('--lsb_mac_shift', type=int, default=0,
                         help='Right-shift tl.dot by N bits in LSB int16 kernel (default: 0)')
     parser.add_argument('--t1_msb_scan', action='store_true',

@@ -854,7 +854,7 @@ class ActQuantWrapper(torch.nn.Module):
         # and undo via integer right-shift after the loop, BEFORE the gscaler
         # float multiply.  They are NOT folded into w_scale prescaling.
         if (gscaler_parsed is not None and gscaler_parsed['bias'] >= 1
-                and acc_dtype.startswith('int')):
+                and (acc_dtype.startswith('int') or acc_dtype.startswith('wint'))):
             self.w_shift_bias = gscaler_parsed['bias']
             self.w_scale = self.w_scale * (2.0 ** self.w_shift_bias)
         else:

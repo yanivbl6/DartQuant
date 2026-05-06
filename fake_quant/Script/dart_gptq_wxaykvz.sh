@@ -55,7 +55,7 @@ Options:
   --acc_bits N         Accumulator bit-width                         (default: 16)
   --acc_block_k N      K-block size for accumulator capping          (default: 32)
   --acc_wrap           Use wrap-around instead of saturation on overflow
-  --acc_dtype S        Tier-2 accumulator dtype (e.g. fp16, int24)     (default: float)
+  --acc_dtype S        Tier-2 accumulator dtype (fp16/int24/int24a0; w-prefix wraps) (default: float)
   --lsb_mac_shift N    Right-shift tl.dot by N bits in LSB int16 kernel (default: 0)
   --t1_msb_scan        Diagnostic: detect tier-1 accumulator overflow per layer
   --quant_out MODE Output quantization: none, up, mlp, spec, speco, all, r4, res, mm, ex

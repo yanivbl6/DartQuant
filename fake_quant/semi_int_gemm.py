@@ -34,6 +34,7 @@ import torch
 
 from int_acc_gemm import (
     parse_acc_dtype,
+    is_wrap_acc_dtype,
     _decompose_int16_to_int8,
 )
 
@@ -392,6 +393,8 @@ def _semi_int_kloop(
     # Tier-2 accumulator setup
     t2_dtype, t2_clamp_max, t2_clamp_min = _t2_acc_dtype_info(acc_dtype)
     t2_is_int = t2_clamp_max is not None
+    t2_wrap = is_wrap_acc_dtype(acc_dtype) and t2_is_int
+    t2_range = (t2_clamp_max - t2_clamp_min + 1) if t2_is_int else 0
     _, _, t2_frac_bits = parse_acc_dtype(acc_dtype)
     t2_frac_scale = 2.0 ** t2_frac_bits  # sign-agnostic (supports int<N>pm<M>)
 
@@ -460,9 +463,14 @@ def _semi_int_kloop(
         if _bit(mask, MASK_T2_INT) and t2_is_int:
             # Sign-agnostic scale: + frac_bits = left-shift, - frac_bits = right-shift.
             output += (contrib * t2_frac_scale).round().long()
-            output = output.clamp(t2_clamp_min, t2_clamp_max)
+            if not t2_wrap:
+                output = output.clamp(t2_clamp_min, t2_clamp_max)
         else:
             output += contrib.to(output.dtype)
+
+    # T2 wraparound: apply once after the K-loop while still in int storage.
+    if t2_wrap and _bit(mask, MASK_T2_INT):
+        output = (output - t2_clamp_min) % t2_range + t2_clamp_min
 
     # Convert to float, undo shifts (sign-agnostic).
     total_shift = t2_frac_bits + w_shift_bias
