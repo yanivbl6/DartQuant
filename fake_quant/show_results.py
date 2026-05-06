@@ -253,19 +253,39 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
         return None
 
     # ── Group non-full runs by key value ───────────────────────────────
-    groups = defaultdict(list)  # {key_value_or_None: [run_idx]}
-    for i, (label, data, rmode, path) in enumerate(runs):
-        if rmode == "full":
-            continue
-        token = _get_key_token(path)
-        if mode == "binary":
-            groups[cmp_lower if token else None].append(i)
-        elif mode == "wildcard":
-            # Track both matched tokens and vanilla (no-match) runs
-            groups[token].append(i)
-        else:
-            if token is not None:
-                groups[token].append(i)
+    def _build_groups():
+        g = defaultdict(list)
+        for i, (label, data, rmode, path) in enumerate(runs):
+            if rmode == "full":
+                continue
+            token = _get_key_token(path)
+            if mode == "binary":
+                g[cmp_lower if token else None].append(i)
+            elif mode == "wildcard":
+                g[token].append(i)
+            else:
+                if token is not None:
+                    g[token].append(i)
+        return g
+
+    groups = _build_groups()
+
+    # Variant mode falls back to binary when the only tokens that matched
+    # the prefix pattern is the literal compare_expr itself — i.e. there is
+    # no real "variant suffix" to compare across, just presence-vs-absence.
+    # Catches expressions like ``FP4-DOWN`` where the dash triggers variant
+    # mode but the user actually wants binary semantics.
+    if mode == "variant":
+        matched_tokens = {k for k in groups if k is not None}
+        if matched_tokens <= {cmp_lower}:
+            literal_pattern = re.compile(
+                f'^{re.escape(compare_expr)}$', re.IGNORECASE)
+            if any(literal_pattern.match(t)
+                   for _, _, rmode, path in runs if rmode != "full"
+                   for t in _norm_base(path).split('_')):
+                mode = "binary"
+                key_pattern = literal_pattern
+                groups = _build_groups()
 
     # For wildcard mode, baseline = vanilla (None); for others, baseline = cmp_lower
     baseline_key = None if mode == "wildcard" else cmp_lower
