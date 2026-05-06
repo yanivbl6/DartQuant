@@ -265,7 +265,7 @@ def parse_runfile_for_calibration(path, recalib=False):
                 and not getattr(line_args, 'static_act', False)):
             continue
 
-        quant_tag = cfg.build_quant_tag(line_args)
+        quant_tag = cfg.build_quant_tag(line_args, for_cal_cache=True)
         key = (mode, quant_tag)
 
         if key not in groups:
