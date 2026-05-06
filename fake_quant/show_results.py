@@ -88,6 +88,50 @@ def color_val(val, best, worst, fmt=".2f", is_ppl=False):
 
 _MODE_COLORS = {"full": CYAN, "baseline": YELLOW, "quarot": MAGENTA, "dart": GREEN}
 
+
+def parse_viz(spec):
+    """Parse a comma-separated key=value visualization-tunables list into a dict.
+
+    Open-ended extension point for figure rendering only — must NOT influence
+    filtering, comparison, or table output. Add new keys as visualization
+    knobs are added; document each in dart-visualize-results SKILL.md.
+
+    Currently recognized keys:
+      ymin=<float>       manual y-axis lower bound (all panels)
+      ymax=<float>       manual y-axis upper bound (all panels)
+      ppl_ymin=<float>   PPL-panel-only y-axis lower bound (overrides ymin on PPL)
+      ppl_ymax=<float>   PPL-panel-only y-axis upper bound (overrides ymax on PPL)
+      acc_ymin=<float>   accuracy-panel-only y-axis lower bound (overrides ymin on acc)
+      acc_ymax=<float>   accuracy-panel-only y-axis upper bound (overrides ymax on acc)
+
+    Values auto-coerce: 'true'/'false' → bool, otherwise int → float → str.
+    """
+    if not spec:
+        return {}
+    out = {}
+    for kv in spec.split(","):
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        k, v = k.strip().lower(), v.strip()
+        if not k:
+            continue
+        if v.lower() in ("true", "yes", "1"):
+            out[k] = True
+        elif v.lower() in ("false", "no", "0"):
+            out[k] = False
+        else:
+            for cast in (int, float):
+                try:
+                    out[k] = cast(v)
+                    break
+                except ValueError:
+                    continue
+            else:
+                out[k] = v
+    return out
+
+
 # Metric keyword aliases for --draw (lowercase key → column header)
 _METRIC_ALIASES = {
     "wikitext": "PPL↓ wikitext2", "wikitext2": "PPL↓ wikitext2", "wiki": "PPL↓ wikitext2",
@@ -334,8 +378,10 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
 
     # baseline_key may have been updated (fallback to first matched value)
     bl_display = no_label if baseline_key is None else baseline_key
-    # File-safe version of the expression (replace * with ____ for filenames)
-    file_label = cmp_lower.replace('*', '____')
+    # File-safe version of the expression (replace * with -any for filenames).
+    # Avoid runs of underscores — markdown renderers parse `____` as emphasis
+    # and break clickable links to figure files.
+    file_label = cmp_lower.replace('*', '-any')
     return {
         "baseline_value": bl_display,
         "file_label": file_label,
@@ -375,28 +421,38 @@ def _collect_metric_values(configs, matrix, col_idx):
     return vals
 
 
-def _set_focused_ylim(ax, vals, ppl_col):
+def _set_focused_ylim(ax, vals, ppl_col, viz=None):
     """Set y-axis limits focused on the actual data range.
 
     For PPL columns, the range is fixed to [floor(min, 2 decimals),
     floor(min, 2 decimals) + 10], with the axis inverted so lower (better)
-    sits at the top.
+    sits at the top. Manual override via viz['ymin'] / viz['ymax']; either
+    or both may be set, and PPL-axis inversion is preserved.
     """
     if not vals:
         return
     vmin, vmax = min(vals), max(vals)
+    viz = viz or {}
+    ymin_global = viz.get("ymin")
+    ymax_global = viz.get("ymax")
     if ppl_col:
         import math
         floored = math.floor(vmin/5)*5
         floored2 = math.floor(vmax/5+1)*5
         if (floored2 > floored + 20):
             floored2 = floored + 10
-        
-
-        ax.set_ylim(floored2, floored)
+        ymin_override = viz.get("ppl_ymin", ymin_global)
+        ymax_override = viz.get("ppl_ymax", ymax_global)
+        lo = ymin_override if ymin_override is not None else floored
+        hi = ymax_override if ymax_override is not None else floored2
+        ax.set_ylim(hi, lo)  # inverted: lower PPL = top
     else:
         margin = max((vmax - vmin) * 0.3, 0.01)
-        ax.set_ylim(vmin - margin, vmax + margin)
+        ymin_override = viz.get("acc_ymin", ymin_global)
+        ymax_override = viz.get("acc_ymax", ymax_global)
+        lo = ymin_override if ymin_override is not None else (vmin - margin)
+        hi = ymax_override if ymax_override is not None else (vmax + margin)
+        ax.set_ylim(lo, hi)
 
 
 def _make_title(col_header, baseline_value, common_sub):
@@ -469,7 +525,7 @@ def _save_summary_figure(specs, fig_dir, file_label):
 
 def _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                       baseline_value, key_colors, col_header, common_sub,
-                      short_labels):
+                      short_labels, viz=None):
     """Render a clustered bar chart for one metric into the given Axes."""
     n_keys = len(key_values)
     bar_width = 0.8 / n_keys
@@ -501,7 +557,7 @@ def _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                 bars.append((x, val))
 
     _set_focused_ylim(ax, _collect_metric_values(configs, matrix, col_idx),
-                      ppl_col)
+                      ppl_col, viz=viz)
 
     for x, val in bars:
         ax.text(x, val, f'{val:.2f}', ha='center', va='bottom', fontsize=9)
@@ -518,74 +574,108 @@ def _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
 
 def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
                     baseline_value, key_colors, col_header, common_sub,
-                    short_labels, fig_dir, metric_kw, file_label=None):
+                    short_labels, fig_dir, metric_kw, file_label=None,
+                    viz=None):
     """Draw and save a clustered bar chart for one metric."""
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(max(6, len(configs) * 1.5 + 2), 5))
     _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                       baseline_value, key_colors, col_header, common_sub,
-                      short_labels)
+                      short_labels, viz=viz)
     fig.tight_layout()
     return _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value,
                      "bar", subdir="subfigures")
 
 
 def _line_chart_x_nums(key_values, wildcard_capture):
-    """Resolve numeric x-values for a line chart, or None if any are non-numeric."""
+    """Resolve numeric x-values for a line chart.
+
+    Returns a list (same length as key_values) where non-numeric entries are
+    None — the renderer skips those points on the line and may render the
+    baseline (e.g. "vanilla" in wildcard mode) as a reference hline instead.
+
+    Returns None only when fewer than 2 numeric points are available, since
+    a single point can't form a line.
+    """
     x_nums = []
     for kv in key_values:
         val = None
         if wildcard_capture:
             m = wildcard_capture.match(kv)
-            if m and m.group(1).isdigit():
-                val = int(m.group(1))
+            if m:
+                digits = re.findall(r'\d+', m.group(1))
+                if digits:
+                    val = int(digits[0])
         if val is None:
             digits = re.findall(r'\d+', kv)
             val = int(digits[-1]) if digits else None
         x_nums.append(val)
-    if any(v is None for v in x_nums):
+    if sum(1 for v in x_nums if v is not None) < 2:
         return None
     return x_nums
 
 
 def _render_line_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                        baseline_value, col_header, common_sub, short_labels,
-                       fp16_val=None, wildcard_capture=None):
+                       fp16_val=None, wildcard_capture=None, viz=None):
     """Render a line chart into the given Axes. Returns False if non-numeric."""
     import matplotlib.pyplot as plt
     x_nums = _line_chart_x_nums(key_values, wildcard_capture)
     if x_nums is None:
         return False
 
+    baseline_is_numeric = (baseline_value in key_values
+                           and x_nums[key_values.index(baseline_value)] is not None)
+
     cmap = plt.cm.get_cmap("tab10", max(len(configs), 3))
+    baseline_y_vals = []
     for ci, cfg in enumerate(configs):
         y_vals = [None] * len(key_values)
-        bl_ki = key_values.index(baseline_value)
-        y_vals[bl_ki] = matrix[cfg["baseline_idx"]][col_idx]
+        if baseline_value in key_values:
+            bl_ki = key_values.index(baseline_value)
+            y_vals[bl_ki] = matrix[cfg["baseline_idx"]][col_idx]
         for pair in cfg["pairs"]:
             if pair["key_label"] in key_values:
                 ki = key_values.index(pair["key_label"])
                 y_vals[ki] = matrix[pair["run_idx"]][col_idx]
-        xy = [(x, y) for x, y in zip(x_nums, y_vals) if y is not None]
+        xy = [(x, y) for x, y in zip(x_nums, y_vals)
+              if x is not None and y is not None]
         if len(xy) >= 2:
             xs, ys = zip(*xy)
             lbl = short_labels[ci] if ci < len(short_labels) else cfg["baseline_label"]
             ax.plot(xs, ys, marker='o', label=lbl, color=cmap(ci))
+        if not baseline_is_numeric and baseline_value in key_values:
+            bl_y = y_vals[key_values.index(baseline_value)]
+            if bl_y is not None:
+                baseline_y_vals.append(bl_y)
+
+    if baseline_y_vals:
+        bl_y = baseline_y_vals[0]  # one value per common-pattern group; pick first
+        ax.axhline(bl_y, color='gray', linestyle=':', linewidth=1.2,
+                   label=f"{baseline_value} (no key)")
 
     if fp16_val is not None:
         ax.axhline(fp16_val, color='black', linestyle='--', linewidth=1,
                    label='FP16')
 
-    ax.set_xlabel(re.sub(r'\d+', '*', baseline_value))
+    numeric_xs = [x for x in x_nums if x is not None]
+    numeric_labels = [kv for kv, x in zip(key_values, x_nums) if x is not None]
+    short_ticks = []
+    for kv in numeric_labels:
+        cap = wildcard_capture.match(kv) if wildcard_capture else None
+        short_ticks.append(cap.group(1) if cap else kv)
+    xlabel_source = baseline_value if any(c.isdigit() for c in baseline_value) \
+        else (numeric_labels[0] if numeric_labels else baseline_value)
+    ax.set_xlabel(re.sub(r'\d+', '*', xlabel_source))
     ax.set_ylabel(col_header)
     ax.set_title(_make_title(col_header, baseline_value, common_sub),
                  fontsize=10)
-    ax.set_xticks(x_nums)
-    ax.set_xticklabels(key_values, fontsize=8)
+    ax.set_xticks(numeric_xs)
+    ax.set_xticklabels(short_ticks, fontsize=8)
     ax.grid(True, linestyle=':', linewidth=0.5, alpha=0.6)
     ax.set_axisbelow(True)
     _set_focused_ylim(ax, _collect_metric_values(configs, matrix, col_idx),
-                      ppl_col)
+                      ppl_col, viz=viz)
     if fp16_val is not None:
         y0, y1 = ax.get_ylim()
         lo, hi = min(y0, y1), max(y0, y1)
@@ -602,7 +692,7 @@ def _render_line_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
 def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
                      baseline_value, col_header, common_sub, short_labels,
                      fig_dir, metric_kw, fp16_val=None, file_label=None,
-                     wildcard_capture=None):
+                     wildcard_capture=None, viz=None):
     """Draw and save a line chart for one metric (numeric compare, ≥3 values)."""
     import matplotlib.pyplot as plt
     if _line_chart_x_nums(key_values, wildcard_capture) is None:
@@ -610,14 +700,15 @@ def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
     fig, ax = plt.subplots(figsize=(max(6, len(key_values) + 2), 5))
     _render_line_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                        baseline_value, col_header, common_sub, short_labels,
-                       fp16_val=fp16_val, wildcard_capture=wildcard_capture)
+                       fp16_val=fp16_val, wildcard_capture=wildcard_capture,
+                       viz=viz)
     fig.tight_layout()
     return _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value,
                      "line", subdir="subfigures")
 
 
 def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
-                  draw_metrics, bar_only=False):
+                  draw_metrics, bar_only=False, viz=None):
     """Generate bar charts (and line charts for numeric keys) from compare data."""
     import matplotlib
     matplotlib.use("Agg")
@@ -684,14 +775,14 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
         _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
                         baseline_value, key_colors, col_header, common_sub,
                         short_labels, fig_dir, metric_kw,
-                        file_label=file_label)
+                        file_label=file_label, viz=viz)
         specs.append({
             "figsize": bar_figsize,
-            "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header:
+            "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header, v=viz:
                        _render_bar_chart(ax, configs, matrix, ci, p,
                                          key_values, baseline_value,
                                          key_colors, h, common_sub,
-                                         short_labels)),
+                                         short_labels, viz=v)),
         })
 
         if (not bar_only and cmp_mode in ("numeric", "wildcard")
@@ -701,24 +792,26 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
                 configs, matrix, col_idx, ppl_col, key_values,
                 baseline_value, col_header, common_sub, short_labels,
                 fig_dir, metric_kw, fp16_val=fp16_val, file_label=file_label,
-                wildcard_capture=wildcard_capture)
+                wildcard_capture=wildcard_capture, viz=viz)
             if line_path is not None:
                 specs.append({
                     "figsize": line_figsize,
                     "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header,
-                               fv=fp16_val:
+                               fv=fp16_val, v=viz:
                                _render_line_chart(ax, configs, matrix, ci, p,
                                                   key_values, baseline_value,
                                                   h, common_sub, short_labels,
                                                   fp16_val=fv,
-                                                  wildcard_capture=wildcard_capture)),
+                                                  wildcard_capture=wildcard_capture,
+                                                  viz=v)),
                 })
 
     _save_summary_figure(specs, fig_dir, file_label)
 
 
 def _render_all_runs_bar(ax, run_indices, matrix, col_idx, ppl_col, fp16_val,
-                         common_sub, col_header, short_labels, colors):
+                         common_sub, col_header, short_labels, colors,
+                         viz=None):
     """Render the all-runs bar chart for one metric into the given Axes."""
     xs = list(range(len(run_indices)))
     bar_vals = []
@@ -746,7 +839,7 @@ def _render_all_runs_bar(ax, run_indices, matrix, col_idx, ppl_col, fp16_val,
     ax.set_axisbelow(True)
 
     vals = [v for v in bar_vals if v is not None]
-    _set_focused_ylim(ax, vals, ppl_col)
+    _set_focused_ylim(ax, vals, ppl_col, viz=viz)
     if fp16_val is not None:
         y0, y1 = ax.get_ylim()
         lo, hi = min(y0, y1), max(y0, y1)
@@ -759,7 +852,7 @@ def _render_all_runs_bar(ax, run_indices, matrix, col_idx, ppl_col, fp16_val,
 
 
 def _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl, draw_metrics,
-                       fp16_idx):
+                       fp16_idx, viz=None):
     """Draw a bar chart with one bar per non-FP16 run, for each --draw metric.
 
     Triggered by ``--compare *``.  Shows every quantized run side-by-side with
@@ -816,17 +909,17 @@ def _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl, draw_metrics,
             figsize=(max(8, len(run_indices) * 0.7 + 2), 5))
         _render_all_runs_bar(ax, run_indices, matrix, col_idx, ppl_col,
                              fp16_val, common_sub, col_header, short_labels,
-                             colors)
+                             colors, viz=viz)
         fig.tight_layout()
         _save_fig(fig, fig_dir, metric_kw, "all", "bar", subdir="subfigures")
 
         specs.append({
             "figsize": (max(8, len(run_indices) * 0.7 + 2), 5),
             "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header,
-                       fv=fp16_val:
+                       fv=fp16_val, v=viz:
                        _render_all_runs_bar(ax, run_indices, matrix, ci, p,
                                             fv, common_sub, h, short_labels,
-                                            colors)),
+                                            colors, viz=v)),
         })
 
     _save_summary_figure(specs, fig_dir, "all")
@@ -1011,7 +1104,7 @@ def hline(widths, char="─", left="├", mid="┼", right="┤"):
 
 
 def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None,
-                   fast=False, bar_only=False):
+                   fast=False, bar_only=False, viz=None):
     """Print a pretty summary table."""
     if not runs:
         print("No result files found.")
@@ -1188,7 +1281,7 @@ def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None,
     if compare_expr == "*":
         if draw_metrics:
             _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl,
-                               draw_metrics, full_idx)
+                               draw_metrics, full_idx, viz=viz)
         else:
             print(f"\n  {YELLOW}--compare *: use --draw <metric> to produce "
                   f"the all-runs bar chart{RESET}")
@@ -1197,7 +1290,7 @@ def print_summary(runs, show_delta=False, compare_expr=None, draw_metrics=None,
                                       compare_expr, label_w=label_w)
         if draw_metrics and compare_data:
             _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
-                          draw_metrics, bar_only=bar_only)
+                          draw_metrics, bar_only=bar_only, viz=viz)
 
     # Legend
     print()
@@ -1376,6 +1469,14 @@ def main():
     parser.add_argument("--bar", action="store_true",
                         help="Force bar charts only (skip line charts even for "
                              "numeric/wildcard compares)")
+    parser.add_argument("--viz", type=str, default=None, metavar="K=V,K=V",
+                        help="Visualization-only tunables (key=value list). "
+                             "Affects figure rendering only, never filtering "
+                             "or table output. Currently recognized: "
+                             "ymin/ymax (all panels), ppl_ymin/ppl_ymax "
+                             "(PPL panels only), acc_ymin/acc_ymax "
+                             "(accuracy panels only). Add new keys to "
+                             "parse_viz() and the relevant render function.")
     parser.add_argument("--nbl", "--no-baseline", action="store_true",
                         dest="no_baseline",
                         help="Exclude the FP16 full-precision baseline")
@@ -1387,6 +1488,7 @@ def main():
         parser.error("--draw requires --compare (-c)")
 
     draw_metrics = [m.strip() for m in args.draw.split(",")] if args.draw else None
+    viz = parse_viz(args.viz)
 
     # ── Gather files ────────────────────────────────────────────────────
     all_results = glob.glob(os.path.join(RESULTS_DIR, "*_results.pb"))
@@ -1450,7 +1552,8 @@ def main():
         runs = [r for r in runs if r[2] != "full"]
 
     print_summary(runs, show_delta=args.delta, compare_expr=args.compare,
-                  draw_metrics=draw_metrics, fast=args.fast, bar_only=args.bar)
+                  draw_metrics=draw_metrics, fast=args.fast, bar_only=args.bar,
+                  viz=viz)
 
 
 if __name__ == "__main__":
