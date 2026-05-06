@@ -25,14 +25,28 @@ import experiment_config as cfg
 # ── Path resolution (delegates to experiment_config) ──
 
 def _resolve_paths(args, mode):
-    """Return (act_scales_path, gptq_checkpoint_dir, quant_tag)."""
-    quant_tag = cfg.build_quant_tag(args)
-    gptq_tag = cfg.build_quant_tag(args, for_gptq_cache=True)
-    act_path = cfg.resolve_act_scales_path(args.model, mode, quant_tag)
+    """Return (act_scales_path, gptq_checkpoint_dir, display_tag).
+
+    Uses for_cal_cache=True for the cal lookup so the path matches what
+    calibrate_act_scales.py actually saves (strips auto-T2 t2intNaM, uses
+    _scalewise-<spec> form for scalewise+hwscale combos). GPTQ dir uses both
+    flags so result-only segments are stripped. The third return value is
+    the display tag (full form) used for figure filenames.
+    """
+    cal_tag = cfg.build_quant_tag(args, for_cal_cache=True)
+    gptq_tag = cfg.build_quant_tag(args, for_gptq_cache=True, for_cal_cache=True)
+    display_tag = cfg.build_quant_tag(args)
+    act_path = cfg.resolve_act_scales_path(args.model, mode, cal_tag)
     imitate_gguf = bool(getattr(args, 'imitate_gguf', None))
-    gptq_dir = cfg.resolve_gptq_checkpoint_dir(
-        args.model, mode, gptq_tag, args.w_bits, imitate_gguf=imitate_gguf)
-    return act_path, gptq_dir, quant_tag
+    # GPTAQ checkpoints live under data/gptaq_checkpoints/ (separate from
+    # data/gptq_checkpoints/ — see resolve_gptaq_checkpoint_dir).
+    if getattr(args, 'gptaq', False):
+        gptq_dir = cfg.resolve_gptaq_checkpoint_dir(
+            args.model, mode, gptq_tag, args.w_bits, imitate_gguf=imitate_gguf)
+    else:
+        gptq_dir = cfg.resolve_gptq_checkpoint_dir(
+            args.model, mode, gptq_tag, args.w_bits, imitate_gguf=imitate_gguf)
+    return act_path, gptq_dir, display_tag
 
 
 # ── Weight scale extraction ──
@@ -457,7 +471,14 @@ def main():
     parser.add_argument('--no-plot', action='store_true',
                         help='Skip histogram generation')
 
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"Note: ignoring unrecognized args (likely inference-only): {unknown}",
+              file=sys.stderr)
+    # Apply preset flips (e.g. acc_block_k follows groupsize when not explicitly
+    # set) so the tag matches what calibrate_act_scales.py / run_experiments.py
+    # actually wrote. Without this, default-valued args produce wrong paths.
+    cfg.apply_set_preset(args)
     cfg.resolve_v_bits(args)
     args.model = cfg.resolve_model(args.model)
 
@@ -469,9 +490,17 @@ def main():
     if args.group and args.weights:
         print("Error: --group and --weights are mutually exclusive.", file=sys.stderr)
         sys.exit(1)
-    if args.hwscale and not args.group:
-        print("Error: --hwscale requires --group.", file=sys.stderr)
+    if args.fp16_calib and (args.weights or args.group):
+        print("Error: --fp16_calib (analyze FP16 cal) is mutually exclusive "
+              "with --weights and --group.", file=sys.stderr)
         sys.exit(1)
+    if args.hwscale and not args.group:
+        # --hwscale is needed for cal/GPTQ path resolution under --scalewise
+        # (the cal tag becomes _scalewise-<spec>). Allow it through; the
+        # post-global histogram is still gated on --group below.
+        print(f"Note: --hwscale={args.hwscale} accepted for path resolution; "
+              f"post-global histogram only generated under --group.",
+              file=sys.stderr)
 
     if args.group:
         # ── Merged per-group scale analysis (a_gscale × w_gscale) ──
@@ -482,9 +511,12 @@ def main():
         cal_pt = (args.pt_path
                   if (args.pt_path and os.path.isfile(args.pt_path))
                   else cfg.resolve_act_scales_path(args.model, args.mode, _cal_tag))
+        _resolve_ckpt = (cfg.resolve_gptaq_checkpoint_dir
+                         if getattr(args, 'gptaq', False)
+                         else cfg.resolve_gptq_checkpoint_dir)
         ckpt_dir = (args.pt_path
                     if (args.pt_path and os.path.isdir(args.pt_path))
-                    else cfg.resolve_gptq_checkpoint_dir(
+                    else _resolve_ckpt(
                         args.model, args.mode, _gptq_tag, args.w_bits,
                         imitate_gguf=bool(getattr(args, 'imitate_gguf', None))))
 
@@ -591,16 +623,28 @@ def main():
 
     else:
         # ── Activation scale analysis ──
-        pt_path = args.pt_path or act_path
+        # When --fp16_calib is set, analyze the FP16 (pre-GPTQ) cal artifact
+        # instead of the post-GPTQ cal. The FP16 cal is what this config
+        # actually deploys with, so it's the right artifact to inspect.
+        if args.fp16_calib:
+            fp16_tag = cfg.build_quant_tag(args, for_fp16_cal_cache=True)
+            resolved_path = cfg.resolve_fp16_act_scales_path(
+                args.model, args.mode, fp16_tag)
+        else:
+            resolved_path = act_path
+        pt_path = args.pt_path or resolved_path
 
         if not os.path.isfile(pt_path):
             print(f"Error: calibration file not found: {pt_path}")
-            scales_dir = os.path.dirname(act_path)
+            scales_dir = os.path.dirname(resolved_path)
             if os.path.isdir(scales_dir):
                 prefix = f'{args.mode}_'
                 available = [f for f in os.listdir(scales_dir) if f.startswith(prefix) and f.endswith('.pt')]
+                if args.fp16_calib:
+                    available = [f for f in available if f.endswith('__fp16.pt')]
                 if available:
-                    print(f"\nAvailable {args.mode} calibrations:")
+                    kind = 'FP16 calibrations' if args.fp16_calib else 'calibrations'
+                    print(f"\nAvailable {args.mode} {kind}:")
                     for f in sorted(available):
                         print(f"  {f}")
             sys.exit(1)
