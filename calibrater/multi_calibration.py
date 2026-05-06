@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Wrapped by skill: .claude/skills/dart-run-experiments (cal-only entry point) — update SKILL.md if this script's CLI / runfile semantics change.
 """
 Run static-activation-scale calibration for baseline, quarot, and dart
 in parallel across GPUs.

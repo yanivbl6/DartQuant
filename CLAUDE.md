@@ -1,40 +1,62 @@
-This project is testing quantizations over LLMs. It was meant to test an experimental (published) method called dart, that learns allegedly better rotations than the quarot method, aimed to reduce outliers in LLMs.
+# DartQuant — project orientation
 
-quarot adds r1/r2/r3/r4 rotation operations to attention. 
-dart computes r1/r2. It's in 
-/workspace/DartQuant/calibrater/r1_base_qr.py
-/workspace/DartQuant/calibrater/r2_base_qr.py
+## What this repo does
 
-which can be both run using:
-calibrater/calibrate_act_scales.py
+Quantization research on small Llama models (primarily Llama-3.2-1B-Instruct). The active method is **quarot**: four rotations (r1, r2, r3, r4) inserted into the model graph to push outliers off the residual stream so it quantizes cleanly. Each rotation has its own knobs and is treated independently — r1 is online pre-attention, r2 is inside MLP gate/up, r3 is inside attention K, r4 is in down_proj; any can be on/off, hadamard or learned. On top of the rotations we run GPTQ at a configurable bit width and quantize activations (static or dynamic).
 
-we also do gptq with a specified number of bits. 
+Note: `dart` (`calibrater/r1_base_qr.py`, `calibrater/r2_base_qr.py`) — the project's namesake learned-rotation method — is now legacy and rarely run. Code is kept; the live path is quarot + GPTQ + activation cal.
 
+## Pipeline entry points
 
+| Stage | File | Purpose |
+|---|---|---|
+| Cal + rotations + GPTQ produce | `calibrater/calibrate_act_scales.py` | Runs r1/r2 fitting, GPTQ, observes activations, writes `.pt` cal files |
+| 3-way cal sweep | `calibrater/multi_calibration.py` | Wraps `calibrate_model.sh` for parallel cal experiments |
+| Inference batches | `fake_quant/run_experiments.py` | Drives runfiles (`data/runs/*.ini`) across multiple GPUs |
+| Single run | `fake_quant/Script/dart_gptq_wxaykvz.sh` | One-off command for ad-hoc tests |
 
-We have made several changes for:
-1. easier testing (in fake_quant Scripts), with caching and visualization.
-2. support of the 1B model (didn't work OOB)
-3. bypass huggingface downloads to use local datasets
-4. add support for static configuration, which is a big and important change
-5. Added the Piecewise Linear activation support based on the halio-sdk repository, and tested it.
+## Canonical modules — go through these, don't hand-roll
 
-The quantization of the hailo-sdk repository is in
-`/home/yanivbl/phase2-sdk/model_optimization/model_optimization_production/hailo_model_optimization/flows/optimization_flow.py`
+- **`experiment_config.py`** — single source of truth for the quant tag and all artifact paths. Use `build_quant_tag(args, for_gptq_cache=…, for_cal_cache=…, for_fp16_cal_cache=…)`, `resolve_act_scales_path`, `resolve_gptq_checkpoint_dir`, `resolve_gptaq_checkpoint_dir`. Also exposes `apply_set_preset` (e.g. flips `acc_block_k=32 → groupsize` when not explicitly set) — call it after argparse so your tag matches what the cal script wrote.
+- **`fake_quant/int_acc_gemm.py`** — integer GEMM with capped accumulator (Triton + reference). Enabled with `--int_gemm --acc_bits N --acc_block_k N`. Theory and the per-group-vs-per-column scale rationale live in `documentation.md`.
+- **`fake_quant/gguf_utils.py`** — GGUF dequant + Q/K reverse-permute on load (llama.cpp's `convert.py` permutes Q/K rows; without the reverse, PPL ~1600 instead of ~18).
 
+## Path layout
 
-6. Integer GEMM with capped accumulator (`fake_quant/int_acc_gemm.py`): Triton kernel + PyTorch reference that simulates hardware integer GEMM with limited-width accumulator. Enabled via `--int_gemm --acc_bits N --acc_block_k N`. Integrated into inference, GPTQ propagation, and calibration. Calibration hooks attach to `ActQuantWrapper` (not inner Linear) and use stored `_cal_input`/`_cal_output` so int_gemm path is captured. Static mode uses per-group activation scales aligned with `acc_block_k` (per-column scales can't factor out of a dot product; per-group scales can because each K-block has one scalar scale). Dynamic mode uses per-token scales. The kernel supports both per-group activation scales (`A_GROUP_SIZE > 0`) and per-group weight scales (`GROUP_SIZE > 0`).
+| Path | Contents |
+|---|---|
+| `data/runs/*.ini` | Run definitions consumed by `run_experiments.py` |
+| `data/cached_results/` | `<tag>.log` (eval), `<tag>_CAL.log` (cal), `<tag>_results.pb` (cached PPL) |
+| `data/act_scales/<model>/` | Activation cal `.pt` files (post-GPTQ and `__fp16` variants) |
+| `data/gptq_checkpoints/` | GPTQ checkpoints (no asym-aware GPTAQ) |
+| `data/gptaq_checkpoints/` | **Separate** dir for GPTAQ checkpoints — dispatched on `args.gptaq` |
+| `../quantized_models/` (one level above repo) | GGUF source files |
 
-for static configuration, we use `calibrater/calibrate_model.sh` before the run. it accepts r1/r2 and also runs gptq, which we cache.
-`multi_calibration.py` runs `calibrater/calibrate_model.sh` for 3 different experiments.
+## ⚠️ TAG MISMATCH — the recurring class of bug
 
+Cal files, GPTQ checkpoints, and result caches are all keyed by a "quant tag" string built from the run's flags. The tag is constructed by `experiment_config.build_quant_tag(args, for_gptq_cache=…, for_cal_cache=…, for_fp16_cal_cache=…)` — and **the booleans matter**: cal-time tags strip auto-T2 (`t2intNaM`) and rewrite `_hws-<spec>` → `_scalewise-<spec>`. Anything that hand-rolls a tag, or calls `build_quant_tag` with the wrong booleans, produces a path that does not match what `calibrate_act_scales.py` writes.
 
-when changing enviroment variables/ update the dockerfile to match.
+**Two failure modes:**
+- *Path miss* — lookup points at a non-existent file (e.g. `analyze_scales.py` drift fixed 2026-05-06: wrong `for_cal_cache` boolean).
+- *Silent corruption* — lookup hits a file that exists but was contaminated by inference-only flags that bled into cal (`--acc_dtype` cal-bleed fixed `c1bcd73`: T2 capping leaked into cal forward, distorting activation stats).
 
-example run:
-`sh Script/experiments.sh -m 1b` 
-but it's very slow and uses shared GPU, so don't run it yourself
+**Symptoms:**
+- Fresh-regenerated cal yields a different PPL than the cached cal for "the same" config.
+- `show_results` / `analyze_scales` / `run_experiments` reports "not found" when you know the file exists.
+- PPL drifts between two runs that should be identical.
 
+**Rule:** every consumer of cached artifacts must go through `experiment_config.py`'s resolvers. When a discrepancy appears, FIRST diff the consumer's tag-construction path against `calibrate_act_scales.py:main()` before chasing algorithmic theories.
 
-The documentation file `documentation.md` include explainations about:
-1. Activation Quantization: Static vs Dynamic, GEMM vs GEMM-Int
+## Capabilities flagged in passing
+
+1B-model support (untied embeddings, etc.), static activation quant (precomputed scales via cal), PWL activation (ported from hailo-sdk; reference impl at `~/phase2-sdk/.../optimization_flow.py`), int-GEMM (capped accumulator), GGUF load (Q4_K_M tested).
+
+## Etiquette
+
+Be mindful of the time when launching runs — they're slow and the GPUs are shared, so don't kick them off as an afterthought. Check `nvidia-smi` first. When changing environment variables, update the Dockerfile to match.
+
+## Pointers
+
+- `documentation.md` — static-vs-dynamic + GEMM-vs-int_gemm theory.
+- `~/.claude/projects/-workspace-DartQuant/memory/MEMORY.md` — auto-loaded cross-session context (past pitfalls, user preferences, GGUF gotchas).
+- `.claude/skills/` — operational playbooks (auto-routed by description; no need to enumerate them here).

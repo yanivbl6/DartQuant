@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Wrapped by skill: .claude/skills/dart-analyze-scales — update SKILL.md if CLI flags / mode behavior change.
 """Analyze quantization scales from calibration files or GPTQ checkpoints.
 
 Modes:

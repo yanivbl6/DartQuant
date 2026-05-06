@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Wrapped by skill: .claude/skills/dart-run-experiments — update SKILL.md if this script's CLI / runfile semantics change.
 """
 Run the 7 standard DartQuant experiments in parallel.
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Wrapped by skill: .claude/skills/dart-ppl-status — update SKILL.md if this script's CLI changes.
 """
 Visualize DartQuant experiment results from cached .pb files.
 
