@@ -266,7 +266,9 @@ def parse_runfile_for_calibration(path, recalib=False):
             continue
 
         quant_tag = cfg.build_quant_tag(line_args, for_cal_cache=True)
-        key = (mode, quant_tag)
+        # fp16_calib changes cal flow (skips post-GPTQ cal); the cal-cache tag
+        # strips _fp16dep, so include it here separately to keep groups disjoint.
+        key = (mode, quant_tag, getattr(line_args, 'fp16_calib', False))
 
         if key not in groups:
             groups[key] = {

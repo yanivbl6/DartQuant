@@ -19,7 +19,7 @@ Wrap `fake_quant/run_experiments.py`. Two responsibilities: (a) pick the right f
 
 3. **`--dry` first, always — interpret the output yourself.** Run the dry preview to get the numbered queue and GPU assignment. Use it to:
    - Verify the queue matches the user's stated intent (which lines, how many).
-   - Verify the unflagged lines match the user's stated intent (the runner picks up unflagged lines and skips `[DONE]/[FAST]/[CAL]` ones).
+   - Verify the queue matches user intent. Default mode runs anything that isn't `[DONE]` or `[ERROR-CALIBRATE]` — that includes unflagged, `[FAST]`, `[CAL]`, and `[ERROR]`. Fast mode (`-F`) additionally skips `[FAST]`. **Common surprise:** `[FAST]` lines DO run in default mode (and get upgraded to `[DONE]`); `[CAL]` lines always need inference. See "Flag semantics" below for the full table.
    - Catch obvious mistakes (wrong runfile path, no lines selected, GPUs that aren't free).
 
    **Two entry points — pick by intent:**
@@ -45,12 +45,13 @@ Wrap `fake_quant/run_experiments.py`. Two responsibilities: (a) pick the right f
 
 User says ... | Intent | Entry point + flags | Notes
 ---|---|---|---
-"rerun the inference for the v6 runs" | results cache invalid, cal+GPTQ OK | `run_experiments.py` from `fake_quant/`, `--overwrite` | Cheapest. Just regenerates `.pb`. Respects `[DONE]/[FAST]` flags.
+"rerun the inference for the v6 runs" | results cache invalid, cal+GPTQ OK | `run_experiments.py` from `fake_quant/`, `--overwrite` | Tells the inference subprocess to ignore `*_results.pb` cache and recompute. Does NOT bypass the runfile flag filter — `[DONE]` lines are still skipped (strip `[DONE]` first if you want them re-run).
 "the cal code changed, regenerate" | cal must be redone WHOLE FILE | `run_experiments.py` from `fake_quant/`, `--recalib` | **Re-runs EVERY line.** For partial scope, unflag instead — see "Partial-scope re-runs" below.
 "just regenerate cal, don't run inference" | cal-only refresh | `multi_calibration.py` from `calibrater/`, `--recalib` | Cal-only entry point. Note: `--skip` is NOT supported for cal-queue trimming here — see line 34.
 "the GPTQ code changed" | GPTQ ckpt invalid | `run_experiments.py` from `fake_quant/`, `--recalib --gptq` | NEVER `--gptq` alone — see footgun. Same `--recalib` scope warning applies.
 "preview which lines would run" | scoping | add `--dry` (to whichever entry point) | This is mandatory before any real run.
-"run only the unflagged lines" | runfile in normal mode | `run_experiments.py` from `fake_quant/` (no extra flags) | Default behavior — respects `[DONE]/[FAST]/[CAL]` markers.
+"run only the unflagged lines" | runfile in normal mode | `run_experiments.py` from `fake_quant/` (no extra flags) | Default mode skips `[DONE]` and `[ERROR-CALIBRATE]`; runs everything else (unflagged, `[FAST]`, `[CAL]`, `[ERROR]`). `[FAST]` lines get upgraded to `[DONE]` after full eval completes.
+"upgrade [FAST] lines to [DONE] (full eval)" | already have fast PPL, want lm_eval | `run_experiments.py` from `fake_quant/` (no `-F`, no other flags) | DON'T strip `[FAST]` — default mode picks them up automatically (`needs_inference([FAST], fast=False) → True`).
 "re-cal only these specific lines" | partial recalib | unflag the lines in the runfile, run normally | If cal artifact already exists, only inference reruns. If cal is missing/stale, use single-line cal recipe below.
 "quick PPL check" | speed | add `--very-fast` | wt2 only, ~3 min/run.
 "normal eval, no MMLU" | speed | add `-F` / `--fast` | wt2/ptb/c4, ~7-10 min/run. Most common default.
@@ -84,7 +85,9 @@ These replace footgun "ask the user" patterns with autonomous safe defaults. Alw
 
 ## Partial-scope re-runs: unflag, don't `--recalib --skip`
 
-For partial scope (one or a few specific lines), the right pattern is to **unflag those lines in the runfile** and run normally. The runner's default mode skips `[DONE]/[FAST]/[CAL]` lines and runs unflagged ones — that's the entire mechanism. No `--recalib`, no `--skip` complement-of-intent computation.
+For partial scope (one or a few specific lines), the right pattern is to **unflag those lines in the runfile** and run normally. The runner's default mode skips `[DONE]` (and `[ERROR-CALIBRATE]`) and runs everything else, including `[FAST]`/`[CAL]`/`[ERROR]` — that's the entire mechanism. No `--recalib`, no `--skip` complement-of-intent computation.
+
+**Important:** you only need to strip `[DONE]` to re-run a finished line. Stripping `[FAST]` or `[CAL]` is unnecessary in default mode (they're already picked up); strip them only if you specifically want a from-scratch state in the runfile.
 
 Why not `--recalib --skip <complement>`:
 - `--skip` restricts INFERENCE scope only; cal scope is independent.
@@ -92,9 +95,22 @@ Why not `--recalib --skip <complement>`:
 - It's also fragile (1-indexed line numbers shift if the runfile is edited).
 
 Standard partial-scope pattern:
-1. Edit the runfile: remove `[DONE]/[FAST]/[CAL]/[ERROR]` from the lines you want re-run.
+1. Edit the runfile: remove `[DONE]` from the lines you want re-run (or `[FAST]` if running with `-F` and you want them re-included). `[CAL]/[ERROR]` are picked up automatically — no need to strip.
 2. Run normally: `cd /workspace/DartQuant/fake_quant && python run_experiments.py --runfile ../data/runs/runs_v6.ini -g <GPUS> -F` (or no `-F` for full eval).
-3. The runner picks up unflagged lines, skips the rest. On success it stamps `[FAST]` or `[DONE]` back.
+3. The runner picks up everything that needs work per the flag table below; on success it stamps `[FAST]` or `[DONE]` back.
+
+### Flag semantics (the actual rules from `runfile_flags.needs_inference`)
+
+| Flag | Default mode (no `-F`) | Fast mode (`-F`) |
+|---|---|---|
+| (unflagged) | run | run |
+| `[CAL]` | run (cal done, inference still pending) | run |
+| `[FAST]` | **run** (upgrades to `[DONE]`) | skip |
+| `[ERROR]` | run (retries the failure) | run |
+| `[DONE]` | skip | skip |
+| `[ERROR-CALIBRATE]` | skip (cal-side failure, won't auto-recover) | skip |
+
+So in plain English: **`[DONE]` and `[ERROR-CALIBRATE]` are the only flags that actually skip a line**. The others are state markers that don't block re-running.
 
 What if cal is missing for an unflagged line? See "Single-line cal for a brand-new line" below — the runner won't auto-cal; you cal once directly, then unflag and run inference.
 
@@ -161,14 +177,14 @@ Don't auto-retry failed lines without understanding the failure first; the same 
 - Don't block on user input. Pick the safe default per "Default-on-ambiguity rules" and proceed. Log the choice.
 - Don't tail running jobs in a loop — kick them off in the background and use `dart-ppl-status` for status checks.
 - Don't restructure the runfile (reorder lines, rewrite labels, change configs). The user owns runs_v6.ini's content; if the queue is wrong, ABORT and log.
-- DO feel free to unflag lines (strip `[DONE]/[FAST]/[CAL]/[ERROR]`) when the user wants those lines re-run — that's the standard partial-scope pattern. The runner re-stamps the marker on the next successful run.
+- DO feel free to unflag lines when the user wants them re-run, but know which flag actually blocks: only `[DONE]` (and `[ERROR-CALIBRATE]`) skip in default mode. Stripping `[FAST]/[CAL]/[ERROR]` is usually unnecessary — those re-run automatically. The runner re-stamps on the next successful run.
 
 ## Example: autonomous workflow
 
 User: "the cal-fix is committed, rerun the v6 ablations with the new cal."
 You:
 1. `nvidia-smi --query-gpu=index,memory.used --format=csv,noheader` → identify free GPUs.
-2. Substring-match "v6 ablations" against runfile labels → `s1_no_fp16cal_full_M4S4_t2int24a0_*` lines. Edit those lines: strip their `[DONE]/[FAST]/[CAL]` markers.
+2. Substring-match "v6 ablations" against runfile labels → `s1_no_fp16cal_full_M4S4_t2int24a0_*` lines. Strip their `[DONE]` markers (any `[FAST]/[CAL]/[ERROR]` will be picked up automatically; only `[DONE]` blocks default-mode runs).
 3. `cd /workspace/DartQuant/fake_quant && python run_experiments.py --runfile ../data/runs/runs_v6.ini -g <free-gpus> -F --dry` → confirm only the unflagged lines are in the queue.
 4. Drop `--dry`, launch in background. Output: log paths + a one-line summary of what was launched + a pointer to `dart-ppl-status` for monitoring.
 
