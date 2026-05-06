@@ -32,20 +32,9 @@ Note: `dart` (`calibrater/r1_base_qr.py`, `calibrater/r2_base_qr.py`) — the pr
 | `data/gptaq_checkpoints/` | **Separate** dir for GPTAQ checkpoints — dispatched on `args.gptaq` |
 | `../quantized_models/` (one level above repo) | GGUF source files |
 
-## ⚠️ TAG MISMATCH — the recurring class of bug
+## ⚠️ TAG MISMATCH — recurring class of bug
 
-Cal files, GPTQ checkpoints, and result caches are all keyed by a "quant tag" string built from the run's flags. The tag is constructed by `experiment_config.build_quant_tag(args, for_gptq_cache=…, for_cal_cache=…, for_fp16_cal_cache=…)` — and **the booleans matter**: cal-time tags strip auto-T2 (`t2intNaM`) and rewrite `_hws-<spec>` → `_scalewise-<spec>`. Anything that hand-rolls a tag, or calls `build_quant_tag` with the wrong booleans, produces a path that does not match what `calibrate_act_scales.py` writes.
-
-**Two failure modes:**
-- *Path miss* — lookup points at a non-existent file (e.g. `analyze_scales.py` drift fixed 2026-05-06: wrong `for_cal_cache` boolean).
-- *Silent corruption* — lookup hits a file that exists but was contaminated by inference-only flags that bled into cal (`--acc_dtype` cal-bleed fixed `c1bcd73`: T2 capping leaked into cal forward, distorting activation stats).
-
-**Symptoms:**
-- Fresh-regenerated cal yields a different PPL than the cached cal for "the same" config.
-- `show_results` / `analyze_scales` / `run_experiments` reports "not found" when you know the file exists.
-- PPL drifts between two runs that should be identical.
-
-**Rule:** every consumer of cached artifacts must go through `experiment_config.py`'s resolvers. When a discrepancy appears, FIRST diff the consumer's tag-construction path against `calibrate_act_scales.py:main()` before chasing algorithmic theories.
+Cached cal files, GPTQ checkpoints, and result caches are keyed by a quant tag built via `experiment_config.build_quant_tag(args, for_gptq_cache=…, for_cal_cache=…, for_fp16_cal_cache=…)` — and the booleans matter (cal-time tags strip auto-T2 and rewrite `_hws-` → `_scalewise-`). Hand-rolled tags or wrong booleans cause either a *path miss* or *silent cal contamination*. **Rule:** every consumer goes through `experiment_config.py`'s resolvers; when fresh-cal and cached-cal PPL disagree, diff `Quant tag:` lines in both `_CAL.log`s before chasing algorithmic theories. Full diagnostic playbook in auto-memory (`project_tag_mismatch_pattern.md`).
 
 ## Capabilities flagged in passing
 
