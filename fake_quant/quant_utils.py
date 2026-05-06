@@ -794,7 +794,7 @@ class ActQuantWrapper(torch.nn.Module):
                          acc_bits=32, acc_block_k=32, use_triton=True,
                          acc_wrap=False, acc_dtype='float',
                          gscaler_parsed=None, lsb_mac_shift=0,
-                         t1_msb_scan=False):
+                         t1_msb_scan=False, nvfp4=False):
         """Pre-compute integer weight representation for capped-accumulator GEMM."""
         from int_acc_gemm import prepare_int_weights
         self.use_int_gemm = True
@@ -806,8 +806,11 @@ class ActQuantWrapper(torch.nn.Module):
         self.int_gemm_use_triton = use_triton
         self.w_group_size = w_group_size
         self.lsb_mac_shift = lsb_mac_shift
+        self.nvfp4 = nvfp4
 
-        w_int, w_scale, w_zp = prepare_int_weights(self.module, w_bits, w_sym, w_group_size)
+        w_int, w_scale, w_zp = prepare_int_weights(
+            self.module, w_bits, w_sym, w_group_size, nvfp4=nvfp4,
+        )
         dev = self.module.weight.device
         self.w_int = w_int.to(dev)
         self.w_scale = w_scale.to(dev)

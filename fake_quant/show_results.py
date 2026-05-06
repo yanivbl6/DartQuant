@@ -295,13 +295,15 @@ def _print_compare(runs, matrix, labels, cols, is_ppl, col_w, compare_expr,
     # w{N}a{N}k{N}v{N} token (and any bare w{N}) for imitate comparisons.
     neutralize_w_bits = 'imitate' in cmp_lower
 
-    if mode == "binary":
-        baseline_indices = groups[cmp_lower]
+    if mode in ("binary", "wildcard", "variant"):
+        baseline_indices = groups.get(baseline_key, [])
         other_indices = [idx for g, idxs in groups.items()
-                         if g != cmp_lower for idx in idxs]
+                         if g != baseline_key for idx in idxs]
         if baseline_indices and other_indices:
             # Tokens present in ALL of one side and NONE of the other are
-            # stripped so pair keys line up (handled symmetrically).
+            # stripped so pair keys line up (handled symmetrically). Catches
+            # e.g. "scalewise" which always co-occurs with hws-* but never
+            # with the vanilla baseline.
             bl_token_sets = [set(_norm_base(runs[i][3]).split('_'))
                              for i in baseline_indices]
             ot_token_sets = [set(_norm_base(runs[i][3]).split('_'))

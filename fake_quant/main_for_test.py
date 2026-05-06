@@ -614,6 +614,10 @@ def main():
                 layer_w_bits = _ig_w_bits_map.get(name, layer_w_bits)
             if getattr(args, 'w_bits_down_proj', None) is not None and 'down_proj' in name:
                 layer_w_bits = args.w_bits_down_proj
+            fp4_mode = getattr(args, 'fp4', 'none')
+            layer_use_fp4 = (fp4_mode == 'all') or (
+                fp4_mode == 'down' and 'down_proj' in name
+            )
             qlayer.prepare_int_gemm(
                 w_bits=layer_w_bits,
                 w_sym=not args.w_asym,
@@ -626,6 +630,7 @@ def main():
                 gscaler_parsed=getattr(args, 'gscaler_parsed', None),
                 lsb_mac_shift=getattr(args, 'lsb_mac_shift', 0),
                 t1_msb_scan=getattr(args, 't1_msb_scan', False),
+                nvfp4=layer_use_fp4,
             )
             qlayer.quantizer._sd_name = name
             n_int_gemm += 1

@@ -560,6 +560,10 @@ def gptq_fwrd(model, dataloader, dev, args):
                             _ig_wb = w_bits_map.get(f'model.layers.{i}.{bare}', _ig_wb)
                         if getattr(args, 'w_bits_down_proj', None) is not None and 'down_proj' in qname:
                             _ig_wb = args.w_bits_down_proj
+                        _ig_fp4_mode = getattr(args, 'fp4', 'none')
+                        _ig_use_fp4 = (_ig_fp4_mode == 'all') or (
+                            _ig_fp4_mode == 'down' and 'down_proj' in qname
+                        )
                         ql.prepare_int_gemm(
                             w_bits=_ig_wb,
                             w_sym=not args.w_asym,
@@ -571,6 +575,7 @@ def gptq_fwrd(model, dataloader, dev, args):
                             acc_dtype=getattr(args, 'acc_dtype', 'float'),
                             gscaler_parsed=getattr(args, 'gscaler_parsed', None),
                             lsb_mac_shift=getattr(args, 'lsb_mac_shift', 0),
+                            nvfp4=_ig_use_fp4,
                         )
 
         # Enable capped int GEMM on any remaining layers (safety net)
@@ -589,6 +594,10 @@ def gptq_fwrd(model, dataloader, dev, args):
                         _ig_wb = w_bits_map.get(f'model.layers.{i}.{bare}', _ig_wb)
                     if getattr(args, 'w_bits_down_proj', None) is not None and 'down_proj' in qname:
                         _ig_wb = args.w_bits_down_proj
+                    _ig_fp4_mode = getattr(args, 'fp4', 'none')
+                    _ig_use_fp4 = (_ig_fp4_mode == 'all') or (
+                        _ig_fp4_mode == 'down' and 'down_proj' in qname
+                    )
                     ql.prepare_int_gemm(
                         w_bits=_ig_wb,
                         w_sym=not args.w_asym,
@@ -600,6 +609,7 @@ def gptq_fwrd(model, dataloader, dev, args):
                         acc_dtype=getattr(args, 'acc_dtype', 'float'),
                         gscaler_parsed=getattr(args, 'gscaler_parsed', None),
                         lsb_mac_shift=getattr(args, 'lsb_mac_shift', 0),
+                        nvfp4=_ig_use_fp4,
                     )
 
         avg_loss = sum(layer_losses) / len(layer_losses) if layer_losses else 0.0

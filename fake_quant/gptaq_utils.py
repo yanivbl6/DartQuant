@@ -330,6 +330,10 @@ def _enable_int_gemm_on_subset(layer, names, args, layer_idx, w_bits_map):
             if (getattr(args, 'w_bits_down_proj', None) is not None
                     and 'down_proj' in qname):
                 _ig_wb = args.w_bits_down_proj
+            fp4_mode = getattr(args, 'fp4', 'none')
+            layer_use_fp4 = (fp4_mode == 'all') or (
+                fp4_mode == 'down' and 'down_proj' in qname
+            )
             ql.prepare_int_gemm(
                 w_bits=_ig_wb,
                 w_sym=not args.w_asym,
@@ -341,4 +345,5 @@ def _enable_int_gemm_on_subset(layer, names, args, layer_idx, w_bits_map):
                 acc_dtype=getattr(args, 'acc_dtype', 'float'),
                 gscaler_parsed=getattr(args, 'gscaler_parsed', None),
                 lsb_mac_shift=getattr(args, 'lsb_mac_shift', 0),
+                nvfp4=layer_use_fp4,
             )

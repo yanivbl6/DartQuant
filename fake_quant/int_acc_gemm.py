@@ -1195,6 +1195,7 @@ def prepare_int_weights(
     w_bits: int,
     w_sym: bool = True,
     w_group_size: int = -1,
+    nvfp4: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Re-quantize fake-quantized (post-GPTQ) float weights back to (w_int8, w_scale, w_zp).
@@ -1221,8 +1222,11 @@ def prepare_int_weights(
             and linear._gptq_w_scale is not None):
         dev = W.device
         scale = linear._gptq_w_scale.to(dev).float()  # [N, n_groups] or [N, 1]
-        sym_minq = -(2 ** (w_bits - 1))
-        sym_maxq = 2 ** (w_bits - 1) - 1
+        if nvfp4:
+            sym_minq, sym_maxq = -12, 12
+        else:
+            sym_minq = -(2 ** (w_bits - 1))
+            sym_maxq = 2 ** (w_bits - 1) - 1
         if w_group_size > 0:
             scale_exp = scale.repeat_interleave(w_group_size, dim=1)[:, :K]
             w_int = torch.round(W / scale_exp.clamp(min=1e-10)).to(torch.int8)
