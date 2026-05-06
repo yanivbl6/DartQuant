@@ -19,7 +19,7 @@ Wrap `fake_quant/run_experiments.py`. Two responsibilities: (a) pick the right f
 
 3. **`--dry` first, always — interpret the output yourself.** Run the dry preview to get the numbered queue and GPU assignment. Use it to:
    - Verify the queue matches the user's stated intent (which lines, how many).
-   - Compute `--skip` lists for partial-scope runs (see `--recalib` note below).
+   - Verify the unflagged lines match the user's stated intent (the runner picks up unflagged lines and skips `[DONE]/[FAST]/[CAL]` ones).
    - Catch obvious mistakes (wrong runfile path, no lines selected, GPUs that aren't free).
 
    **Two entry points — pick by intent:**
@@ -31,11 +31,11 @@ Wrap `fake_quant/run_experiments.py`. Two responsibilities: (a) pick the right f
      ```bash
      cd /workspace/DartQuant/calibrater && python multi_calibration.py --runfile ../data/runs/runs_v6.ini -g <GPUS> --dry [other flags]
      ```
-   `multi_calibration.py` shares the same flag surface (`--runfile`, `--recalib`, `--gptq`, `-g`, `--dry`). Dry output paths are relative to the cwd you ran from — don't get confused if you `--dry` `run_experiments.py` from `fake_quant/` and see cal subprocess paths that look "wrong"; they execute with cwd=calibrater/.
+   `multi_calibration.py` shares MOST of the flag surface (`--runfile`, `--recalib`, `--gptq`, `-g`, `--dry`) but **NOT** `--skip` — it forwards `--skip` as a pass-through arg to inner `calibrate_act_scales.py` calls instead of filtering its own queue. Don't rely on `multi_calibration.py --skip` to restrict cal scope. Dry output paths are relative to the cwd you ran from — don't get confused if you `--dry` `run_experiments.py` from `fake_quant/` and see cal subprocess paths that look "wrong"; they execute with cwd=calibrater/.
 
    No user-confirmation step. If the dry output matches intent, proceed. If it doesn't match, pick the closest reasonable interpretation, log what you chose and why, and proceed. ABORT (with a clear log) only if the queue is empty or no GPUs are free.
 
-4. **`--recalib` ignores runfile flags — handle scope yourself.** `--recalib` re-runs EVERY line in the runfile. Standard partial-recalib pattern: read the dry output, substring-match line labels against the user's stated intent ("the v6 ablations", "the M4S4 sweep"), build the complement as `--skip`, proceed. If multiple interpretations are plausible, pick the most specific match and log what was selected. Don't block.
+4. **`--recalib` is whole-file-only.** It re-runs EVERY line in the runfile. Use it ONLY when you genuinely want to regenerate cal for the whole file (e.g. cal-code change affecting all lines). For partial scope, do NOT pair `--recalib` with `--skip` — see "Partial-scope re-runs" below. The right partial pattern is to unflag the lines you want re-run and let the runner's normal mode pick them up.
 
 5. **Launch** in background. Multi-hour cal+inference batches MUST run in background (`run_in_background: true`) — never block the conversation on them.
 
@@ -46,12 +46,12 @@ Wrap `fake_quant/run_experiments.py`. Two responsibilities: (a) pick the right f
 User says ... | Intent | Entry point + flags | Notes
 ---|---|---|---
 "rerun the inference for the v6 runs" | results cache invalid, cal+GPTQ OK | `run_experiments.py` from `fake_quant/`, `--overwrite` | Cheapest. Just regenerates `.pb`. Respects `[DONE]/[FAST]` flags.
-"the cal code changed, regenerate" | cal must be redone | `run_experiments.py` from `fake_quant/`, `--recalib` | **Re-runs EVERY line** regardless of `[DONE]` flags. Always pair with `--skip` for partial re-cal.
-"just regenerate cal, don't run inference" | cal-only refresh | `multi_calibration.py` from `calibrater/`, `--recalib` | Cal-only entry point. Same flag surface as run_experiments.py.
+"the cal code changed, regenerate" | cal must be redone WHOLE FILE | `run_experiments.py` from `fake_quant/`, `--recalib` | **Re-runs EVERY line.** For partial scope, unflag instead — see "Partial-scope re-runs" below.
+"just regenerate cal, don't run inference" | cal-only refresh | `multi_calibration.py` from `calibrater/`, `--recalib` | Cal-only entry point. Note: `--skip` is NOT supported for cal-queue trimming here — see line 34.
 "the GPTQ code changed" | GPTQ ckpt invalid | `run_experiments.py` from `fake_quant/`, `--recalib --gptq` | NEVER `--gptq` alone — see footgun. Same `--recalib` scope warning applies.
 "preview which lines would run" | scoping | add `--dry` (to whichever entry point) | This is mandatory before any real run.
 "run only the unflagged lines" | runfile in normal mode | `run_experiments.py` from `fake_quant/` (no extra flags) | Default behavior — respects `[DONE]/[FAST]/[CAL]` markers.
-"re-cal only these specific lines" | partial recalib | `--recalib --skip <line-nums>` from appropriate entry point | Substring-match labels in dry output to compute `--skip`.
+"re-cal only these specific lines" | partial recalib | unflag the lines in the runfile, run normally | If cal artifact already exists, only inference reruns. If cal is missing/stale, use single-line cal recipe below.
 "quick PPL check" | speed | add `--very-fast` | wt2 only, ~3 min/run.
 "normal eval, no MMLU" | speed | add `-F` / `--fast` | wt2/ptb/c4, ~7-10 min/run. Most common default.
 "thorough eval with lm_eval" | full results | omit fast flags | Hours/run.
@@ -68,7 +68,7 @@ These replace footgun "ask the user" patterns with autonomous safe defaults. Alw
 
 **Forgetting `--runfile` for runfile-mode runs** — auto-add `--runfile ../data/runs/runs_v6.ini` (the default). Log: "added default --runfile". Only fall back to legacy 7-experiment mode if the user explicitly asked for it.
 
-**Empty trimmed queue after `--skip`** — abort with log explaining no lines matched intent. This is a hard error; better to surface than silently launch nothing.
+**Empty queue after unflagging / `--skip`** — abort with log explaining no lines matched intent. This is a hard error; better to surface than silently launch nothing.
 
 **Multiple plausible label-match interpretations** — pick the most specific (longest substring match against user phrasing). If two are equally specific, run BOTH (the queue is just the union). Log: "intent matched 'M4S4 ablations' AND 'gguf' subsets; running union".
 
@@ -82,18 +82,45 @@ These replace footgun "ask the user" patterns with autonomous safe defaults. Alw
 
 `../data/runs/runs_v6.ini` (relative to fake_quant/). Use this unless the user specifies a different path.
 
-## Skip / select-runs (the standard partial-recalib workflow)
+## Partial-scope re-runs: unflag, don't `--recalib --skip`
 
-`--recalib` is all-or-nothing — it ignores `[DONE]/[FAST]/[CAL]` markers and re-runs every line. To restrict scope, pair with `--skip` (1-indexed line numbers from `--dry` print order).
+For partial scope (one or a few specific lines), the right pattern is to **unflag those lines in the runfile** and run normally. The runner's default mode skips `[DONE]/[FAST]/[CAL]` lines and runs unflagged ones — that's the entire mechanism. No `--recalib`, no `--skip` complement-of-intent computation.
 
-Standard partial-recalib pattern (fully autonomous):
-1. From the right entry point (`fake_quant/` for combined cal+inference, `calibrater/` for cal-only): `python <script> --runfile ../data/runs/runs_v6.ini --recalib --dry` → full numbered queue.
-2. Read the queue. Substring-match each label against the user's stated intent.
-3. Build `--skip <complement>` = the line numbers that DON'T match the intent.
-4. Re-run `--dry` with `--skip` to verify the trimmed queue is non-empty.
-5. If trimmed queue is non-empty, launch without `--dry` (in background). If empty, ABORT with log.
+Why not `--recalib --skip <complement>`:
+- `--skip` restricts INFERENCE scope only; cal scope is independent.
+- `--recalib --skip X` re-cals every line including the skipped ones — wasted GPU on already-good cals.
+- It's also fragile (1-indexed line numbers shift if the runfile is edited).
 
-No user prompts. Log the matching decisions in plain text alongside the launch so the audit trail is visible.
+Standard partial-scope pattern:
+1. Edit the runfile: remove `[DONE]/[FAST]/[CAL]/[ERROR]` from the lines you want re-run.
+2. Run normally: `cd /workspace/DartQuant/fake_quant && python run_experiments.py --runfile ../data/runs/runs_v6.ini -g <GPUS> -F` (or no `-F` for full eval).
+3. The runner picks up unflagged lines, skips the rest. On success it stamps `[FAST]` or `[DONE]` back.
+
+What if cal is missing for an unflagged line? See "Single-line cal for a brand-new line" below — the runner won't auto-cal; you cal once directly, then unflag and run inference.
+
+`--skip` exists for the rare case where the runner's queue includes lines you specifically want excluded (e.g. one of the unflagged lines is broken and you don't want to retry it tonight). It's a simple ordinal trimmer, not a partial-recalib mechanism.
+
+⚠️ **`multi_calibration.py` does NOT support `--skip` for cal-queue trimming.** Despite sharing most of `run_experiments.py`'s flag surface, `multi_calibration.py` forwards `--skip <list>` as a pass-through arg to each inner `calibrate_act_scales.py` invocation rather than filtering its own queue. If you need single-line cal, use the direct-cal pattern below.
+
+## Single-line cal for a brand-new line (the right way)
+
+When a new line is added to the runfile and inference fails with `"Static act scales not found"` → a `[ERROR]` mark gets stamped (the wrapper conflates "cal missing" with "execution error"; see `[ERROR]` recovery section). The temptation is `run_experiments.py --recalib --skip <complement>`, but that re-cals every other line too.
+
+Cleanest path: pull the exact cal command from the dry preview and run `calibrate_act_scales.py` directly.
+
+```bash
+# 1. Get the cal command for the target line from the dry preview's cal section:
+cd /workspace/DartQuant/fake_quant && python run_experiments.py --runfile ../data/runs/runs_v6.ini -g <gpu> --recalib --dry
+# (look at the cal section; each cal job's full command is printed)
+
+# 2. Run that ONE cal command directly (in background):
+cd /workspace/DartQuant/calibrater && nohup env CUDA_VISIBLE_DEVICES=<gpu> python calibrate_act_scales.py <args from dry> > /tmp/<label>_cal.log 2>&1 &
+
+# 3. After cal finishes, remove [ERROR] from the runfile line if needed, then run inference normally:
+cd /workspace/DartQuant/fake_quant && python run_experiments.py --runfile ../data/runs/runs_v6.ini -g <gpu> -F
+```
+
+The runner's normal mode picks up the now-unflagged line and skips `[DONE]` ones. Cost: one cal pass on one GPU (~5–10 min) + inference (~3 min) instead of N cals × N lines.
 
 ## Calibration GPU
 
@@ -125,26 +152,29 @@ When a runfile line fails, `run_experiments.py` writes back `[ERROR]` (inference
 2. Look for tracebacks (`Traceback (most recent call last)`), `RuntimeError`, `AssertionError`, or `Error:` lines.
 3. Surface the failing line + the relevant traceback excerpt — don't dump the whole log.
 
+⚠️ **`[ERROR]` ≠ "this line is broken".** The runner stamps `[ERROR]` on any non-zero exit, including the case where the wrapper bails with `"Static act scales not found"` because cal was never run for a brand-new line. Common signature in the inference log: a single message saying `Static act scales not found at ...` followed by `Run calibration first: ...`. That's not a real failure — the line just needs a cal pass first. Use the "Single-line cal for a brand-new line" recipe above; don't chase tracebacks that aren't there.
+
 Don't auto-retry failed lines without understanding the failure first; the same failure will likely repeat.
 
 ## Don't
 
 - Don't block on user input. Pick the safe default per "Default-on-ambiguity rules" and proceed. Log the choice.
 - Don't tail running jobs in a loop — kick them off in the background and use `dart-ppl-status` for status checks.
-- Don't recreate or modify the runfile. The user owns runs_v6.ini; if the queue is wrong, ABORT and log; don't try to "fix" it.
-- Don't strip the runfile's `[DONE]` / `[FAST]` flags. Those are state markers the script writes back.
+- Don't restructure the runfile (reorder lines, rewrite labels, change configs). The user owns runs_v6.ini's content; if the queue is wrong, ABORT and log.
+- DO feel free to unflag lines (strip `[DONE]/[FAST]/[CAL]/[ERROR]`) when the user wants those lines re-run — that's the standard partial-scope pattern. The runner re-stamps the marker on the next successful run.
 
 ## Example: autonomous workflow
 
 User: "the cal-fix is committed, rerun the v6 ablations with the new cal."
 You:
 1. `nvidia-smi --query-gpu=index,memory.used --format=csv,noheader` → identify free GPUs.
-2. `cd /workspace/DartQuant/fake_quant && python run_experiments.py --runfile ../data/runs/runs_v6.ini -g <free-gpus> --recalib -F --dry` → full numbered queue.
-3. Read the queue. Substring-match "v6 ablations" → `s1_no_fp16cal_full_M4S4_t2int24a0_*` lines. Compute `--skip` for everything else.
-4. Re-run `--dry --skip <complement>` → verify trimmed queue is non-empty and contains the expected ablation labels.
-5. Drop `--dry`, launch in background. Output: log paths + a one-line summary of what was launched + a pointer to `dart-ppl-status` for monitoring.
+2. Substring-match "v6 ablations" against runfile labels → `s1_no_fp16cal_full_M4S4_t2int24a0_*` lines. Edit those lines: strip their `[DONE]/[FAST]/[CAL]` markers.
+3. `cd /workspace/DartQuant/fake_quant && python run_experiments.py --runfile ../data/runs/runs_v6.ini -g <free-gpus> -F --dry` → confirm only the unflagged lines are in the queue.
+4. Drop `--dry`, launch in background. Output: log paths + a one-line summary of what was launched + a pointer to `dart-ppl-status` for monitoring.
 
-Trimmed queue empty → ABORT with log. Trimmed queue contains unexpected lines → log a warning but proceed (the user can `--skip` more next iteration).
+Cal: if the unflagged lines have stale cal that needs regenerating too, run the matching cal commands directly first (single-line cal recipe) before the inference pass — don't try to do it through `--recalib --skip`.
+
+Queue empty → ABORT with log. Queue contains unexpected lines → log a warning but proceed.
 
 ## Example: footgun caught and auto-fixed
 
@@ -152,8 +182,8 @@ User: "rerun with `--overwrite --gptq`"
 You:
 1. Detect: `--gptq` without `--recalib`. Per default-on-ambiguity rules, auto-add `--recalib`.
 2. Log: "auto-added --recalib to avoid GPTQ-vs-cal mismatch (the 2026-05-04 bug)".
-3. Continue with the standard workflow (GPU check → dry → skip-complement → launch).
-4. Final command logged: `... --recalib --gptq --overwrite -F` (and `--skip` if intent narrowed scope).
+3. Continue with the standard workflow (GPU check → dry → launch). Whole-file scope under `--recalib` — if narrower scope is intended, the unflag-pattern is wrong here (cal regen is global by definition); surface to the user instead.
+4. Final command logged: `... --recalib --gptq --overwrite -F`.
 
 ## Example: the footgun the user actually hit
 
