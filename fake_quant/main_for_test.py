@@ -623,8 +623,8 @@ def main():
             # at quant_utils:830.
             _wgm = getattr(args, 'weight_group_mode', 'all')
             _keep = (_wgm == 'all'
-                     or 'down_proj' in name
-                     or (_wgm == 'down_o' and 'o_proj' in name))
+                     or any(f'{tok}_proj' in name
+                            for tok in _wgm.split('_')))
             layer_w_groupsize = args.w_groupsize if _keep else -1
             qlayer.prepare_int_gemm(
                 w_bits=layer_w_bits,

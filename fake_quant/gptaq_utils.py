@@ -165,8 +165,8 @@ def gptaq_fwrd(model, dataloader, dev, args):
                 # 'down_o': keep down_proj AND o_proj per-group; rest per-channel.
                 _wgm = getattr(args, 'weight_group_mode', 'all')
                 _keep = (_wgm == 'all'
-                         or 'down_proj' in bare_name
-                         or (_wgm == 'down_o' and 'o_proj' in bare_name))
+                         or any(f'{tok}_proj' in bare_name
+                                for tok in _wgm.split('_')))
                 layer_w_groupsize = args.w_groupsize if _keep else -1
                 layer_scalewise = scalewise and (layer_w_groupsize > 0)
                 if w_bits_map:
@@ -261,8 +261,8 @@ def gptaq_fwrd(model, dataloader, dev, args):
                 gptq[name].pre_shift_fp_target(percdamp=args.percdamp)
                 bare_name = name.replace('.module', '')
                 _keep = (_wgm == 'all'
-                         or 'down_proj' in bare_name
-                         or (_wgm == 'down_o' and 'o_proj' in bare_name))
+                         or any(f'{tok}_proj' in bare_name
+                                for tok in _wgm.split('_')))
                 layer_w_groupsize = args.w_groupsize if _keep else -1
                 # If init_scalewise was called above on the un-shifted W,
                 # re-init now so the per-layer hwscale global reflects the
@@ -350,8 +350,8 @@ def _enable_int_gemm_on_subset(layer, names, args, layer_idx, w_bits_map):
             )
             _wgm = getattr(args, 'weight_group_mode', 'all')
             _keep = (_wgm == 'all'
-                     or 'down_proj' in bare
-                     or (_wgm == 'down_o' and 'o_proj' in bare))
+                     or any(f'{tok}_proj' in bare
+                            for tok in _wgm.split('_')))
             _ig_w_gs = args.w_groupsize if _keep else -1
             ql.prepare_int_gemm(
                 w_bits=_ig_wb,

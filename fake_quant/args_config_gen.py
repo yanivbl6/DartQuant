@@ -201,7 +201,6 @@ def parser_gen():
     parser.add_argument('--w_groupsize', type=int, default=-1,
                         help='Groupsize for weight quantization. Note that this should be the same as a_groupsize')
     parser.add_argument('--weight_group_mode', type=str, default='all',
-                        choices=['all', 'down', 'down_o'],
                         help='Per-Linear weight groupsize policy. '
                              '"all" (default): every Linear uses --w_groupsize. '
                              '"down": only down_proj uses --w_groupsize; all '

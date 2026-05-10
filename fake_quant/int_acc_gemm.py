@@ -184,7 +184,18 @@ def resolve_auto_acc_dtype(qlayers, total_bits, safety_bits):
 
         if (getattr(qlayer, 'w_group_size', -1) <= 0
                 and getattr(qlayer, 'w_scale', None) is not None):
-            w_post = float(qlayer.w_scale.abs().max().item())
+            # Per-channel-w: the K-loop accumulator stores integer sums
+            # before w_scale is applied (post-loop). The worst-case
+            # T2 envelope is bounded by output_max / (a_post * MIN|w_scale|),
+            # because the channel with the smallest w_scale needs the
+            # largest sum to reach output_max. Using max|w_scale| here
+            # under-bounds the envelope by log2(w_max/w_min) bits and
+            # causes T2 wraparound on per-channel-w layers (e.g. WGQ-DOWN
+            # non-down). See: layer 15 q_proj has ratio ~31 → 5 bits.
+            _w_abs = qlayer.w_scale.abs()
+            _w_nz = _w_abs[_w_abs > 0]
+            w_post = (float(_w_nz.min().item())
+                      if _w_nz.numel() > 0 else 1.0)
         else:
             w_post = 1.0
 

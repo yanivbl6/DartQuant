@@ -127,13 +127,15 @@ def add_quant_args(parser):
     parser.add_argument('-G', '--groupsize', type=int, default=128,
                         help='Group size for W, K, V (default: 128)')
     parser.add_argument('--weight_group_mode', type=str, default='all',
-                        choices=['all', 'down', 'down_o'],
                         help='Per-Linear weight groupsize policy. '
                              '"all" (default): every Linear uses --groupsize. '
-                             '"down": only down_proj uses --groupsize; all '
-                             'other Linears go per-channel (-1). '
-                             '"down_o": down_proj AND o_proj use --groupsize; '
-                             'all other Linears go per-channel (-1).')
+                             'Otherwise an underscore-separated list of '
+                             'projection names to KEEP per-group (rest go '
+                             'per-channel, -1). Tokens: q, k, v, o, gate, up, '
+                             'down. E.g. "down" = only down_proj per-group; '
+                             '"down_o" = down + o per-group; "down_o_v" = '
+                             'down + o + v per-group; "down_q_k_v_o_gate" = '
+                             'all per-group except up_proj.')
     parser.add_argument('--sym', action='store_true',
                         help='Symmetric quantization for W/K/V')
     parser.add_argument('--w_asym', action='store_true',
@@ -555,10 +557,11 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False,
     # post-GPTQ cal (observers see different weight-quant distortion), and the
     # result tag. Naturally absent from FP16 cal tag (early return at line ~393).
     _wgm = getattr(args, 'weight_group_mode', 'all')
-    if _wgm == 'down':
-        tag += "_WGQ-DOWN"
-    elif _wgm == 'down_o':
-        tag += "_WGQ-DOWN-O"
+    if _wgm and _wgm != 'all':
+        # Generic: any underscore-separated list of projection names becomes
+        # _WGQ-<UPPER-DASH-SEPARATED>. Existing two-token forms are preserved
+        # (down → DOWN, down_o → DOWN-O).
+        tag += "_WGQ-" + _wgm.replace('_', '-').upper()
     # Output quantization tag (activation-side, not relevant for GPTQ cache)
     _qo = getattr(args, 'quant_out', 'none')
     if _qo != 'none' and not for_gptq_cache:

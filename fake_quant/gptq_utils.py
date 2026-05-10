@@ -480,8 +480,8 @@ def gptq_fwrd(model, dataloader, dev, args):
                 # 'down_o': keep down_proj AND o_proj per-group; rest per-channel.
                 _wgm = getattr(args, 'weight_group_mode', 'all')
                 _keep = (_wgm == 'all'
-                         or 'down_proj' in bare_name
-                         or (_wgm == 'down_o' and 'o_proj' in bare_name))
+                         or any(f'{tok}_proj' in bare_name
+                                for tok in _wgm.split('_')))
                 layer_w_groupsize = args.w_groupsize if _keep else -1
                 # scalewise requires a positive groupsize (init_scalewise raises
                 # otherwise). Disable per-Linear for the per-channel case.
@@ -547,8 +547,8 @@ def gptq_fwrd(model, dataloader, dev, args):
             for name in subset:
                 bare_name = name.replace('.module', '')
                 _keep = (_wgm == 'all'
-                         or 'down_proj' in bare_name
-                         or (_wgm == 'down_o' and 'o_proj' in bare_name))
+                         or any(f'{tok}_proj' in bare_name
+                                for tok in _wgm.split('_')))
                 layer_w_groupsize = args.w_groupsize if _keep else -1
                 loss = gptq[name].fasterquant(
                     percdamp=args.percdamp, groupsize=layer_w_groupsize,
@@ -620,8 +620,8 @@ def gptq_fwrd(model, dataloader, dev, args):
                         _ig_fp4_mode == 'down' and 'down_proj' in qname
                     )
                     _keep = (_wgm_safety == 'all'
-                             or 'down_proj' in bare
-                             or (_wgm_safety == 'down_o' and 'o_proj' in bare))
+                             or any(f'{tok}_proj' in bare
+                                    for tok in _wgm_safety.split('_')))
                     _ig_w_gs = args.w_groupsize if _keep else -1
                     ql.prepare_int_gemm(
                         w_bits=_ig_wb,

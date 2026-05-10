@@ -457,7 +457,6 @@ Examples:
     parser.add_argument('-G', '--groupsize', type=int, default=128,
                         help='Group size for W, K, V (default: 128)')
     parser.add_argument('--weight_group_mode', type=str, default='all',
-                        choices=['all', 'down', 'down_o'],
                         help='Per-Linear weight groupsize policy. '
                              '"all" (default): every Linear uses --groupsize. '
                              '"down": only down_proj uses --groupsize; all '

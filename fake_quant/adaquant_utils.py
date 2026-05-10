@@ -653,8 +653,8 @@ def adaquant_fwrd(model, dataloader, dev, args, adaquant_params=None):
 
                 bare_name = name.replace('.module', '')
                 _keep = (_wgm == 'all'
-                         or 'down_proj' in bare_name
-                         or (_wgm == 'down_o' and 'o_proj' in bare_name))
+                         or any(f'{tok}_proj' in bare_name
+                                for tok in _wgm.split('_')))
                 layer_w_groupsize = args.w_groupsize if _keep else -1
 
                 # Get the activation quantizer if this linear is wrapped
@@ -738,8 +738,8 @@ def adaquant_fwrd(model, dataloader, dev, args, adaquant_params=None):
                     if getattr(args, 'w_bits_down_proj', None) is not None and 'down_proj' in qname:
                         _ig_wb = args.w_bits_down_proj
                     _keep = (_wgm_safety == 'all'
-                             or 'down_proj' in bare
-                             or (_wgm_safety == 'down_o' and 'o_proj' in bare))
+                             or any(f'{tok}_proj' in bare
+                                    for tok in _wgm_safety.split('_')))
                     _ig_w_gs = args.w_groupsize if _keep else -1
                     ql.prepare_int_gemm(
                         w_bits=_ig_wb,
