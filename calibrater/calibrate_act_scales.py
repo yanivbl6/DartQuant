@@ -456,6 +456,14 @@ Examples:
                         help='V-cache bit-width (default: same as -k)')
     parser.add_argument('-G', '--groupsize', type=int, default=128,
                         help='Group size for W, K, V (default: 128)')
+    parser.add_argument('--weight_group_mode', type=str, default='all',
+                        choices=['all', 'down', 'down_o'],
+                        help='Per-Linear weight groupsize policy. '
+                             '"all" (default): every Linear uses --groupsize. '
+                             '"down": only down_proj uses --groupsize; all '
+                             'other Linears go per-channel (-1). '
+                             '"down_o": down_proj AND o_proj use --groupsize; '
+                             'all other Linears go per-channel (-1).')
     parser.add_argument('--sym', action='store_true',
                         help='Symmetric K/V quantization (default: asymmetric)')
     parser.add_argument('--w_asym', action='store_true',
@@ -1214,6 +1222,7 @@ def main():
                 gptq_args.w_clip = args.w_clip
                 gptq_args.w_bits_down_proj = None
                 gptq_args.w_bits_map = getattr(args, 'w_bits_map', None)
+                gptq_args.weight_group_mode = getattr(args, 'weight_group_mode', 'all')
                 gptq_args.percdamp = args.percdamp
                 gptq_args.act_order = False
                 gptq_args.w_static_groups = False

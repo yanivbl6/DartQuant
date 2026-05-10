@@ -158,8 +158,18 @@ def gptaq_fwrd(model, dataloader, dev, args):
                 layer_weight_sym = not (args.w_asym)
                 if 'lm_head' in name:
                     continue
+                bare_name = name.replace('.module', '')
+                # --weight_group_mode: per-Linear weight groupsize override.
+                # 'all' (default): every Linear at args.w_groupsize.
+                # 'down':   keep down_proj per-group; rest per-channel.
+                # 'down_o': keep down_proj AND o_proj per-group; rest per-channel.
+                _wgm = getattr(args, 'weight_group_mode', 'all')
+                _keep = (_wgm == 'all'
+                         or 'down_proj' in bare_name
+                         or (_wgm == 'down_o' and 'o_proj' in bare_name))
+                layer_w_groupsize = args.w_groupsize if _keep else -1
+                layer_scalewise = scalewise and (layer_w_groupsize > 0)
                 if w_bits_map:
-                    bare_name = name.replace('.module', '')
                     full_name = f'model.layers.{i}.{bare_name}'
                     layer_weight_bits = w_bits_map.get(full_name, layer_weight_bits)
                 if args.w_bits_down_proj is not None and 'down_proj' in name:
@@ -174,8 +184,7 @@ def gptaq_fwrd(model, dataloader, dev, args):
                     )
                 # Scalewise FP16 act scale lookup — same as gptq_fwrd.
                 layer_act_scale = None
-                if scalewise and fp16_act_scales is not None:
-                    bare_name = name.replace('.module', '')
+                if layer_scalewise and fp16_act_scales is not None:
                     qkey = f'model.layers.{i}.{bare_name}.quantizer'
                     entry = fp16_act_scales.get(qkey)
                     if entry is not None:
@@ -191,13 +200,13 @@ def gptaq_fwrd(model, dataloader, dev, args):
                     mse=args.w_clip,
                     gscaler=getattr(args, 'gscaler_parsed', None),
                     nvfp4=layer_use_fp4,
-                    scalewise=scalewise,
+                    scalewise=layer_scalewise,
                     hwscale_spec=hwscale_parsed,
                     layer_act_scale=layer_act_scale,
                 )
                 if gptq[name].quantizer.scalewise:
                     gptq[name].quantizer.init_scalewise(
-                        subset[name].weight.data, args.w_groupsize)
+                        subset[name].weight.data, layer_w_groupsize)
 
             # Paired FP/Q activation capture. The FP hook stashes per-sample
             # X_FP per Linear in fp_cache; the Q hook reads the matching
@@ -245,18 +254,23 @@ def gptaq_fwrd(model, dataloader, dev, args):
                     h.remove()
                 fp_cache.clear()
 
+            _wgm = getattr(args, 'weight_group_mode', 'all')
             for name in subset:
                 # GPTAQ: pre-shift W ← W + W (C - H) H^-1, then run GPTQ
                 # on the shifted weight via the standard fasterquant path.
                 gptq[name].pre_shift_fp_target(percdamp=args.percdamp)
+                bare_name = name.replace('.module', '')
+                _keep = (_wgm == 'all'
+                         or 'down_proj' in bare_name
+                         or (_wgm == 'down_o' and 'o_proj' in bare_name))
+                layer_w_groupsize = args.w_groupsize if _keep else -1
                 # If init_scalewise was called above on the un-shifted W,
                 # re-init now so the per-layer hwscale global reflects the
                 # shifted weight magnitudes.
                 if gptq[name].quantizer.scalewise:
                     gptq[name].quantizer.init_scalewise(
-                        subset[name].weight.data, args.w_groupsize)
+                        subset[name].weight.data, layer_w_groupsize)
 
-                layer_w_groupsize = args.w_groupsize
                 loss = gptq[name].fasterquant(
                     percdamp=args.percdamp, groupsize=layer_w_groupsize,
                     actorder=args.act_order, static_groups=args.w_static_groups,
@@ -324,8 +338,8 @@ def _enable_int_gemm_on_subset(layer, names, args, layer_idx, w_bits_map):
             continue
         if ql.quantizer.bits <= 16 and getattr(ql.quantizer, 'groupsize', -1) <= 0:
             _ig_wb = args.w_bits
+            bare = qname.replace('.module', '')
             if w_bits_map:
-                bare = qname.replace('.module', '')
                 _ig_wb = w_bits_map.get(f'model.layers.{layer_idx}.{bare}', _ig_wb)
             if (getattr(args, 'w_bits_down_proj', None) is not None
                     and 'down_proj' in qname):
@@ -334,10 +348,15 @@ def _enable_int_gemm_on_subset(layer, names, args, layer_idx, w_bits_map):
             layer_use_fp4 = (fp4_mode == 'all') or (
                 fp4_mode == 'down' and 'down_proj' in qname
             )
+            _wgm = getattr(args, 'weight_group_mode', 'all')
+            _keep = (_wgm == 'all'
+                     or 'down_proj' in bare
+                     or (_wgm == 'down_o' and 'o_proj' in bare))
+            _ig_w_gs = args.w_groupsize if _keep else -1
             ql.prepare_int_gemm(
                 w_bits=_ig_wb,
                 w_sym=not args.w_asym,
-                w_group_size=args.w_groupsize,
+                w_group_size=_ig_w_gs,
                 acc_bits=args.acc_bits,
                 acc_block_k=args.acc_block_k,
                 use_triton=getattr(args, 'int_gemm_use_triton', True),

@@ -126,6 +126,14 @@ def add_quant_args(parser):
                         help='V-cache bit-width (default: same as -k)')
     parser.add_argument('-G', '--groupsize', type=int, default=128,
                         help='Group size for W, K, V (default: 128)')
+    parser.add_argument('--weight_group_mode', type=str, default='all',
+                        choices=['all', 'down', 'down_o'],
+                        help='Per-Linear weight groupsize policy. '
+                             '"all" (default): every Linear uses --groupsize. '
+                             '"down": only down_proj uses --groupsize; all '
+                             'other Linears go per-channel (-1). '
+                             '"down_o": down_proj AND o_proj use --groupsize; '
+                             'all other Linears go per-channel (-1).')
     parser.add_argument('--sym', action='store_true',
                         help='Symmetric quantization for W/K/V')
     parser.add_argument('--w_asym', action='store_true',
@@ -542,6 +550,15 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False,
     if _hw_accurate_flag and (
             not (for_gptq_cache or for_cal_cache) or _aligned_in_cache):
         tag += "_hwacc"
+    # Per-Linear weight-groupsize policy (--weight_group_mode). Affects GPTQ
+    # output (different per-Linear groupsize → different quantized weights),
+    # post-GPTQ cal (observers see different weight-quant distortion), and the
+    # result tag. Naturally absent from FP16 cal tag (early return at line ~393).
+    _wgm = getattr(args, 'weight_group_mode', 'all')
+    if _wgm == 'down':
+        tag += "_WGQ-DOWN"
+    elif _wgm == 'down_o':
+        tag += "_WGQ-DOWN-O"
     # Output quantization tag (activation-side, not relevant for GPTQ cache)
     _qo = getattr(args, 'quant_out', 'none')
     if _qo != 'none' and not for_gptq_cache:
@@ -727,6 +744,9 @@ def build_quant_args(args):
            '-k', str(args.k_bits),
            '-v', str(args.v_bits),
            '-G', str(args.groupsize)]
+    _wgm = getattr(args, 'weight_group_mode', 'all')
+    if _wgm != 'all':
+        cmd += ['--weight_group_mode', _wgm]
     if args.sym:
         cmd.append('--sym')
     if getattr(args, 'w_asym', False):

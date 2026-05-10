@@ -172,6 +172,7 @@ R4_STATS_BATCHES=0
 STOCHASTIC_QUANT=0
 SEMI_INT_GEMM=""
 FP4="none"
+WEIGHT_GROUP_MODE="all"
 FP16_CALIB=0
 SCALEWISE=0
 FORCE_RECALIB=0
@@ -242,6 +243,7 @@ while [[ $# -gt 0 ]]; do
         --gptaq)         GPTAQ=1;           shift   ;;
         --set)         PRESET="$2";       shift 2 ;;
         --fp4)         FP4="$2";           shift 2 ;;
+        --weight_group_mode) WEIGHT_GROUP_MODE="$2"; shift 2 ;;
         --wait)        WAIT_GPU=1;         shift   ;;
         --max_used_mb) MAX_USED_MB="$2";   shift 2 ;;
         -F|--fast) FAST=1;        shift   ;;
@@ -593,6 +595,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ "$SCALEWISE" == "1" ] && TAG_ARGS="${TAG_ARGS} --scalewise"
 [ "$GPTAQ" == "1" ] && TAG_ARGS="${TAG_ARGS} --gptaq"
 [ "$FP4" != "none" ] && TAG_ARGS="${TAG_ARGS} --fp4 ${FP4}"
+[ "$WEIGHT_GROUP_MODE" != "all" ] && TAG_ARGS="${TAG_ARGS} --weight_group_mode ${WEIGHT_GROUP_MODE}"
 
 SCRIPT_DIR_BASE="$(cd "$(dirname "$0")/../.." && pwd)"
 QUANT_TAG=$(python "${SCRIPT_DIR_BASE}/experiment_config.py" ${TAG_ARGS})
@@ -776,6 +779,7 @@ python main_for_test.py \
     $([ "$UD_EQ" == "1" ] && echo "--ud_eq") \
     $([ "$UGD_EQ" == "1" ] && echo "--ugd_eq") \
     $([ "$FP4" != "none" ] && echo "--fp4 ${FP4}") \
+    $([ "$WEIGHT_GROUP_MODE" != "all" ] && echo "--weight_group_mode ${WEIGHT_GROUP_MODE}") \
     --percdamp 0.1 \
     --no-w_ft \
     --ft_percdamp 0.0 \

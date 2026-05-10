@@ -618,10 +618,18 @@ def main():
             layer_use_fp4 = (fp4_mode == 'all') or (
                 fp4_mode == 'down' and 'down_proj' in name
             )
+            # --weight_group_mode: per-Linear weight groupsize, must match
+            # what GPTQ stored in _gptq_w_scale. Mismatch → reshape error
+            # at quant_utils:830.
+            _wgm = getattr(args, 'weight_group_mode', 'all')
+            _keep = (_wgm == 'all'
+                     or 'down_proj' in name
+                     or (_wgm == 'down_o' and 'o_proj' in name))
+            layer_w_groupsize = args.w_groupsize if _keep else -1
             qlayer.prepare_int_gemm(
                 w_bits=layer_w_bits,
                 w_sym=not args.w_asym,
-                w_group_size=args.w_groupsize,
+                w_group_size=layer_w_groupsize,
                 acc_bits=args.acc_bits,
                 acc_block_k=args.acc_block_k,
                 use_triton=args.int_gemm_use_triton,

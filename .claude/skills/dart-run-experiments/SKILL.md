@@ -15,6 +15,8 @@ Wrap `fake_quant/run_experiments.py`. Two responsibilities: (a) pick the right f
    ```
    "Free" = `memory.used < ~500 MiB`. Note which GPUs are free.
 
+   **NVML init failure → user-gate.** If `nvidia-smi` returns `Failed to initialize NVML`, stop and ask the user before launching anything. Don't try to work around it; CUDA subprocesses fail unpredictably even when `/dev/nvidia*` is present.
+
 2. **Decide flag combination** from user intent (see flag table below).
 
 3. **`--dry` first, always — interpret the output yourself.** Run the dry preview to get the numbered queue and GPU assignment. Use it to:

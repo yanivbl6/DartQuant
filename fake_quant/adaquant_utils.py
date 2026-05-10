@@ -646,11 +646,16 @@ def adaquant_fwrd(model, dataloader, dev, args, adaquant_params=None):
                 h.remove()
 
             # --- Optimise each layer in the group ---
+            _wgm = getattr(args, 'weight_group_mode', 'all')
             for name in subset:
                 short_name = name.replace('self_attn.', '').replace('mlp.', '').replace('.module', '')
                 pbar.set_postfix(sub=short_name)
 
-                layer_w_groupsize = args.w_groupsize
+                bare_name = name.replace('.module', '')
+                _keep = (_wgm == 'all'
+                         or 'down_proj' in bare_name
+                         or (_wgm == 'down_o' and 'o_proj' in bare_name))
+                layer_w_groupsize = args.w_groupsize if _keep else -1
 
                 # Get the activation quantizer if this linear is wrapped
                 a_quantizer = None
@@ -692,15 +697,19 @@ def adaquant_fwrd(model, dataloader, dev, args, adaquant_params=None):
                                                sym=True, clip_ratio=1.0)
                     if ql.quantizer.bits < 16 and getattr(ql.quantizer, 'groupsize', -1) <= 0:
                         _ig_wb = args.w_bits
+                        bare = qname.replace('.module', '')
                         if w_bits_map:
-                            bare = qname.replace('.module', '')
                             _ig_wb = w_bits_map.get(f'model.layers.{i}.{bare}', _ig_wb)
                         if getattr(args, 'w_bits_down_proj', None) is not None and 'down_proj' in qname:
                             _ig_wb = args.w_bits_down_proj
+                        _keep = (_wgm == 'all'
+                                 or 'down_proj' in bare
+                                 or (_wgm == 'down_o' and 'o_proj' in bare))
+                        _ig_w_gs = args.w_groupsize if _keep else -1
                         ql.prepare_int_gemm(
                             w_bits=_ig_wb,
                             w_sym=not args.w_asym,
-                            w_group_size=args.w_groupsize,
+                            w_group_size=_ig_w_gs,
                             acc_bits=args.acc_bits,
                             acc_block_k=args.acc_block_k,
                             use_triton=getattr(args, 'int_gemm_use_triton', True),
@@ -713,6 +722,7 @@ def adaquant_fwrd(model, dataloader, dev, args, adaquant_params=None):
         # Safety-net: enable int_gemm on remaining layers
         if getattr(args, 'int_gemm', False):
             _a_bits = getattr(args, 'a_bits', 16)
+            _wgm_safety = getattr(args, 'weight_group_mode', 'all')
             qlayers_ig = quant_utils.find_qlayers(layer, layers=[quant_utils.ActQuantWrapper])
             for qname, ql in qlayers_ig.items():
                 if ql.use_int_gemm:
@@ -722,15 +732,19 @@ def adaquant_fwrd(model, dataloader, dev, args, adaquant_params=None):
                                            sym=True, clip_ratio=1.0)
                 if ql.quantizer.bits < 16 and getattr(ql.quantizer, 'groupsize', -1) <= 0:
                     _ig_wb = args.w_bits
+                    bare = qname.replace('.module', '')
                     if w_bits_map:
-                        bare = qname.replace('.module', '')
                         _ig_wb = w_bits_map.get(f'model.layers.{i}.{bare}', _ig_wb)
                     if getattr(args, 'w_bits_down_proj', None) is not None and 'down_proj' in qname:
                         _ig_wb = args.w_bits_down_proj
+                    _keep = (_wgm_safety == 'all'
+                             or 'down_proj' in bare
+                             or (_wgm_safety == 'down_o' and 'o_proj' in bare))
+                    _ig_w_gs = args.w_groupsize if _keep else -1
                     ql.prepare_int_gemm(
                         w_bits=_ig_wb,
                         w_sym=not args.w_asym,
-                        w_group_size=args.w_groupsize,
+                        w_group_size=_ig_w_gs,
                         acc_bits=args.acc_bits,
                         acc_block_k=args.acc_block_k,
                         use_triton=getattr(args, 'int_gemm_use_triton', True),
