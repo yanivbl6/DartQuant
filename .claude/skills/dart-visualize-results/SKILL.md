@@ -75,9 +75,9 @@ The script has an open-ended **`--viz K=V,K=V`** flag for visualization-only tun
 | Problem | Filter-side fix | `--viz` knob | Code-side change |
 |---|---|---|---|
 | Too many bars | Tighten filter (`-c "v68,M4S4,t2int"` → narrower) | — | — |
-| Y-axis clips outliers | `--nbl` (drop FP16 if it's the cap-trigger) | `--viz ymin=N,ymax=M` (all panels), `--viz ppl_ymax=N` / `acc_ymax=N` (per-panel-type) | Implemented — read in `_set_focused_ylim` at [show_results.py:418](fake_quant/show_results.py#L418). PPL inversion preserved. **Use `ppl_ymax`** (not the global `ymax`) when capping a PPL outlier in a multi-metric panel that includes accuracy — global `ymax=35` will also clip MMLU/avg around 35, hiding good accuracy. |
+| Y-axis range looks wrong | `--nbl` (drop FP16 if it's the cap-trigger) | `--viz ymin=N,ymax=M` (all panels), `--viz ppl_ymax=N` / `acc_ymax=N` (per-panel-type), `--viz <metric>_ymax=N` (per-metric, e.g. `wiki_ymax=18,ptb_ymax=40,c4_ymax=30`) | Implemented — read in `_set_focused_ylim` at [show_results.py:446](fake_quant/show_results.py#L446). PPL inversion preserved. **Resolution order:** `<metric>_y{min,max}` → `{ppl,acc}_y{min,max}` → `y{min,max}` → auto. **Semantic: manual ymax is for tighter clipping than auto, not for expanding to include outliers.** Auto-cap already clips at `floor(vmin/5)*5 + 10` for PPL (i.e. excludes outliers automatically). When you set a manual ymax, you're zooming in further — useful when even the auto-cap range is too wide to see the contrast between in-range bars. If you instead expand ymax to fit an outlier, the chart's purpose collapses (other bars get crushed). Out-of-range bars get an "↓N.NN" / "↑N.NN" annotation at the panel edge (see below) so a clipped outlier doesn't look like it merely touches the edge. |
 | Want line, got bar | Use a numeric or wildcard `-c` if compatible (`-c 't2int*'` instead of `-c 'wAsym'`) | (proposed: `--viz line=true`) | Edit gate in `_draw_figures` around [show_results.py:745](fake_quant/show_results.py#L745) to read `viz.get('line')`; document the new key here. |
-| Want bar, got both | `--bar` flag exists (predates `--viz`) | — | — |
+| Want bar, got both | `--bar` flag suppresses the line panels (summary drops them and per-metric `_line.png` outputs are skipped). Predates `--viz`, so it's a top-level flag, not a viz key. | — | — |
 | X-axis order weird | — | (proposed: `--viz sort=numeric`) | Sort `key_values` in `_draw_figures` when `viz.get('sort') == 'numeric'`. |
 | Colors collide past 10 keys | — | (proposed: `--viz palette=viridis`) | Branch on `viz.get('palette')` in `_draw_figures` color setup. |
 
@@ -96,7 +96,7 @@ The whole point of `--viz` is to keep the visualization namespace open without b
 
 Listed in expected-bite-order. When you close one, delete it from this list and add the corresponding `--viz` key to Step 4's table.
 
-1. **~~No manual y-limit override~~ — closed 2026-05-06.** `--viz ymin=N,ymax=M` reads in `_set_focused_ylim` at [show_results.py:418](fake_quant/show_results.py#L418). PPL inversion preserved. ← Use this when the auto-cap (`floor(vmin/5)*5 + 10` for PPL) hides outliers.
+1. **~~No manual y-limit override~~ — closed 2026-05-06; ~~no per-metric override~~ — closed 2026-05-11; ~~clipped bars looked solid (no overflow indicator)~~ — closed 2026-05-11.** Three related fixes all in `_render_bar_chart` / `_set_focused_ylim` ([show_results.py:446](fake_quant/show_results.py#L446)). (a) `--viz ymin=N,ymax=M` (global) and `--viz <metric>_ymin/ymax=N` (per-metric) — resolution order `<metric>_y{min,max}` → `{ppl,acc}_y{min,max}` → `y{min,max}` → auto. PPL inversion preserved. (b) Bars whose value falls outside the y-axis range now get an "↓N.NN" or "↑N.NN" annotation pinned to the relevant panel edge (arrow points toward where the true value lies visually). Without this, a clipped catastrophic bar (e.g. M8S0bmin at PPL=40.8 with the auto-cap fixing the panel to [10,20]) fills the panel solidly and reads as "barely worse" instead of "off-chart by ~2×". **Mental model for the manual override:** use it to TIGHTEN beyond the auto-cap (focus more), not to LOOSEN it to include outliers — outliers are meant to be clipped + annotated, not visually equalized with the in-range bars.
 2. **Line chart in binary/variant compare modes.** Wildcard mode now works (see #7 below). Binary (e.g. `-c wAsym`) and variant (string-valued) modes still get bar-only because their key_values are non-numeric strings, and the line gate at [show_results.py:745](fake_quant/show_results.py#L745) checks `cmp_mode in ("numeric", "wildcard")`. `--bar` forces bar-only but there's no symmetric `--viz line=true` for the inverse. Proposed key: `viz.get('line')` to override the gate (would still need a numeric x-axis source — for binary/variant modes that source doesn't exist by default, so this gap is mostly conceptual).
 3. **No summary figure for single-metric runs.** `_save_summary_figure` at [show_results.py:484](fake_quant/show_results.py#L484) returns early when `len(specs) < 2`. Sometimes you want the summary's nicer labels even with one panel. Easy fix: read `viz.get('force_summary')` and skip the `< 2` early return.
 4. **No x-axis ordering control.** Bar / line charts use `key_values` in insertion order. For `t2int*` wildcard the order is whatever order the result files happened to list — often not numeric. Proposed key: `viz['sort'] = 'numeric'` to sort `key_values` (and corresponding column data) by parsed wildcard value.
@@ -143,6 +143,14 @@ User: "the y-axis is squashed, the int28 run got cut off"
 python show_results.py "v68,M4S4" -c "t2int*" --draw wiki,c4 --viz ymin=10,ymax=40
 ```
 The PPL-axis inversion (lower=better at top) is preserved automatically.
+
+User: "the outlier dominates the chart and crushes the in-range contrast"
+
+→ Auto-cap already excludes outliers — most of the time you can just rely on it (no `--viz` flag at all). Out-of-range bars get an "↓N.NN" annotation at the panel edge so the reader still sees the catastrophic value. Use `--bar` to drop the line panels when the compare key isn't a meaningful sweep axis (e.g. named hwscale presets):
+```bash
+python show_results.py "<filter>" -c "<key>" --draw wiki,ptb,c4 --bar
+```
+Reach for `--viz <metric>_ymax=N` only when even the auto-cap is too wide to see the in-range contrast — that's "zoom in further", not "zoom out to fit outliers". The auto-cap formula is `floor(vmin/5)*5 + 10` for PPL, so for wiki vmin=14.37 the auto-cap is [10,20]; if you want to focus on a ±2 range around the best you'd write `--viz wiki_ymax=17` or similar.
 
 User: "compare wAsym vs sym graphically across the t2int sweep"
 

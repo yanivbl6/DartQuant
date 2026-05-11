@@ -1131,7 +1131,7 @@ def main():
             if args.gptq and os.path.isdir(_aq_ckpt):
                 import shutil
                 print(f"--gptq: removing cached AdaQuant checkpoint: {_aq_ckpt}")
-                shutil.rmtree(_aq_ckpt)
+                shutil.rmtree(_aq_ckpt, ignore_errors=True)
 
             if os.path.isdir(_aq_ckpt) and any(
                     f.endswith('.pth') for f in os.listdir(_aq_ckpt)):
@@ -1194,7 +1194,7 @@ def main():
             if args.gptq and os.path.isdir(_gptq_ckpt):
                 import shutil
                 print(f"--gptq: removing cached GPTQ checkpoint: {_gptq_ckpt}")
-                shutil.rmtree(_gptq_ckpt)
+                shutil.rmtree(_gptq_ckpt, ignore_errors=True)
 
             if os.path.isdir(_gptq_ckpt) and any(
                     f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
@@ -1363,10 +1363,19 @@ def main():
                 fp4_mode == 'down' and 'down_proj' in name
             )
             dev = qlayer.module.weight.device
+            # --weight_group_mode: per-Linear weight groupsize override.
+            # Must match what GPTQ stored in _gptq_w_scale, otherwise the
+            # int_gemm fast paths broadcast wrong (sym: silently; asym: hard
+            # crash in _requantize_with_gptq_params). Mirror main_for_test.py.
+            _wgm = getattr(args, 'weight_group_mode', 'all')
+            _keep = (_wgm == 'all'
+                     or any(f'{tok}_proj' in name
+                            for tok in _wgm.split('_')))
+            layer_w_groupsize = args.w_groupsize if _keep else -1
             print(f"  [{n_ig}] {name}: weight on {dev}, shape={list(qlayer.module.weight.shape)}, bits={qlayer.quantizer.bits}, w_bits={layer_w_bits}", flush=True)
             qlayer.prepare_int_gemm(
                 w_bits=layer_w_bits, w_sym=not args.w_asym,
-                w_group_size=args.w_groupsize,
+                w_group_size=layer_w_groupsize,
                 acc_bits=args.acc_bits, acc_block_k=args.acc_block_k,
                 acc_wrap=args.acc_wrap,
                 acc_dtype=getattr(args, 'acc_dtype', 'float'),

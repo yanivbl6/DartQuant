@@ -103,6 +103,12 @@ def parse_viz(spec):
       ppl_ymax=<float>   PPL-panel-only y-axis upper bound (overrides ymax on PPL)
       acc_ymin=<float>   accuracy-panel-only y-axis lower bound (overrides ymin on acc)
       acc_ymax=<float>   accuracy-panel-only y-axis upper bound (overrides ymax on acc)
+      <metric>_ymin/ymax most specific — per-metric override using the --draw
+                         keyword (e.g. wiki_ymax=45, ptb_ymax=115, c4_ymax=100,
+                         mmlu_ymin=0.3). Wins over ppl_*/acc_*/ymin/ymax.
+
+    Resolution order (most → least specific):
+      <metric>_y{min,max}  →  {ppl,acc}_y{min,max}  →  y{min,max}  →  auto.
 
     Values auto-coerce: 'true'/'false' → bool, otherwise int → float → str.
     """
@@ -443,35 +449,49 @@ def _collect_metric_values(configs, matrix, col_idx):
     return vals
 
 
-def _set_focused_ylim(ax, vals, ppl_col, viz=None):
+def _set_focused_ylim(ax, vals, ppl_col, viz=None, metric_kw=None):
     """Set y-axis limits focused on the actual data range.
 
     For PPL columns, the range is fixed to [floor(min, 2 decimals),
     floor(min, 2 decimals) + 10], with the axis inverted so lower (better)
     sits at the top. Manual override via viz['ymin'] / viz['ymax']; either
     or both may be set, and PPL-axis inversion is preserved.
+
+    Per-metric override (e.g. wiki_ymax) wins when *metric_kw* is supplied —
+    useful in multi-panel summaries where different PPL metrics have very
+    different ranges (one global ymax over-zooms the smaller-range panels).
     """
     if not vals:
         return
     vmin, vmax = min(vals), max(vals)
     viz = viz or {}
-    ymin_global = viz.get("ymin")
-    ymax_global = viz.get("ymax")
+    mk = metric_kw.lower() if metric_kw else None
+
+    def _pick(per_metric_suffix, type_key, global_key):
+        if mk is not None:
+            v = viz.get(f"{mk}_{per_metric_suffix}")
+            if v is not None:
+                return v
+        v = viz.get(type_key)
+        if v is not None:
+            return v
+        return viz.get(global_key)
+
     if ppl_col:
         import math
         floored = math.floor(vmin/5)*5
         floored2 = math.floor(vmax/5+1)*5
         if (floored2 > floored + 20):
             floored2 = floored + 10
-        ymin_override = viz.get("ppl_ymin", ymin_global)
-        ymax_override = viz.get("ppl_ymax", ymax_global)
+        ymin_override = _pick("ymin", "ppl_ymin", "ymin")
+        ymax_override = _pick("ymax", "ppl_ymax", "ymax")
         lo = ymin_override if ymin_override is not None else floored
         hi = ymax_override if ymax_override is not None else floored2
         ax.set_ylim(hi, lo)  # inverted: lower PPL = top
     else:
         margin = max((vmax - vmin) * 0.3, 0.01)
-        ymin_override = viz.get("acc_ymin", ymin_global)
-        ymax_override = viz.get("acc_ymax", ymax_global)
+        ymin_override = _pick("ymin", "acc_ymin", "ymin")
+        ymax_override = _pick("ymax", "acc_ymax", "ymax")
         lo = ymin_override if ymin_override is not None else (vmin - margin)
         hi = ymax_override if ymax_override is not None else (vmax + margin)
         ax.set_ylim(lo, hi)
@@ -547,7 +567,7 @@ def _save_summary_figure(specs, fig_dir, file_label):
 
 def _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                       baseline_value, key_colors, col_header, common_sub,
-                      short_labels, viz=None):
+                      short_labels, viz=None, metric_kw=None):
     """Render a clustered bar chart for one metric into the given Axes."""
     n_keys = len(key_values)
     bar_width = 0.8 / n_keys
@@ -579,10 +599,30 @@ def _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                 bars.append((x, val))
 
     _set_focused_ylim(ax, _collect_metric_values(configs, matrix, col_idx),
-                      ppl_col, viz=viz)
+                      ppl_col, viz=viz, metric_kw=metric_kw)
 
+    # Annotate bar values. When a bar exceeds the y-axis range (clipped by the
+    # auto-cap or a manual --viz limit), pin the label to the appropriate panel
+    # edge with an arrow pointing toward where the true value lies visually —
+    # otherwise a clipped bar fills the panel solidly and misleads the reader.
+    y0, y1 = ax.get_ylim()
+    y_lo, y_hi = (y0, y1) if y0 < y1 else (y1, y0)  # canonical data low/high
+    inverted = ax.yaxis_inverted()  # True for PPL panels (lower=better=top)
     for x, val in bars:
-        ax.text(x, val, f'{val:.2f}', ha='center', va='bottom', fontsize=9)
+        if y_lo <= val <= y_hi:
+            ax.text(x, val, f'{val:.2f}', ha='center', va='bottom', fontsize=9)
+            continue
+        if val > y_hi:
+            # Beyond y_hi in data: visually below panel if inverted, above if not.
+            arrow = '↓' if inverted else '↑'
+            va = 'bottom' if inverted else 'top'
+            ax.text(x, y_hi, f'{arrow}{val:.2f}', ha='center', va=va,
+                    fontsize=9, color='dimgray', fontweight='bold')
+        else:  # val < y_lo
+            arrow = '↑' if inverted else '↓'
+            va = 'top' if inverted else 'bottom'
+            ax.text(x, y_lo, f'{arrow}{val:.2f}', ha='center', va=va,
+                    fontsize=9, color='dimgray', fontweight='bold')
 
     wrapped = [_wrap_label(l) for l in short_labels]
     ax.set_xticks([ci + bar_width * (n_keys - 1) / 2
@@ -603,7 +643,7 @@ def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
     fig, ax = plt.subplots(figsize=(max(6, len(configs) * 1.5 + 2), 5))
     _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                       baseline_value, key_colors, col_header, common_sub,
-                      short_labels, viz=viz)
+                      short_labels, viz=viz, metric_kw=metric_kw)
     fig.tight_layout()
     return _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value,
                      "bar", subdir="subfigures")
@@ -639,7 +679,8 @@ def _line_chart_x_nums(key_values, wildcard_capture):
 
 def _render_line_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                        baseline_value, col_header, common_sub, short_labels,
-                       fp16_val=None, wildcard_capture=None, viz=None):
+                       fp16_val=None, wildcard_capture=None, viz=None,
+                       metric_kw=None):
     """Render a line chart into the given Axes. Returns False if non-numeric."""
     import matplotlib.pyplot as plt
     x_nums = _line_chart_x_nums(key_values, wildcard_capture)
@@ -697,7 +738,7 @@ def _render_line_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
     ax.grid(True, linestyle=':', linewidth=0.5, alpha=0.6)
     ax.set_axisbelow(True)
     _set_focused_ylim(ax, _collect_metric_values(configs, matrix, col_idx),
-                      ppl_col, viz=viz)
+                      ppl_col, viz=viz, metric_kw=metric_kw)
     if fp16_val is not None:
         y0, y1 = ax.get_ylim()
         lo, hi = min(y0, y1), max(y0, y1)
@@ -723,7 +764,7 @@ def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
     _render_line_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                        baseline_value, col_header, common_sub, short_labels,
                        fp16_val=fp16_val, wildcard_capture=wildcard_capture,
-                       viz=viz)
+                       viz=viz, metric_kw=metric_kw)
     fig.tight_layout()
     return _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value,
                      "line", subdir="subfigures")
@@ -800,11 +841,12 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
                         file_label=file_label, viz=viz)
         specs.append({
             "figsize": bar_figsize,
-            "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header, v=viz:
+            "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header, v=viz,
+                       mk=metric_kw:
                        _render_bar_chart(ax, configs, matrix, ci, p,
                                          key_values, baseline_value,
                                          key_colors, h, common_sub,
-                                         short_labels, viz=v)),
+                                         short_labels, viz=v, metric_kw=mk)),
         })
 
         if (not bar_only and cmp_mode in ("numeric", "wildcard")
@@ -819,13 +861,13 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
                 specs.append({
                     "figsize": line_figsize,
                     "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header,
-                               fv=fp16_val, v=viz:
+                               fv=fp16_val, v=viz, mk=metric_kw:
                                _render_line_chart(ax, configs, matrix, ci, p,
                                                   key_values, baseline_value,
                                                   h, common_sub, short_labels,
                                                   fp16_val=fv,
                                                   wildcard_capture=wildcard_capture,
-                                                  viz=v)),
+                                                  viz=v, metric_kw=mk)),
                 })
 
     _save_summary_figure(specs, fig_dir, file_label)
@@ -833,7 +875,7 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
 
 def _render_all_runs_bar(ax, run_indices, matrix, col_idx, ppl_col, fp16_val,
                          common_sub, col_header, short_labels, colors,
-                         viz=None):
+                         viz=None, metric_kw=None):
     """Render the all-runs bar chart for one metric into the given Axes."""
     xs = list(range(len(run_indices)))
     bar_vals = []
@@ -861,7 +903,7 @@ def _render_all_runs_bar(ax, run_indices, matrix, col_idx, ppl_col, fp16_val,
     ax.set_axisbelow(True)
 
     vals = [v for v in bar_vals if v is not None]
-    _set_focused_ylim(ax, vals, ppl_col, viz=viz)
+    _set_focused_ylim(ax, vals, ppl_col, viz=viz, metric_kw=metric_kw)
     if fp16_val is not None:
         y0, y1 = ax.get_ylim()
         lo, hi = min(y0, y1), max(y0, y1)
@@ -931,17 +973,17 @@ def _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl, draw_metrics,
             figsize=(max(8, len(run_indices) * 0.7 + 2), 5))
         _render_all_runs_bar(ax, run_indices, matrix, col_idx, ppl_col,
                              fp16_val, common_sub, col_header, short_labels,
-                             colors, viz=viz)
+                             colors, viz=viz, metric_kw=metric_kw)
         fig.tight_layout()
         _save_fig(fig, fig_dir, metric_kw, "all", "bar", subdir="subfigures")
 
         specs.append({
             "figsize": (max(8, len(run_indices) * 0.7 + 2), 5),
             "render": (lambda ax, ci=col_idx, p=ppl_col, h=col_header,
-                       fv=fp16_val, v=viz:
+                       fv=fp16_val, v=viz, mk=metric_kw:
                        _render_all_runs_bar(ax, run_indices, matrix, ci, p,
                                             fv, common_sub, h, short_labels,
-                                            colors, viz=v)),
+                                            colors, viz=v, metric_kw=mk)),
         })
 
     _save_summary_figure(specs, fig_dir, "all")
@@ -1497,8 +1539,11 @@ def main():
                              "or table output. Currently recognized: "
                              "ymin/ymax (all panels), ppl_ymin/ppl_ymax "
                              "(PPL panels only), acc_ymin/acc_ymax "
-                             "(accuracy panels only). Add new keys to "
-                             "parse_viz() and the relevant render function.")
+                             "(accuracy panels only), <metric>_ymin/ymax "
+                             "(per-metric using --draw keyword, e.g. "
+                             "wiki_ymax=45, ptb_ymax=115, c4_ymax=100; "
+                             "wins over ppl_*/acc_*/ymin/ymax). Add new keys "
+                             "to parse_viz() and the relevant render function.")
     parser.add_argument("--nbl", "--no-baseline", action="store_true",
                         dest="no_baseline",
                         help="Exclude the FP16 full-precision baseline")

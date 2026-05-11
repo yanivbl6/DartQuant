@@ -11,6 +11,23 @@ description: Shepherd a large DartQuant runfile end-to-end (cal → fast pass �
 
 A large DartQuant runfile (~30 entries) takes most of a day to run end-to-end. The work is genuinely long, and most of it is grinding — but the right *structure* and *cadence* keep things efficient and let you catch failures within minutes rather than at the end. This skill encodes that structure so you don't reinvent it each time.
 
+## Operating principle — minimize user gating
+
+The shepherd's prime directive: **keep the GPUs busy on whatever lines still work**. The user invoked this to walk away for hours; treat their attention as the scarcest resource. Decisions you'd normally surface for approval (skipping broken lines, applying obvious patches, moving to the next stage with partial coverage) you instead make autonomously and surface in the end-of-phase summary.
+
+**Defaults when failures happen mid-run:**
+- Failures in some lines almost never block the rest. The runner already marks failed lines with `[ERROR]` / `[ERROR-CALIBRATE]` and skips them; the other lines complete normally. **Let it.**
+- **Do not stop a launched phase to investigate.** Triage happens between phases, not during. Investigations on lines that are already errored don't make the running lines faster.
+- **Move to the next stage with partial coverage.** If fast pass finishes with 41/44 [FAST] and 3 [ERROR-CALIBRATE], launch full eval on the 41 — the 3 errored lines auto-skip in default mode and don't risk anything. The full-eval pass is the long pole; don't delay it for cal-side failures unrelated to it.
+- **Apply minor patches autonomously.** If a failure is obviously a small bug (one-line fix, parallel-cal race, missing per-layer override that another caller already has, etc.) and the user is reachable later, just fix it and re-cal/re-run the affected lines in parallel with the next phase. Save the long ones — anything that needs a deeper code change or judgment call about correctness — for the user.
+
+**What still warrants stopping and asking:**
+- A failure pattern that suggests the *whole run* is producing bad numbers (e.g. all PPL = 10⁴, or all cals crashing on the same step). That's not "some lines broke", it's "the path is wrong."
+- A patch that changes algorithmic behavior (not just a try/except or a per-layer override mirroring an existing caller). Anything touching cal math, GPTQ weight derivation, or scale computation goes to the user.
+- A decision that costs real wall-clock on a large fraction of the runfile (e.g. "regenerate GPTQ checkpoints shared by 20 already-[FAST] lines"). The risk of invalidating good work is too high for autonomous action.
+
+**Format of the end-of-phase summary:** lead with "Phase X done, N/M lines successful." Then surface the failed labels with one-line root cause each, the patches you applied (if any), and the recommended next step. The user reads this once after the phase, not N times during it.
+
 ## The phase order — always run in this order
 
 For a fresh runfile (no `[DONE]` flags), the right pipeline is:
@@ -92,11 +109,14 @@ done
 Expect: `[FAST]: <total>`, all others 0. If `[ERROR]` or `[ERROR-CALIBRATE]` is non-zero:
 
 1. Identify the failing labels: `grep '^\[ERROR\]' <runfile> | awk '{print $2}'`.
-2. Read the log: `tail -50 /workspace/DartQuant/data/cached_results/<label>.log`.
+2. Read the log: `tail -50 /workspace/DartQuant/data/cached_results/<label>.log`. For `[ERROR-CALIBRATE]`, the cal-side log is at `data/cached_results/cal_<tag>.log` (find via `ls -lt | head` or grep the fastpass log for `Calibration FAILED for:`).
 3. Look for `"Static act scales not found"` (cal artifact missing — usually a dedup-key bug like 2026-05-06 fp16_calib mishandling) or genuine tracebacks.
-4. Fix root cause, strip `[ERROR]` from the affected lines, run the fast pass again (no need to re-cal lines that succeeded; runner picks up unflagged + `[ERROR]`).
+4. **Triage per the operating principle (above).** Bucket each failure:
+   - **Trivial-patch bucket** (parallel-cal race → `ignore_errors=True`, missing per-layer override that another caller already has, obvious one-line fixes): patch it, strip `[ERROR-CALIBRATE]`, re-cal the affected groups in parallel, and **proceed to Phase 4 anyway** — don't block the long phase on the small one.
+   - **Real-bug bucket** (algorithmic, shape math, something that needs design judgment): surface it in the phase summary with the traceback excerpt, recommend skipping, and **launch Phase 4 on the working lines**. The errored lines auto-skip in default mode (per dart-run-experiments' flag-semantics table) and don't risk anything.
+   - **Whole-run-broken bucket** (every cal failing on the same step, all PPLs ≈ 10⁴): stop and ask. This is the only bucket that gates Phase 4.
 
-**Don't proceed to full eval until all 32 are `[FAST]`.** A full-eval pass on a still-broken cal would burn 8 hours and have to be re-done.
+**Default: launch Phase 4 with whatever's [FAST].** "Don't proceed until all are [FAST]" was the old rule and it was wrong — it burns hours of user attention to recover lines that the next phase will skip anyway. The right rule is: launch Phase 4 in parallel with whatever recovery you're doing on the errored subset.
 
 ## Phase 4 — Full-eval pass
 
@@ -150,7 +170,7 @@ You'll watch this for hours. Use `/loop` in **dynamic mode** (no interval) to se
 
 | Signal | What it usually means | Action |
 |---|---|---|
-| `[ERROR]` / `[ERROR-CALIBRATE]` count > 0 | Cal or inference failed for some lines | Stop, investigate logs, fix, recover (Phase 3 recipe) |
+| `[ERROR]` / `[ERROR-CALIBRATE]` count > 0 during a phase | Cal or inference failed for some lines (runner already isolated them) | **Don't stop the running phase.** Triage at phase end per Phase 3 recipe — likely launch Phase 4 anyway, recovery runs in parallel. |
 | GPU at 0% util but inference subprocs alive | Batch waiting on straggler (normal) OR process hung | Check log progress; if not advancing for 10+ min, suspect hang |
 | Inference log: `"Static act scales not found"` | Cal artifact missing for that line's tag | Cal-time tag mismatch (rare with proper dedup); re-cal that line |
 | Cal log ends with `"FP16 act_scales are the deployment scales; skipping post-GPTQ activation calibration."` | `--fp16_calib` path; no post-GPTQ artifact written | NORMAL for fp16dep lines. Only worry if a non-fp16dep line in the same dedup group needs the post-GPTQ artifact (means dedup key is too loose). |
