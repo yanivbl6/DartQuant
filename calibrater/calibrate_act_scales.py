@@ -1138,7 +1138,7 @@ def main():
                     f.endswith('.pth') for f in os.listdir(_aq_ckpt)):
                 print(f"Loading existing AdaQuant checkpoint from: {_aq_ckpt}")
                 utils.load_model_in_parts(model, _aq_ckpt)
-                if args.w_asym and getattr(args, 'int_gemm', False):
+                if getattr(args, 'int_gemm', False):
                     from int_acc_gemm import load_gptq_w_params
                     load_gptq_w_params(model, _aq_ckpt)
             else:
@@ -1184,7 +1184,7 @@ def main():
                                               prefix=f'{model_name}_part')
                     if _x_scales:
                         torch.save(_x_scales, os.path.join(_aq_ckpt, '_adaquant_x_scales.pt'))
-                    if args.w_asym and getattr(args, 'int_gemm', False):
+                    if getattr(args, 'int_gemm', False):
                         from int_acc_gemm import save_gptq_w_params
                         save_gptq_w_params(model, _aq_ckpt)
 
@@ -1201,7 +1201,7 @@ def main():
                     f.endswith('.pth') for f in os.listdir(_gptq_ckpt)):
                 print(f"Loading existing GPTQ checkpoint from: {_gptq_ckpt}")
                 utils.load_model_in_parts(model, _gptq_ckpt)
-                if args.w_asym and getattr(args, 'int_gemm', False):
+                if getattr(args, 'int_gemm', False):
                     from int_acc_gemm import load_gptq_w_params
                     load_gptq_w_params(model, _gptq_ckpt)
             else:
@@ -1275,7 +1275,7 @@ def main():
                     print(f"Saving GPTQ checkpoint to: {_gptq_ckpt}")
                     utils.save_model_in_parts(model, _gptq_ckpt,
                                               prefix=f'{model_name}_part')
-                    if args.w_asym and getattr(args, 'int_gemm', False):
+                    if getattr(args, 'int_gemm', False):
                         from int_acc_gemm import save_gptq_w_params
                         save_gptq_w_params(model, _gptq_ckpt)
 

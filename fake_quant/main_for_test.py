@@ -231,7 +231,7 @@ def main():
                     f.endswith('.pth') for f in os.listdir(_adaquant_ckpt)):
                 logging.info("Loading AdaQuant checkpoint from: {}".format(_adaquant_ckpt))
                 utils.load_model_in_parts(model, _adaquant_ckpt)
-                if args.w_asym and args.int_gemm:
+                if args.int_gemm:
                     from int_acc_gemm import load_gptq_w_params
                     load_gptq_w_params(model, _adaquant_ckpt)
                 # Load optimised activation scales if present
@@ -264,7 +264,7 @@ def main():
                                                   prefix=f'{model.model_name}_part')
                         if x_scales:
                             torch.save(x_scales, os.path.join(_adaquant_ckpt, '_adaquant_x_scales.pt'))
-                        if args.w_asym and args.int_gemm:
+                        if args.int_gemm:
                             from int_acc_gemm import save_gptq_w_params
                             save_gptq_w_params(model, _adaquant_ckpt)
 
@@ -284,7 +284,7 @@ def main():
                     f.endswith('.pth') for f in os.listdir(_gptaq_ckpt))):
                 logging.info("Loading GPTAQ checkpoint from: %s", _gptaq_ckpt)
                 utils.load_model_in_parts(model, _gptaq_ckpt)
-                if args.w_asym and args.int_gemm:
+                if args.int_gemm:
                     from int_acc_gemm import load_gptq_w_params
                     load_gptq_w_params(model, _gptaq_ckpt)
                 logging.info("GPTAQ checkpoint loaded – skipping quantization.")
@@ -324,7 +324,7 @@ def main():
                         utils.save_model_in_parts(
                             model, _gptaq_ckpt,
                             prefix=f'{model.model_name}_part')
-                        if args.w_asym and args.int_gemm:
+                        if args.int_gemm:
                             from int_acc_gemm import save_gptq_w_params
                             save_gptq_w_params(model, _gptaq_ckpt)
 
@@ -333,7 +333,7 @@ def main():
             logging.info("Loading GPTQ checkpoint from: {}".format(_gptq_ckpt))
             utils.load_model_in_parts(model, _gptq_ckpt)
             # Load per-group GPTQ scale/zero for w_asym + int_gemm
-            if args.w_asym and args.int_gemm:
+            if args.int_gemm:
                 from int_acc_gemm import load_gptq_w_params
                 load_gptq_w_params(model, _gptq_ckpt)
             logging.info("GPTQ checkpoint loaded – skipping quantization.")
@@ -388,7 +388,7 @@ def main():
                     utils.save_model_in_parts(model, _gptq_ckpt,
                                               prefix=f'{model.model_name}_part')
                     # Save per-group GPTQ scale/zero for w_asym + int_gemm
-                    if args.w_asym and args.int_gemm:
+                    if args.int_gemm:
                         from int_acc_gemm import save_gptq_w_params
                         save_gptq_w_params(model, _gptq_ckpt)
 

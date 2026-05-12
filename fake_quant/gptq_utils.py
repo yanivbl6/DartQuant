@@ -218,7 +218,8 @@ class GPTQ:
             groupsize != -1
             and (not self.quantizer.sym
                  or getattr(self.quantizer, 'nvfp4', False)
-                 or getattr(self.quantizer, 'scalewise', False))
+                 or getattr(self.quantizer, 'scalewise', False)
+                 or getattr(self.quantizer, 'gscaler', None) is not None)
             and not (actorder and not static_groups)
         )
         _gptq_scales = []  # will be [n_groups] list of [N,1] tensors
@@ -366,9 +367,16 @@ class GPTQ:
             self.layer._gptq_w_scale = torch.cat(_gptq_scales, dim=1)  # [N, n_groups]
             self.layer._gptq_w_zero = torch.cat(_gptq_zeros, dim=1)    # [N, n_groups]
 
-        # For per-channel (groupsize == -1) asym or FP4, also save.
+        # For per-channel (groupsize == -1), also save when:
+        #   - asym: zero point is data-dependent, recovery can't infer it
+        #   - nvfp4: non-uniform code set, recovery can't infer
+        #   - sym + gscaler: find_params snapped the scale to the M<m>S<s>
+        #     grid; runtime int_gemm recovery (abs_max/maxq from fake-quant W)
+        #     returns the un-snapped value, so prepare_int_weights would use
+        #     a scale GPTQ never optimized against.
         if groupsize == -1 and (not self.quantizer.sym
-                                or getattr(self.quantizer, 'nvfp4', False)):
+                                or getattr(self.quantizer, 'nvfp4', False)
+                                or getattr(self.quantizer, 'gscaler', None) is not None):
             self.layer._gptq_w_scale = self.quantizer.scale.clone()
             self.layer._gptq_w_zero = self.quantizer.zero.clone()
 
