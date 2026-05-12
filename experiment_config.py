@@ -141,8 +141,10 @@ def add_quant_args(parser):
     parser.add_argument('--w_asym', action='store_true',
                         help='Asymmetric weight quantization (default: symmetric)')
     parser.add_argument('--fp4', type=str, default='none',
-                        choices=['all', 'down', 'none'],
-                        help='FP4 weight quantization: all / down (down_proj only) / none (default)')
+                        choices=['all', 'down', 'down_o', 'none'],
+                        help='FP4 weight quantization: all / down (down_proj only) / '
+                             'down_o (down_proj + o_proj, pairs with --weight_group_mode down_o) / '
+                             'none (default)')
     parser.add_argument('--kv_ex', type=int, default=0,
                         help='K-cache quant without R3 rotation (0=off)')
     parser.add_argument('--proj_ex', type=int, default=0,
@@ -583,6 +585,8 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False,
         tag += "_FP4"
     elif _fp4 == 'down':
         tag += "_FP4-DOWN"
+    elif _fp4 == 'down_o':
+        tag += "_FP4-DOWN-O"
     # Deployment-side choice of activation scales: --fp16_calib loads FP16 cal
     # at inference, otherwise post-GPTQ cal. Both cal artifacts can coexist on
     # disk under the new (decoupled) cal flow, so two inference runs that

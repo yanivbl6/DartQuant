@@ -468,8 +468,9 @@ Examples:
     parser.add_argument('--w_asym', action='store_true',
                         help='Asymmetric weight quantization (default: symmetric)')
     parser.add_argument('--fp4', type=str, default='none',
-                        choices=['all', 'down', 'none'],
-                        help='FP4 weight quantization: all / down (down_proj only) / none (default)')
+                        choices=['all', 'down', 'down_o', 'none'],
+                        help='FP4 weight quantization: all / down (down_proj only) / '
+                             'down_o (down_proj + o_proj) / none (default)')
 
     # Rarely changed tuning knobs
     parser.add_argument('--a_clip_ratio', type=float, default=0.9)
@@ -1361,6 +1362,9 @@ def main():
             fp4_mode = getattr(args, 'fp4', 'none')
             layer_use_fp4 = (fp4_mode == 'all') or (
                 fp4_mode == 'down' and 'down_proj' in name
+            ) or (
+                fp4_mode == 'down_o'
+                and ('down_proj' in name or 'o_proj' in name)
             )
             dev = qlayer.module.weight.device
             # --weight_group_mode: per-Linear weight groupsize override.

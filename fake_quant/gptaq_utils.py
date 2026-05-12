@@ -177,6 +177,9 @@ def gptaq_fwrd(model, dataloader, dev, args):
                 fp4_mode = getattr(args, 'fp4', 'none')
                 layer_use_fp4 = (fp4_mode == 'all') or (
                     fp4_mode == 'down' and 'down_proj' in name
+                ) or (
+                    fp4_mode == 'down_o'
+                    and ('down_proj' in name or 'o_proj' in name)
                 )
                 if layer_use_fp4 and args.w_asym:
                     raise ValueError(
@@ -347,6 +350,9 @@ def _enable_int_gemm_on_subset(layer, names, args, layer_idx, w_bits_map):
             fp4_mode = getattr(args, 'fp4', 'none')
             layer_use_fp4 = (fp4_mode == 'all') or (
                 fp4_mode == 'down' and 'down_proj' in qname
+            ) or (
+                fp4_mode == 'down_o'
+                and ('down_proj' in qname or 'o_proj' in qname)
             )
             _wgm = getattr(args, 'weight_group_mode', 'all')
             _keep = (_wgm == 'all'

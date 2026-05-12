@@ -123,7 +123,10 @@ def parser_gen():
     # Integer GEMM / Capped Accumulator Arguments
     parser.add_argument('--int_gemm', action=argparse.BooleanOptionalAction, default=False,
                         help='Use integer GEMM with capped accumulator instead of float matmul. '
-                             'Requires symmetric activation quantization and a_bits/w_bits <= 8.')
+                             'Requires symmetric activation quantization and w_bits <= 8. '
+                             'a_bits <= 8 dispatches to the int8 Triton kernel; '
+                             '8 < a_bits <= 16 dispatches to the int16 path that '
+                             'decomposes activations into hi/lo int8 GEMMs.')
     parser.add_argument('--acc_bits', type=int, default=16,
                         help='Accumulator bit-width for integer GEMM (e.g. 16, 20, 32). '
                              '32 means no capping. (default: 16)')
@@ -217,11 +220,12 @@ def parser_gen():
                         help='''Clipping the weight quantization!
                         We do not support arguments for clipping and we find the best clip ratio during the weight quantization''')
     parser.add_argument('--fp4', type=str, default='none',
-                        choices=['all', 'down', 'none'],
+                        choices=['all', 'down', 'down_o', 'none'],
                         help='FP4 weight quantization mode. Levels are the integer set '
                              '{0, +/-1, +/-2, +/-3, +/-4, +/-6, +/-8, +/-12} with scale = amax/12. '
                              'all: every GPTQ-quantized linear; down: only mlp.down_proj; '
-                             'none: disabled (default). Symmetric only.')
+                             'down_o: mlp.down_proj AND self_attn.o_proj (pairs with '
+                             '--weight_group_mode down_o); none: disabled (default). Symmetric only.')
     parser.add_argument('--nsamples', type=int, default=128,
                         help='Number of calibration data samples for GPTQ.')
     parser.add_argument('--cal_dataset', type=str, default='wikitext2',
@@ -433,7 +437,10 @@ def parser_gen():
     assert args.k_pre_rope == False, 'Pre-RoPE quantization is not supported yet!'
 
     if args.int_gemm:
-        assert args.a_bits <= 8, 'Integer GEMM requires activation bits <= 8'
+        # a_bits=9..16 routes through _triton_int16_gemm which decomposes
+        # int16 activations into hi/lo int8 GEMMs (same path already used by
+        # down_proj under --down_bits 16).
+        assert args.a_bits <= 16, 'Integer GEMM requires activation bits <= 16'
         assert args.w_bits <= 8, 'Integer GEMM requires weight bits <= 8'
         # Mirror experiment_config.apply_set_preset: when int_gemm is on and
         # acc_block_k is at the default (32), follow w_groupsize so the kernel

@@ -514,8 +514,21 @@ def main():
             if 'o_proj' in name:  # Set the o_proj precision
                 if getattr(args, 'oproj_bits', None) is not None:
                     layer_input_bits = args.oproj_bits
-                # hw_accurate uses per-tensor for o_proj — skip per-head grouping
-                if args.o_per_head and not getattr(args, 'hw_accurate', False):
+                # Per-head grouping for o_proj activation is a static-scale
+                # optimization. Skip it when:
+                #   - hw_accurate is on (collapses to per-tensor anyway), or
+                #   - we're in dynamic int_gemm a>=16 realint mode (no static
+                #     scales to be "per-head"; per-head groupsize would just
+                #     exclude o_proj from int_gemm decomposition).
+                _is_dynamic_int_gemm_a16 = (
+                    getattr(args, 'int_gemm', False)
+                    and args.a_bits >= 16
+                    and getattr(args, 'realint', False)
+                    and getattr(args, 'act_scales_path', None) is None
+                )
+                if (args.o_per_head
+                        and not getattr(args, 'hw_accurate', False)
+                        and not _is_dynamic_int_gemm_a16):
                     num_heads = model.config.num_attention_heads
                     model_dim = model.config.hidden_size
                     layer_groupsize = model_dim // num_heads
@@ -617,6 +630,9 @@ def main():
             fp4_mode = getattr(args, 'fp4', 'none')
             layer_use_fp4 = (fp4_mode == 'all') or (
                 fp4_mode == 'down' and 'down_proj' in name
+            ) or (
+                fp4_mode == 'down_o'
+                and ('down_proj' in name or 'o_proj' in name)
             )
             # --weight_group_mode: per-Linear weight groupsize, must match
             # what GPTQ stored in _gptq_w_scale. Mismatch → reshape error

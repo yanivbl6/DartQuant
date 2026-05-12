@@ -72,7 +72,7 @@ Options:
   --sim_version N  Simulation version tag for A/B comparisons       (default: 0=omitted)
   --fp32           Run model in float32 instead of float16 (isolate precision effects)
   --realint        Force real integer quantize/dequantize even at 16 bits
-  --fp4 MODE       FP4 weight quantization: all, down, none                (default: none)
+  --fp4 MODE       FP4 weight quantization: all, down, down_o, none        (default: none)
   --gptaq          Closed-form FP-target GPTQ. Implies --fp16_calib;
                    pre-shifts W by W (C - H) H^-1 from FP-vs-Q activation gap
                    before the GPTQ Cholesky loop.

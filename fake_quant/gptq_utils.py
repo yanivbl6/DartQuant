@@ -494,6 +494,9 @@ def gptq_fwrd(model, dataloader, dev, args):
                 fp4_mode = getattr(args, 'fp4', 'none')
                 layer_use_fp4 = (fp4_mode == 'all') or (
                     fp4_mode == 'down' and 'down_proj' in name
+                ) or (
+                    fp4_mode == 'down_o'
+                    and ('down_proj' in name or 'o_proj' in name)
                 )
                 if layer_use_fp4 and args.w_asym:
                     raise ValueError(
@@ -579,6 +582,9 @@ def gptq_fwrd(model, dataloader, dev, args):
                         _ig_fp4_mode = getattr(args, 'fp4', 'none')
                         _ig_use_fp4 = (_ig_fp4_mode == 'all') or (
                             _ig_fp4_mode == 'down' and 'down_proj' in qname
+                        ) or (
+                            _ig_fp4_mode == 'down_o'
+                            and ('down_proj' in qname or 'o_proj' in qname)
                         )
                         _keep = (_wgm == 'all'
                                  or 'down_proj' in bare
@@ -618,6 +624,9 @@ def gptq_fwrd(model, dataloader, dev, args):
                     _ig_fp4_mode = getattr(args, 'fp4', 'none')
                     _ig_use_fp4 = (_ig_fp4_mode == 'all') or (
                         _ig_fp4_mode == 'down' and 'down_proj' in qname
+                    ) or (
+                        _ig_fp4_mode == 'down_o'
+                        and ('down_proj' in qname or 'o_proj' in qname)
                     )
                     _keep = (_wgm_safety == 'all'
                              or any(f'{tok}_proj' in bare
@@ -691,6 +700,9 @@ def rtn_fwrd(model, dev, args, stochastic=False):
             fp4_mode = getattr(args, 'fp4', 'none')
             layer_use_fp4 = (fp4_mode == 'all') or (
                 fp4_mode == 'down' and 'down_proj' in name
+            ) or (
+                fp4_mode == 'down_o'
+                and ('down_proj' in name or 'o_proj' in name)
             )
             if layer_use_fp4 and args.w_asym:
                 raise ValueError(
