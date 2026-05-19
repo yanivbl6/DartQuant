@@ -480,6 +480,7 @@ def main():
     # set) so the tag matches what calibrate_act_scales.py / run_experiments.py
     # actually wrote. Without this, default-valued args produce wrong paths.
     cfg.apply_set_preset(args)
+    cfg.apply_calib_set(args)
     cfg.resolve_v_bits(args)
     args.model = cfg.resolve_model(args.model)
 

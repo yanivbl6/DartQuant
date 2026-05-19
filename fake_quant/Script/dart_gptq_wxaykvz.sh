@@ -163,6 +163,7 @@ QUANT_WARNINGS=0
 WAIT_GPU=0
 MAX_USED_MB=200
 SIM_VERSION=0
+CALIB_SET=""
 FP32=0
 REALINT=0
 QUANT_OUT="none"
@@ -227,6 +228,7 @@ while [[ $# -gt 0 ]]; do
         --gptq_strength) GPTQ_STRENGTH="$2"; shift 2 ;;
         --quant_warnings) QUANT_WARNINGS=1; shift   ;;
         --sim_version) SIM_VERSION="$2";   shift 2 ;;
+        --calib_set)   CALIB_SET="$2";     shift 2 ;;
         --fp32)        FP32=1;             shift   ;;
         --realint)     REALINT=1;          shift   ;;
         --quant_out)   QUANT_OUT="$2";     shift 2 ;;
@@ -468,6 +470,11 @@ if [ "$FP32" == "1" ]; then
     FP32_FLAG="--fp32"
 fi
 
+CALIB_SET_FLAG=""
+if [ -n "$CALIB_SET" ]; then
+    CALIB_SET_FLAG="--calib_set ${CALIB_SET}"
+fi
+
 REALINT_FLAG=""
 if [ "$REALINT" == "1" ]; then
     REALINT_FLAG="--realint"
@@ -582,6 +589,7 @@ TAG_ARGS="-w ${W_BITS} -a ${A_BITS} -k ${KV_BITS} -v ${V_BITS} -G ${GROUPSIZE} -
 [ -n "$GSCALER_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${GSCALER_FLAG}"
 [ -n "$HWSCALE_FLAG" ] && TAG_ARGS="${TAG_ARGS} ${HWSCALE_FLAG}"
 [ "$SIM_VERSION" != "0" ] && TAG_ARGS="${TAG_ARGS} --sim_version ${SIM_VERSION}"
+[ -n "$CALIB_SET" ] && TAG_ARGS="${TAG_ARGS} --calib_set ${CALIB_SET}"
 [ "$FP32" == "1" ] && TAG_ARGS="${TAG_ARGS} --fp32"
 [ "$REALINT" == "1" ] && TAG_ARGS="${TAG_ARGS} --realint"
 [ "$QUANT_OUT" != "none" ] && TAG_ARGS="${TAG_ARGS} --quant_out ${QUANT_OUT}"
@@ -760,6 +768,7 @@ python main_for_test.py \
     ${GPTQ_STRENGTH_FLAG} \
     ${FP32_FLAG} \
     ${REALINT_FLAG} \
+    ${CALIB_SET_FLAG} \
     ${QUANT_OUT_FLAG} \
     ${LATE_ROT4_FLAG} \
     ${R4_STATS_FLAG} \

@@ -226,10 +226,12 @@ def parser_gen():
                              'all: every GPTQ-quantized linear; down: only mlp.down_proj; '
                              'down_o: mlp.down_proj AND self_attn.o_proj (pairs with '
                              '--weight_group_mode down_o); none: disabled (default). Symmetric only.')
-    parser.add_argument('--nsamples', type=int, default=128,
-                        help='Number of calibration data samples for GPTQ.')
-    parser.add_argument('--cal_dataset', type=str, default='wikitext2',
-                        help='calibration data samples for GPTQ.', choices=supported_datasets)
+    parser.add_argument('--calib_set', type=str, default=None,
+                        help='Calibration corpus + sample count, e.g. wiki-512, '
+                             'c4-1024. Datasets: wiki, c4, ptb. Default: '
+                             'wiki-128 (no tag emitted). Wall-clock is linear '
+                             'in sample count. Replaces legacy --cal_dataset / '
+                             '--nsamples.')
     parser.add_argument('--percdamp', type=float, default=.01,
                         help='Percent of the average Hessian diagonal to use for dampening.')
     parser.add_argument('--act_order', action=argparse.BooleanOptionalAction, default=False,

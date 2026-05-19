@@ -122,6 +122,17 @@ def get_ptb_new(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
 def get_loaders(
     name, nsamples=128, seed=0, seqlen=2048, model='', hf_token=None, eval_mode=False
 ):
+    if 'mixed' in name:
+        # 1/3 each from wiki/ptb/c4; remainder → wiki. Eval-mode is undefined
+        # for mixed (PPL is per-corpus) — fall back to wikitext2 test split.
+        if eval_mode:
+            return get_wikitext2(nsamples, seed, seqlen, model, hf_token, True)
+        per = nsamples // 3
+        rem = nsamples - 2 * per
+        wiki_part = get_wikitext2(rem, seed,     seqlen, model, hf_token, False)
+        ptb_part  = get_ptb_new(  per, seed + 1, seqlen, model, hf_token, False)
+        c4_part   = get_c4_new(   per, seed + 2, seqlen, model, hf_token, False)
+        return wiki_part + ptb_part + c4_part
     if 'wikitext2' in name:
         return get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode)
     if 'ptb' in name:

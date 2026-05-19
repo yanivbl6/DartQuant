@@ -504,10 +504,12 @@ Examples:
 
     # Calibration
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--nsamples', type=int, default=128)
     parser.add_argument('--seqlen', type=int, default=2048)
-    parser.add_argument('--calib_dataset', type=str, default='wikitext2',
-                        choices=['wikitext2', 'ptb', 'c4'])
+    parser.add_argument('--calib_set', type=str, default=None,
+                        help='Calibration corpus + sample count, e.g. wiki-512, '
+                             'c4-1024. Datasets: wiki, c4, ptb. Default: '
+                             'wiki-128 (no tag emitted). Wall-clock is linear '
+                             'in sample count.')
 
     # PWL Activation Approximation
     parser.add_argument('--pwl_act', action='store_true',
@@ -647,6 +649,7 @@ Examples:
 def main():
     args = parse_args()
     cfg.apply_set_preset(args)
+    cfg.apply_calib_set(args)
 
     # Cal collects FP activation distributions; T2 accumulator capping is an
     # inference-time hardware constraint and must NOT bleed into cal forward.

@@ -25,7 +25,7 @@ Note: `dart` (`calibrater/r1_base_qr.py`, `calibrater/r2_base_qr.py`) — the pr
 
 | Path | Contents |
 |---|---|
-| `data/runs/*.ini` | Run definitions consumed by `run_experiments.py` |
+| `data/runs/*.ini` | Run definitions consumed by `run_experiments.py` — also the canonical place to look for **example runfiles** when constructing a new one |
 | `data/cached_results/` | `<tag>.log` (eval), `<tag>_CAL.log` (cal), `<tag>_results.pb` (cached PPL) |
 | `data/act_scales/<model>/` | Activation cal `.pt` files (post-GPTQ and `__fp16` variants) |
 | `data/gptq_checkpoints/` | GPTQ checkpoints (no asym-aware GPTAQ) |
@@ -44,8 +44,18 @@ Cached cal files, GPTQ checkpoints, and result caches are keyed by a quant tag b
 
 Be mindful of the time when launching runs — they're slow and the GPUs are shared, so don't kick them off as an afterthought. Check `nvidia-smi` first. When changing environment variables, update the Dockerfile to match.
 
+## Sim versions (`--sim_version N`)
+
+`--sim_version N` (in `experiment_config.py`) appends `_vN` to **all** artifact tags — result cache, post-GPTQ cal cache, FP16 cal cache, **and** GPTQ checkpoint. Purpose: keep results from different code branches from silently sharing caches. GPTQ is included because bug fixes that touch the GPTQ path would otherwise be masked by reusing an old checkpoint across a bump (the saving from sharing GPTQ across versions isn't worth the risk of silent contamination). Bump rules:
+
+- **Bug-fix bump:** when a fix changes behavior of the *current* major (e.g. 74), increment the suffix → 741, 742, … so old and new results don't collide.
+- **Major bump (75, 76, 8, …):** only by explicit user request. Do not bump majors on your own.
+
+The active version + commit map lives in [VERSIONS.md](VERSIONS.md) — append a row whenever you bump.
+
 ## Pointers
 
 - `documentation.md` — static-vs-dynamic + GEMM-vs-int_gemm theory.
+- `VERSIONS.md` — sim_version history (current version is the bottom row).
 - `~/.claude/projects/-workspace-DartQuant/memory/MEMORY.md` — auto-loaded cross-session context (past pitfalls, user preferences, GGUF gotchas).
 - `.claude/skills/` — operational playbooks (auto-routed by description; no need to enumerate them here).

@@ -267,6 +267,16 @@ def add_quant_args(parser):
     parser.add_argument('--sim_version', type=int, default=0,
                         help='Simulation version tag for A/B comparisons (0=omitted from tag)')
 
+    # Calibration corpus + sample count (consolidates the legacy --cal_dataset /
+    # --calib_dataset / --nsamples flags). The resolver in apply_calib_set
+    # populates args.cal_dataset / args.calib_dataset / args.nsamples so existing
+    # read sites need no changes.
+    parser.add_argument('--calib_set', type=str, default=None,
+                        help='Calibration corpus + sample count, e.g. wiki-512, '
+                             'c4-1024. Datasets: wiki, c4, ptb. Default: '
+                             'wiki-128 (no tag emitted). Wall-clock is linear '
+                             'in sample count.')
+
     # FP32 model precision (isolate float16 bottleneck)
     parser.add_argument('--fp32', action='store_true',
                         help='Run model in float32 instead of float16 (isolate precision effects)')
@@ -305,6 +315,38 @@ def add_quant_args(parser):
                              'if a<16 add static_act+realint+down_bits=16+kv_ex=8+k=v=8; '
                              'if int_gemm add acc_block_k=G+acc_wrap; '
                              'if hwscale add scalewise. Explicit user flags win.')
+
+
+# --calib_set resolver. Single source of truth for the calibration corpus +
+# sample count. Outputs the canonical dataset name (matching
+# data_utils.get_loaders's substring router) and the resolved nsamples.
+_CALIB_SET_ALIASES = {'wiki': 'wikitext2', 'c4': 'c4', 'ptb': 'ptb', 'mixed': 'mixed'}
+_CALIB_SET_REVERSE = {v: k for k, v in _CALIB_SET_ALIASES.items()}
+_CALIB_SET_DEFAULT = ('wikitext2', 128)
+
+
+def parse_calib_set(spec):
+    """'wiki-512' -> ('wikitext2', 512). None -> default ('wikitext2', 128)."""
+    if spec is None:
+        return _CALIB_SET_DEFAULT
+    ds, _sep, n = spec.rpartition('-')
+    if not ds or not n.isdigit() or int(n) <= 0:
+        raise ValueError(
+            f"--calib_set must be <dataset>-<nsamples>, got {spec!r}")
+    if ds not in _CALIB_SET_ALIASES:
+        raise ValueError(
+            f"--calib_set dataset must be one of "
+            f"{sorted(_CALIB_SET_ALIASES)}, got {ds!r}")
+    return _CALIB_SET_ALIASES[ds], int(n)
+
+
+def apply_calib_set(args):
+    """Resolve args.calib_set and populate the legacy attributes that read
+    sites already consume. Call right after parse_args()."""
+    ds, n = parse_calib_set(getattr(args, 'calib_set', None))
+    args.cal_dataset = ds       # fake_quant naming (main_for_test.py etc.)
+    args.calib_dataset = ds     # calibrater naming (calibrate_act_scales.py)
+    args.nsamples = n
 
 
 def apply_set_preset(args):
@@ -527,11 +569,21 @@ def build_quant_tag(args, for_gptq_cache=False, for_cal_cache=False,
     # FP-trajectory activation scales).
     if getattr(args, 'gptaq', False) and not for_fp16_cal_cache:
         tag += "_gptaq"
-    # Simulation version tag (non-gptq only, for A/B comparisons)
-    if not for_gptq_cache:
-        _sv = getattr(args, 'sim_version', 0)
-        if _sv:
-            tag += f"_v{_sv}"
+    # Simulation version tag (A/B comparisons). Applied to all caches incl.
+    # GPTQ — bug fixes in GPTQ-path code would otherwise be masked by reusing
+    # an old GPTQ checkpoint across a version bump.
+    _sv = getattr(args, 'sim_version', 0)
+    if _sv:
+        tag += f"_v{_sv}"
+    # Calibration corpus + sample count. Applied to all caches (fp16-cal,
+    # post-GPTQ cal, GPTQ, result) — the cal corpus seeds the Hessian and the
+    # FP16 observer, so it affects every downstream artifact. Default
+    # (wikitext2, 128) emits no tag.
+    _cs_ds = getattr(args, 'cal_dataset', 'wikitext2')
+    _cs_n = getattr(args, 'nsamples', 128)
+    if (_cs_ds, _cs_n) != _CALIB_SET_DEFAULT:
+        _cs_short = _CALIB_SET_REVERSE.get(_cs_ds, _cs_ds)
+        tag += f"_calibset-{_cs_short}-{_cs_n}"
     # FP32 model tag
     if getattr(args, 'fp32', False):
         tag += "_FP32"
@@ -664,6 +716,14 @@ def _build_fp16_cal_tag(args):
     # smq adds softmax/k-cache observers (calibrate_act_scales:952-955).
     if getattr(args, 'smq', 0) > 0:
         parts.append(f"smq{args.smq}")
+    # Calibration corpus + sample count: changes which token distribution the
+    # FP16 observers see → different act_scales contents and shape. Default
+    # (wikitext2, 128) emits no tag.
+    _cs_ds = getattr(args, 'cal_dataset', 'wikitext2')
+    _cs_n = getattr(args, 'nsamples', 128)
+    if (_cs_ds, _cs_n) != _CALIB_SET_DEFAULT:
+        _cs_short = _CALIB_SET_REVERSE.get(_cs_ds, _cs_ds)
+        parts.append(f"calibset-{_cs_short}-{_cs_n}")
     # GGUF rewrites weights before any cal — different activations through
     # FP16 observers. Mirrors build_quant_tag's encoding.
     if getattr(args, 'gguf', None):
@@ -815,6 +875,8 @@ def build_quant_args(args):
         cmd += ['--adaquant', _aq]
     if getattr(args, 'sim_version', 0):
         cmd += ['--sim_version', str(args.sim_version)]
+    if getattr(args, 'calib_set', None):
+        cmd += ['--calib_set', args.calib_set]
     if getattr(args, 'fp32', False):
         cmd.append('--fp32')
     if getattr(args, 'realint', False):
@@ -867,6 +929,7 @@ if __name__ == '__main__':
                               'that affect the FP16 act_scales contents are kept.')
     _args = _parser.parse_args()
     apply_set_preset(_args)
+    apply_calib_set(_args)
     resolve_v_bits(_args)
     _args.model = resolve_model(_args.model)
     print(build_quant_tag(_args, for_gptq_cache=_args.for_gptq_cache,

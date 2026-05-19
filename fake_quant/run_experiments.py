@@ -368,6 +368,7 @@ def main():
         sys.exit(1)
 
     cfg.apply_set_preset(args)
+    cfg.apply_calib_set(args)
     cfg.resolve_v_bits(args)
     quant_args = cfg.build_quant_args(args)
 

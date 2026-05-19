@@ -255,6 +255,7 @@ def parse_runfile_for_calibration(path, recalib=False):
         filtered = _filter_runtime_flags(rest)
         line_args, extra = _parse_runfile_line_args(filtered)
         cfg.apply_set_preset(line_args)
+        cfg.apply_calib_set(line_args)
         cfg.resolve_v_bits(line_args)
         line_args.model = cfg.resolve_model(line_args.model)
 
@@ -404,6 +405,7 @@ def main():
         sys.exit(1)
 
     cfg.apply_set_preset(args)
+    cfg.apply_calib_set(args)
     cfg.resolve_v_bits(args)
     quant_args = cfg.build_quant_args(args)
 

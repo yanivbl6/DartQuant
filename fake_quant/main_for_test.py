@@ -17,6 +17,14 @@ from result_cache import ResultCache
 def main():
     args = args_config_gen.parser_gen()
 
+    # Resolve --calib_set → args.cal_dataset / args.calib_dataset / args.nsamples
+    # so downstream cal-loader sites (data_utils.get_loaders calls) read the
+    # right values. experiment_config is one level up.
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    import experiment_config as _cfg
+    _cfg.apply_calib_set(args)
+
     if args.r1_path and '.pt' not in args.r1_path and '.bin' not in args.r1_path:
         args.r1_path += '/' + args.r1_path.split('/')[-1] + '.pt'
 
