@@ -106,6 +106,17 @@ def parse_viz(spec):
       <metric>_ymin/ymax most specific — per-metric override using the --draw
                          keyword (e.g. wiki_ymax=45, ptb_ymax=115, c4_ymax=100,
                          mmlu_ymin=0.3). Wins over ppl_*/acc_*/ymin/ymax.
+      caption=<text>     one-line italic caption rendered below each saved figure
+                         (single-panel and summary alike). Use it to embed the
+                         conclusion of the figure for slide/share use. Commas
+                         in the caption must be escaped — replace ',' with ';'
+                         or quote the whole --viz arg.
+      delta=true|both    annotate each bar with its delta vs the cluster's
+                         baseline value:
+                           true → replace absolute value with "+N.NN" / "-N.NN"
+                           both → show "V.VV (+D.DD)" — absolute then delta
+                         Baselines come from each cluster's `baseline_idx` —
+                         no extra config needed.
 
     Resolution order (most → least specific):
       <metric>_y{min,max}  →  {ppl,acc}_y{min,max}  →  y{min,max}  →  auto.
@@ -505,13 +516,25 @@ def _make_title(col_header, baseline_value, common_sub):
     return title
 
 
-def _save_fig(fig, fig_dir, metric_kw, baseline_value, chart_type, subdir=None):
+def _apply_figure_caption(fig, viz):
+    """Render a one-line italic caption beneath the figure if `viz['caption']`
+    is set. No-op otherwise. Caller must invoke before savefig."""
+    cap = (viz or {}).get("caption")
+    if not cap:
+        return
+    fig.text(0.5, -0.02, cap, ha="center", va="top",
+             fontsize=9.5, style="italic", color="#404040", wrap=True)
+
+
+def _save_fig(fig, fig_dir, metric_kw, baseline_value, chart_type,
+              subdir=None, viz=None):
     """Save figure to disk and print path. Returns the saved path."""
     fname = f"{metric_kw}_{baseline_value}_{chart_type}.png".replace("/", "_")
     out_dir = os.path.join(fig_dir, subdir) if subdir else fig_dir
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, fname)
-    fig.savefig(path, dpi=150)
+    _apply_figure_caption(fig, viz)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     import matplotlib.pyplot as plt
     plt.close(fig)
     print(f"  {DIM}Saved {path}{RESET}")
@@ -533,7 +556,7 @@ def _choose_summary_grid(n):
     return (rows, cols)
 
 
-def _save_summary_figure(specs, fig_dir, file_label):
+def _save_summary_figure(specs, fig_dir, file_label, viz=None):
     """Compose all subfigures natively into a single summary_<label>.png.
 
     Each spec is a dict with:
@@ -558,9 +581,10 @@ def _save_summary_figure(specs, fig_dir, file_label):
     for ax in axes_flat[len(specs):]:
         ax.set_axis_off()
     fig.tight_layout()
+    _apply_figure_caption(fig, viz)
     out = os.path.join(fig_dir,
                        f"summary_{file_label}.png".replace("/", "_"))
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  {DIM}Saved {out}{RESET}")
 
@@ -580,6 +604,8 @@ def _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
         seen_labels.add(kl)
         return kl
 
+    # bars: (x, value, baseline_value_for_cluster) — baseline captured per cluster
+    # so the delta annotation can compute val - bl_val regardless of bar order.
     bars = []
     for ci, cfg in enumerate(configs):
         bl_val = matrix[cfg["baseline_idx"]][col_idx]
@@ -587,7 +613,7 @@ def _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
             x = ci + key_values.index(baseline_value) * bar_width
             ax.bar(x, bl_val, bar_width, color=key_colors[baseline_value],
                    label=_emit_label(baseline_value))
-            bars.append((x, bl_val))
+            bars.append((x, bl_val, bl_val))
         for pair in cfg["pairs"]:
             kl = pair["key_label"]
             val = matrix[pair["run_idx"]][col_idx]
@@ -596,7 +622,7 @@ def _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
                 x = ci + ki * bar_width
                 ax.bar(x, val, bar_width, color=key_colors[kl],
                        label=_emit_label(kl))
-                bars.append((x, val))
+                bars.append((x, val, bl_val))
 
     _set_focused_ylim(ax, _collect_metric_values(configs, matrix, col_idx),
                       ppl_col, viz=viz, metric_kw=metric_kw)
@@ -605,23 +631,34 @@ def _render_bar_chart(ax, configs, matrix, col_idx, ppl_col, key_values,
     # auto-cap or a manual --viz limit), pin the label to the appropriate panel
     # edge with an arrow pointing toward where the true value lies visually —
     # otherwise a clipped bar fills the panel solidly and misleads the reader.
+    # `--viz delta=true|both` switches the annotation format (see parse_viz).
+    delta_mode = (viz or {}).get("delta")
+    def _fmt(val, bl):
+        if delta_mode and bl is not None and val is not None:
+            d = val - bl
+            d_str = f"{d:+.2f}" if abs(d) >= 0.005 else "±0.00"
+            if delta_mode == "both":
+                return f"{val:.2f}\n({d_str})"
+            return d_str if d != 0 else f"{val:.2f}"  # baseline bar keeps abs
+        return f"{val:.2f}"
     y0, y1 = ax.get_ylim()
     y_lo, y_hi = (y0, y1) if y0 < y1 else (y1, y0)  # canonical data low/high
     inverted = ax.yaxis_inverted()  # True for PPL panels (lower=better=top)
-    for x, val in bars:
+    for x, val, bl in bars:
+        label = _fmt(val, bl)
         if y_lo <= val <= y_hi:
-            ax.text(x, val, f'{val:.2f}', ha='center', va='bottom', fontsize=9)
+            ax.text(x, val, label, ha='center', va='bottom', fontsize=9)
             continue
         if val > y_hi:
             # Beyond y_hi in data: visually below panel if inverted, above if not.
             arrow = '↓' if inverted else '↑'
             va = 'bottom' if inverted else 'top'
-            ax.text(x, y_hi, f'{arrow}{val:.2f}', ha='center', va=va,
+            ax.text(x, y_hi, f'{arrow}{label}', ha='center', va=va,
                     fontsize=9, color='dimgray', fontweight='bold')
         else:  # val < y_lo
             arrow = '↑' if inverted else '↓'
             va = 'top' if inverted else 'bottom'
-            ax.text(x, y_lo, f'{arrow}{val:.2f}', ha='center', va=va,
+            ax.text(x, y_lo, f'{arrow}{label}', ha='center', va=va,
                     fontsize=9, color='dimgray', fontweight='bold')
 
     wrapped = [_wrap_label(l) for l in short_labels]
@@ -646,7 +683,7 @@ def _draw_bar_chart(configs, matrix, col_idx, ppl_col, key_values,
                       short_labels, viz=viz, metric_kw=metric_kw)
     fig.tight_layout()
     return _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value,
-                     "bar", subdir="subfigures")
+                     "bar", subdir="subfigures", viz=viz)
 
 
 def _line_chart_x_nums(key_values, wildcard_capture):
@@ -767,7 +804,7 @@ def _draw_line_chart(configs, matrix, col_idx, ppl_col, key_values,
                        viz=viz, metric_kw=metric_kw)
     fig.tight_layout()
     return _save_fig(fig, fig_dir, metric_kw, file_label or baseline_value,
-                     "line", subdir="subfigures")
+                     "line", subdir="subfigures", viz=viz)
 
 
 def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
@@ -870,7 +907,7 @@ def _draw_figures(compare_data, runs, matrix, labels, cols, is_ppl,
                                                   viz=v, metric_kw=mk)),
                 })
 
-    _save_summary_figure(specs, fig_dir, file_label)
+    _save_summary_figure(specs, fig_dir, file_label, viz=viz)
 
 
 def _render_all_runs_bar(ax, run_indices, matrix, col_idx, ppl_col, fp16_val,
@@ -975,7 +1012,8 @@ def _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl, draw_metrics,
                              fp16_val, common_sub, col_header, short_labels,
                              colors, viz=viz, metric_kw=metric_kw)
         fig.tight_layout()
-        _save_fig(fig, fig_dir, metric_kw, "all", "bar", subdir="subfigures")
+        _save_fig(fig, fig_dir, metric_kw, "all", "bar", subdir="subfigures",
+                  viz=viz)
 
         specs.append({
             "figsize": (max(8, len(run_indices) * 0.7 + 2), 5),
@@ -986,7 +1024,7 @@ def _draw_all_runs_bar(runs, matrix, labels, cols, is_ppl, draw_metrics,
                                             colors, viz=v, metric_kw=mk)),
         })
 
-    _save_summary_figure(specs, fig_dir, "all")
+    _save_summary_figure(specs, fig_dir, "all", viz=viz)
 
 
 def _extract_model_name(path):
@@ -1542,8 +1580,13 @@ def main():
                              "(accuracy panels only), <metric>_ymin/ymax "
                              "(per-metric using --draw keyword, e.g. "
                              "wiki_ymax=45, ptb_ymax=115, c4_ymax=100; "
-                             "wins over ppl_*/acc_*/ymin/ymax). Add new keys "
-                             "to parse_viz() and the relevant render function.")
+                             "wins over ppl_*/acc_*/ymin/ymax); "
+                             "caption=<text> (one-line italic caption below "
+                             "the figure — use ';' instead of ',' in the "
+                             "caption since ',' separates --viz keys); "
+                             "delta=true|both (annotate bars with delta vs "
+                             "the cluster's baseline). Add new keys to "
+                             "parse_viz() and the relevant render function.")
     parser.add_argument("--nbl", "--no-baseline", action="store_true",
                         dest="no_baseline",
                         help="Exclude the FP16 full-precision baseline")

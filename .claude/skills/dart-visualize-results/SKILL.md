@@ -80,6 +80,8 @@ The script has an open-ended **`--viz K=V,K=V`** flag for visualization-only tun
 | Want bar, got both | `--bar` flag suppresses the line panels (summary drops them and per-metric `_line.png` outputs are skipped). Predates `--viz`, so it's a top-level flag, not a viz key. | — | — |
 | X-axis order weird | — | (proposed: `--viz sort=numeric`) | Sort `key_values` in `_draw_figures` when `viz.get('sort') == 'numeric'`. |
 | Colors collide past 10 keys | — | (proposed: `--viz palette=viridis`) | Branch on `viz.get('palette')` in `_draw_figures` color setup. |
+| Need a one-line conclusion stamped on the figure | — | `--viz caption=<text>` — italic line rendered beneath the figure. Use `;` instead of `,` in the caption (commas separate `--viz` keys). Closed 2026-05-20. | `_apply_figure_caption` helper at [show_results.py:521](fake_quant/show_results.py#L521); threaded through `_save_fig` and `_save_summary_figure`. |
+| Bars all look similar — want the delta vs baseline visible | — | `--viz delta=true` (replace abs values with `+N.NN` / `-N.NN`) or `--viz delta=both` (show `value (+delta)`). Baseline is each cluster's `baseline_idx` — automatic. Closed 2026-05-20. | Annotation block in `_render_bar_chart` at [show_results.py:633](fake_quant/show_results.py#L633). |
 
 When a code-side change is needed, follow the **"Adding a new viz key"** recipe below and update this skill body with the new key in the same edit. Tag it with the date so future-you knows the script has moved.
 

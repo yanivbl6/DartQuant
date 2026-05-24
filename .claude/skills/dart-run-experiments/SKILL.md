@@ -7,6 +7,8 @@ description: Drive fake_quant/run_experiments.py to launch DartQuant calibration
 
 Wrap `fake_quant/run_experiments.py`. Two responsibilities: (a) pick the right flag combination based on user intent, (b) avoid known footguns (especially the `--gptq + no --recalib` cal mismatch from 2026-05-04).
 
+> ⛔ **`--recalib` re-runs EVERY line in the runfile**, not just the one you care about — hours-to-days of GPU on a typical sweep. If `--dry` shows `[DONE→rerun]` on lines you didn't intend to touch, that's the symptom. For partial scope, unflag the lines instead (see below).
+
 ## Always-do steps (in order)
 
 1. **GPU check** — show what's free before suggesting a command.
